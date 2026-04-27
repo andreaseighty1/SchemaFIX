@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Schemapussel — fritidshem</title>
+<title>SchemaFIX — fritidshem</title>
 
 <!-- Tailwind via CDN för styling -->
 <script src="https://cdn.tailwindcss.com"></script>
@@ -486,7 +486,7 @@ function FritidsSchemaApp() {
   const saveToFile = async (saveAs = false) => {
     const data = buildSaveData();
     const today = new Date().toISOString().slice(0, 10);
-    const defaultName = `fritidsschema-${today}.json`;
+    const defaultName = `schemafix-${today}.json`;
 
     // Modern API (Chrome/Edge/Opera): visar en riktig "Spara som"-dialog
     if (window.showSaveFilePicker) {
@@ -720,7 +720,7 @@ function FritidsSchemaApp() {
         <header className="mb-8 flex items-end justify-between flex-wrap gap-4">
           <div>
             <p className="text-xs uppercase tracking-widest text-stone-500 mb-1">Fritidshem · schemaverktyg</p>
-            <h1 className="display-font text-4xl text-stone-800" style={{ letterSpacing: '-0.02em' }}>Schemapussel</h1>
+            <h1 className="display-font text-4xl text-stone-800" style={{ letterSpacing: '-0.02em' }}>SchemaFIX</h1>
             <div className="flex items-center gap-2 mt-1">
               <p className="text-stone-600 text-sm">Prototyp v9 · spara/öppna med rätt mappval</p>
               {dirty && (
