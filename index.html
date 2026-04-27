@@ -33,7 +33,7 @@
 // Vi bygger en React-komponent som tar size/className/fill/style etc precis som lucide-react.
 (function() {
   const { createElement: h } = React;
-  const iconNames = ['AlertCircle', 'Clock', 'Users', 'Calendar', 'CheckCircle2', 'ChevronRight', 'Edit3', 'Sparkles', 'X', 'Plus', 'Trash2', 'Wand2', 'Settings', 'Download', 'Upload', 'Circle'];
+  const iconNames = ['AlertCircle', 'Clock', 'Users', 'Calendar', 'CheckCircle2', 'ChevronRight', 'Edit3', 'Sparkles', 'X', 'Plus', 'Trash2', 'Wand2', 'Settings', 'Download', 'Upload', 'Circle', 'HelpCircle', 'ArrowRight'];
   const defaultSvgAttrs = {
     xmlns: 'http://www.w3.org/2000/svg',
     viewBox: '0 0 24 24',
@@ -77,7 +77,7 @@
 
 <script type="text/babel" data-presets="react">
 // Plocka ut ikon-komponenterna så att resten av koden kan använda dem direkt
-const { AlertCircle, Clock, Users, Calendar, CheckCircle2, ChevronRight, Edit3, Sparkles, X, Plus, Trash2, Wand2, Settings, Download, Upload, Circle } = window.__icons;
+const { AlertCircle, Clock, Users, Calendar, CheckCircle2, ChevronRight, Edit3, Sparkles, X, Plus, Trash2, Wand2, Settings, Download, Upload, Circle, HelpCircle, ArrowRight } = window.__icons;
 const { useState, useMemo, useEffect } = React;
 
 
@@ -109,10 +109,14 @@ function getDept(deptId, departments) {
 }
 
 // Returnerar den effektiva tidsbegränsningen för en person på en specifik dag.
-// Om det finns ett dagspecifikt undantag används det, annars den generella regeln.
-function getConstraint(person, dayKey, key) {
-  const ov = (person.dayOverrides || {})[dayKey];
-  if (ov && ov[key] !== undefined) return ov[key];
+// Prioritetsordning: dagsundantag > paritetsundantag (jämn/udda vecka) > generell regel.
+function getConstraint(person, dayKey, key, parity) {
+  const dayOv = (person.dayOverrides || {})[dayKey];
+  if (dayOv && dayOv[key] !== undefined) return dayOv[key];
+  if (parity) {
+    const parOv = (person.parityOverrides || {})[parity];
+    if (parOv && parOv[key] !== undefined) return parOv[key];
+  }
   return person[key];
 }
 
@@ -170,6 +174,10 @@ const DEFAULTS = {
   // Dagspecifika undantag som åsidosätter de generella ovan på just den dagen.
   // Format: { mon: { earliestStart: 480, ... }, tue: { ... }, ... }
   dayOverrides: {},
+  // Vecko-paritetsundantag (jämn/udda kalendervecka). Åsidosätter de generella reglerna.
+  // Dagsundantag har högst prioritet, sen paritet, sen generellt.
+  // Format: { even: { earliestStart: 480, ... }, odd: { ... } }
+  parityOverrides: {},
   daysOff: [], hasFridayRotation: true, fridayShift: null, fridayRotation: null,
 };
 
@@ -320,15 +328,24 @@ function isShiftLegal(person, dayKey, newShift) {
   if (end - start < 60) return false;
   if (start < 330 || end > 1080) return false;
   if (person.onlyAfternoons && start < 720) return false;
-  // Respektera dagspecifika undantag där de finns
-  const earliestStart = getConstraint(person, dayKey, 'earliestStart');
-  const latestStart   = getConstraint(person, dayKey, 'latestStart');
-  const earliestEnd   = getConstraint(person, dayKey, 'earliestEnd');
-  const latestEnd     = getConstraint(person, dayKey, 'latestEnd');
-  if (earliestStart != null && start < earliestStart) return false;
-  if (latestStart   != null && start > latestStart)   return false;
-  if (earliestEnd   != null && end   < earliestEnd)   return false;
-  if (latestEnd     != null && end   > latestEnd)     return false;
+  // Eftersom det ordinarie schemat ska gälla varje vecka måste det respektera
+  // STRÄNGASTE av jämn/udda + dagsundantag. Vi tar max för "earliest"-fält och min för "latest"-fält.
+  const evals = ['even', 'odd'].map(p => ({
+    earliestStart: getConstraint(person, dayKey, 'earliestStart', p),
+    latestStart:   getConstraint(person, dayKey, 'latestStart',   p),
+    earliestEnd:   getConstraint(person, dayKey, 'earliestEnd',   p),
+    latestEnd:     getConstraint(person, dayKey, 'latestEnd',     p),
+  }));
+  const strict = {
+    earliestStart: Math.max(...evals.map(e => e.earliestStart ?? -Infinity)),
+    latestStart:   Math.min(...evals.map(e => e.latestStart   ?? Infinity)),
+    earliestEnd:   Math.max(...evals.map(e => e.earliestEnd   ?? -Infinity)),
+    latestEnd:     Math.min(...evals.map(e => e.latestEnd     ?? Infinity)),
+  };
+  if (Number.isFinite(strict.earliestStart) && start < strict.earliestStart) return false;
+  if (Number.isFinite(strict.latestStart)   && start > strict.latestStart)   return false;
+  if (Number.isFinite(strict.earliestEnd)   && end   < strict.earliestEnd)   return false;
+  if (Number.isFinite(strict.latestEnd)     && end   > strict.latestEnd)     return false;
   if ((person.daysOff || []).includes(dayKey)) return false;
   return true;
 }
@@ -433,6 +450,8 @@ function FritidsSchemaApp() {
   // Referens till en öppnad fil (File System Access API). Kan inte sparas i localStorage,
   // så den nollställs vid ny session — men då fortsätter Spara att fungera (faller tillbaka till nedladdning).
   const [fileHandle, setFileHandle] = useState(null);
+  const [showWelcome, setShowWelcome] = useState(false);
+  const [tourStep, setTourStep] = useState(null); // null = ingen tur aktiv, annars 0..3
 
   // När cykellängden ändras: justera alla personers fridayRotation till rätt längd,
   // och håll currentFridayWeek inom giltigt intervall.
@@ -455,9 +474,11 @@ function FritidsSchemaApp() {
 
   // Ladda backup vid start
   useEffect(() => {
+    let foundData = false;
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
+        foundData = true;
         const data = JSON.parse(raw);
         if (data.staff) {
           setStaff(data.staff);
@@ -469,8 +490,42 @@ function FritidsSchemaApp() {
         if (data.savedFileName) setSavedFileName(data.savedFileName);
       }
     } catch {}
+    // Visa välkomstvyn endast vid allra första besöket — tom localStorage
+    const hasSeenWelcome = localStorage.getItem('schemafix-welcome-seen');
+    if (!foundData && !hasSeenWelcome) {
+      setShowWelcome(true);
+    }
     setLoaded(true);
   }, []);
+
+  const dismissWelcome = () => {
+    localStorage.setItem('schemafix-welcome-seen', '1');
+    setShowWelcome(false);
+  };
+
+  const startTour = () => {
+    dismissWelcome();
+    setView('settings');
+    setTourStep(0);
+  };
+
+  const nextTourStep = () => {
+    const tour = [
+      { view: 'settings' },  // 0: avdelningar
+      { view: 'staff' },     // 1: personal
+      { view: 'rules' },     // 2: bemanningskrav
+      { view: 'schedule' },  // 3: vecka + generera
+    ];
+    const next = (tourStep ?? -1) + 1;
+    if (next >= tour.length) {
+      setTourStep(null);
+      return;
+    }
+    setView(tour[next].view);
+    setTourStep(next);
+  };
+
+  const endTour = () => setTourStep(null);
 
   // Autospar till localStorage vid varje ändring + markera som "ändrat sedan senaste filsparning"
   useEffect(() => {
@@ -665,25 +720,44 @@ function FritidsSchemaApp() {
             v.push({ id: s.id, name: s.name, severity: 'high', msg: `${d.label}: börjar ${s.sched[d.key][0]} men ska bara jobba eftermiddag` });
         }
       }
-      // Tidsbegränsningar — kontrollera per dag, respektera dagspecifika undantag
+      // Tidsbegränsningar — kontrollera per dag och per paritet (jämn/udda)
       for (const d of DAYS) {
         const sh = s.sched[d.key];
         if (!sh) continue;
         const start = timeToMin(sh[0]);
         const end   = timeToMin(sh[1]);
-        const earliestStart = getConstraint(s, d.key, 'earliestStart');
-        const latestStart   = getConstraint(s, d.key, 'latestStart');
-        const earliestEnd   = getConstraint(s, d.key, 'earliestEnd');
-        const latestEnd     = getConstraint(s, d.key, 'latestEnd');
-        const ovTag = (s.dayOverrides || {})[d.key] ? ' (dagsundantag)' : '';
-        if (earliestStart != null && start < earliestStart)
-          v.push({ id: s.id, name: s.name, severity: 'high', msg: `${d.label}: börjar ${sh[0]} men tidigaste tillåtna är ${minToTime(earliestStart)}${ovTag}` });
-        if (latestStart != null && start > latestStart)
-          v.push({ id: s.id, name: s.name, severity: 'high', msg: `${d.label}: börjar ${sh[0]} men måste börja senast ${minToTime(latestStart)}${ovTag}` });
-        if (earliestEnd != null && end < earliestEnd)
-          v.push({ id: s.id, name: s.name, severity: 'high', msg: `${d.label}: slutar ${sh[1]} men måste jobba minst till ${minToTime(earliestEnd)}${ovTag}` });
-        if (latestEnd != null && end > latestEnd)
-          v.push({ id: s.id, name: s.name, severity: 'high', msg: `${d.label}: slutar ${sh[1]} men senaste tillåtna är ${minToTime(latestEnd)}${ovTag}` });
+        const dayHasOverride = !!(s.dayOverrides || {})[d.key];
+
+        // Källa-spårning: vad är hårdast och varifrån kommer regeln?
+        const sources = ['even', 'odd'];
+        const reported = new Set();
+        for (const par of sources) {
+          const tag = dayHasOverride ? ' (dagsundantag)' : (s.parityOverrides?.[par] ? ` (${par === 'even' ? 'jämn' : 'udda'} vecka)` : '');
+          const earliestStart = getConstraint(s, d.key, 'earliestStart', par);
+          const latestStart   = getConstraint(s, d.key, 'latestStart',   par);
+          const earliestEnd   = getConstraint(s, d.key, 'earliestEnd',   par);
+          const latestEnd     = getConstraint(s, d.key, 'latestEnd',     par);
+          if (earliestStart != null && start < earliestStart) {
+            const k = `${d.key}-es-${tag}`;
+            if (!reported.has(k)) { reported.add(k);
+              v.push({ id: s.id, name: s.name, severity: 'high', msg: `${d.label}: börjar ${sh[0]} men tidigaste tillåtna är ${minToTime(earliestStart)}${tag}` }); }
+          }
+          if (latestStart != null && start > latestStart) {
+            const k = `${d.key}-ls-${tag}`;
+            if (!reported.has(k)) { reported.add(k);
+              v.push({ id: s.id, name: s.name, severity: 'high', msg: `${d.label}: börjar ${sh[0]} men måste börja senast ${minToTime(latestStart)}${tag}` }); }
+          }
+          if (earliestEnd != null && end < earliestEnd) {
+            const k = `${d.key}-ee-${tag}`;
+            if (!reported.has(k)) { reported.add(k);
+              v.push({ id: s.id, name: s.name, severity: 'high', msg: `${d.label}: slutar ${sh[1]} men måste jobba minst till ${minToTime(earliestEnd)}${tag}` }); }
+          }
+          if (latestEnd != null && end > latestEnd) {
+            const k = `${d.key}-le-${tag}`;
+            if (!reported.has(k)) { reported.add(k);
+              v.push({ id: s.id, name: s.name, severity: 'high', msg: `${d.label}: slutar ${sh[1]} men senaste tillåtna är ${minToTime(latestEnd)}${tag}` }); }
+          }
+        }
       }
     }
     return v;
@@ -734,7 +808,7 @@ function FritidsSchemaApp() {
             <p className="text-xs uppercase tracking-widest text-stone-500 mb-1">Fritidshem · schemaverktyg</p>
             <h1 className="display-font text-4xl text-stone-800" style={{ letterSpacing: '-0.02em' }}>SchemaFIX</h1>
             <div className="flex items-center gap-2 mt-1">
-              <p className="text-stone-600 text-sm">Prototyp v11 · datahantering samlad i Inställningar</p>
+              <p className="text-stone-600 text-sm">Prototyp v13 · välkomstvy, flikintroduktioner och tooltips</p>
               {dirty && (
                 <span className="inline-flex items-center gap-1 text-xs text-amber-700 bg-amber-50 ring-1 ring-amber-200 rounded-full px-2 py-0.5">
                   <Circle size={6} fill="currentColor" />
@@ -776,6 +850,10 @@ function FritidsSchemaApp() {
               className="px-4 py-2.5 rounded-full text-sm bg-stone-800 text-white hover:bg-stone-900 transition flex items-center gap-2 disabled:opacity-50">
               <Wand2 size={14} />
               {generating ? 'Räknar...' : 'Generera schemaförslag'}
+            </button>
+            <button onClick={() => setShowWelcome(true)} title="Hjälp och guidad tur"
+              className="p-2 rounded-full text-stone-500 hover:bg-stone-200/60 hover:text-stone-800 transition">
+              <HelpCircle size={18} />
             </button>
             <div className="flex gap-1 p-1 rounded-full bg-stone-200/60 flex-wrap">
               {[
@@ -853,11 +931,49 @@ function FritidsSchemaApp() {
           departments={departments}
           onApply={applyAlternative} onClose={() => setAlternatives(null)} />
       )}
+
+      {showWelcome && (
+        <WelcomeModal onClose={dismissWelcome} onStartTour={startTour} />
+      )}
+
+      {tourStep !== null && (
+        <TourBubble step={tourStep} onNext={nextTourStep} onClose={endTour} />
+      )}
     </div>
   );
 }
 
 // ==================== SUBCOMPONENTS ====================
+
+// Liten introduktionsruta som visas högst upp på varje flik. Förklarar vad fliken är till för.
+function TabIntro({ children }) {
+  return (
+    <div className="bg-stone-100/70 ring-1 ring-stone-200 rounded-lg px-4 py-3 text-sm text-stone-600 leading-relaxed">
+      {children}
+    </div>
+  );
+}
+
+// Tooltip — liten ?-ikon som visar förklarande text vid hover. Funkar både med mus och tapp.
+function Tooltip({ text }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <span className="relative inline-flex items-center"
+      onMouseEnter={() => setOpen(true)} onMouseLeave={() => setOpen(false)}>
+      <button type="button" onClick={(e) => { e.preventDefault(); setOpen(o => !o); }}
+        className="text-stone-400 hover:text-stone-700 ml-1 flex items-center" tabIndex={-1}>
+        <HelpCircle size={12} />
+      </button>
+      {open && (
+        <span className="absolute left-1/2 bottom-full mb-1.5 z-30 w-56 -translate-x-1/2 px-3 py-2 rounded-lg bg-stone-800 text-white text-[11px] leading-relaxed shadow-lg pointer-events-none">
+          {text}
+          <span className="absolute top-full left-1/2 -translate-x-1/2 -mt-px"
+            style={{ borderLeft: '4px solid transparent', borderRight: '4px solid transparent', borderTop: '4px solid #1c1917' }} />
+        </span>
+      )}
+    </span>
+  );
+}
 
 function StatCard({ label, value, sub, highlight }) {
   const ring = highlight === 'warn' ? 'ring-1 ring-orange-300 bg-orange-50/60'
@@ -900,6 +1016,9 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
 
   return (
     <div className="space-y-4">
+      <TabIntro>
+        Här ser du schemat per dag och hur bemanningen ser ut över tiden. Klicka på en person för att redigera deras pass. Tryck "Generera schemaförslag" högst upp för att låta appen pussla fram alternativ.
+      </TabIntro>
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="flex gap-2 flex-wrap">
           {DAYS.map(d => (
@@ -1054,6 +1173,9 @@ function StaffView({ staff, violations, onEdit, onAdd, onLoadExample, department
   }
   return (
     <div className="space-y-4">
+      <TabIntro>
+        Lägg till och redigera personalen. Klicka på en person för att fylla i pass mån–tor, fredagsrutin, tjänstgöringsgrad och eventuella villkor som lektionstider eller varannan-vecka-schema. Listan visar varje persons mål jämfört med faktisk arbetstid.
+      </TabIntro>
       <div className="bg-white rounded-2xl ring-1 ring-stone-200 overflow-hidden">
         <table className="w-full text-sm">
           <thead className="bg-stone-50 border-b border-stone-200">
@@ -1084,6 +1206,8 @@ function StaffView({ staff, violations, onEdit, onAdd, onLoadExample, department
               if (s.latestEnd    != null) tags.push(`Senast ${minToTime(s.latestEnd)}`);
               const overrideDays = Object.keys(s.dayOverrides || {}).filter(k => s.dayOverrides[k] && Object.values(s.dayOverrides[k]).some(v => v != null));
               if (overrideDays.length > 0) tags.push(`Dagsundantag: ${overrideDays.map(k => DAYS.find(d => d.key === k).short).join(', ')}`);
+              const parityKeys = Object.keys(s.parityOverrides || {}).filter(k => s.parityOverrides[k] && Object.values(s.parityOverrides[k]).some(v => v != null));
+              if (parityKeys.length > 0) tags.push(`Varannan: ${parityKeys.map(k => k === 'even' ? 'jämn' : 'udda').join(', ')}`);
               if ((s.daysOff || []).length > 0) tags.push(`Ledig ${s.daysOff.map(d => DAYS.find(x => x.key === d).short).join(', ')}`);
               if (!s.hasFridayRotation && s.fridayShift) tags.push('Fast fredag');
               return (
@@ -1166,6 +1290,9 @@ function RulesView({ blocks, setBlocks }) {
 
   return (
     <div className="space-y-4">
+      <TabIntro>
+        Här definierar du hur många personer som behöver vara på plats vid olika tider — t.ex. fler vid morgonöppning och eftermiddag, färre under lunchen. Appen flaggar i Vecka-vyn om kraven inte täcks och försöker uppfylla dem när den genererar förslag.
+      </TabIntro>
       <div className="bg-white rounded-2xl ring-1 ring-stone-200 p-5">
         <div className="flex items-start justify-between mb-4">
           <div>
@@ -1272,6 +1399,9 @@ function SettingsView({ departments, setDepartments, staff, setStaff,
 
   return (
     <div className="space-y-4">
+      <TabIntro>
+        Övergripande inställningar för fritidshemmet. Här ändrar du avdelningar, fredagsrullens cykellängd och hanterar din data (ladda exempel eller töm allt).
+      </TabIntro>
       {/* Avdelningar */}
       <div className="bg-white rounded-2xl ring-1 ring-stone-200 p-5">
         <div className="flex items-start justify-between mb-4">
@@ -1492,7 +1622,8 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, onSave, onClose,
             <div className="mt-4">
               <p className="text-xs text-stone-600 mb-2" style={{ fontWeight: 500 }}>Tjänstgöring</p>
               <div className="grid grid-cols-2 gap-4">
-                <Field label="Heltid på arbetsplats">
+                <Field label="Heltid på arbetsplats"
+                  tip="Antal timmar per vecka som motsvarar 100% tjänstgöring i denna roll. För fritidspedagog brukar det vara 37,5 — andra yrkesgrupper kan ha annan heltid.">
                   <div className="flex items-center gap-2">
                     <input type="number" min="0" max="50" step="0.25" className="input flex-1"
                       value={form.fullTimeHours ?? 37.5}
@@ -1501,7 +1632,8 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, onSave, onClose,
                   </div>
                   <p className="text-[10px] text-stone-400 mt-1">t.ex. 37,5h för fritidspedagog</p>
                 </Field>
-                <Field label="Tjänstgöringsgrad">
+                <Field label="Tjänstgöringsgrad"
+                  tip="Hur stor andel av heltid personen arbetar. Ange 100 för heltid, 75 för deltid 75% osv. Veckotidsmålet räknas automatiskt: tjänstgöring × heltid.">
                   <div className="flex items-center gap-2">
                     <input type="number" min="0" max="200" step="1" className="input flex-1"
                       value={form.percent ?? 100}
@@ -1546,15 +1678,18 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, onSave, onClose,
             <p className="text-xs text-stone-500 mb-3">Dessa villkor respekteras när appen genererar förslag.</p>
             <div className="space-y-2.5">
               <Toggle checked={form.fixedTimes} onChange={v => setForm({ ...form, fixedTimes: v })}
-                label="Fast tid varje vecka" hint="Generatorn rör inte denna persons pass alls" />
+                label="Fast tid varje vecka" hint="Generatorn rör inte denna persons pass alls"
+                tip="Använd för personer som av kollektivavtal eller verksamhetsskäl har exakt samma tider varje vecka och inte ska kunna flyttas runt av appens automatiska schemagenerator. Du kan fortfarande redigera deras tider manuellt." />
               <Toggle checked={form.onlyAfternoons} onChange={v => setForm({ ...form, onlyAfternoons: v })}
-                label="Endast eftermiddag" hint="Får aldrig börja före kl 12:00" />
+                label="Endast eftermiddag" hint="Får aldrig börja före kl 12:00"
+                tip="Markera för personer som bara jobbar efter lunch — t.ex. lärare som har full undervisning förmiddag och bara fritidstid efter skolans slut." />
             </div>
             <div className="mt-4 space-y-4">
               <div>
                 <p className="text-xs text-stone-600 mb-2" style={{ fontWeight: 500 }}>Starttid</p>
                 <div className="grid grid-cols-2 gap-4">
-                  <Field label="Tidigast tillåten">
+                  <Field label="Tidigast tillåten"
+                    tip="Personen får inte börja jobba före denna tid. Använd för t.ex. personer som inte kan ta tidiga öppningar pga. förskolelämning av egna barn.">
                     <div className="flex items-center gap-2">
                       <input type="time" className="input flex-1" value={form.earliestStart != null ? minToTime(form.earliestStart) : ''}
                         onChange={e => setForm({ ...form, earliestStart: e.target.value ? timeToMin(e.target.value) : null })} />
@@ -1562,7 +1697,8 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, onSave, onClose,
                     </div>
                     <p className="text-[10px] text-stone-400 mt-1">Får inte börja före denna tid</p>
                   </Field>
-                  <Field label="Måste börja senast">
+                  <Field label="Måste börja senast"
+                    tip="Personen måste vara på plats senast denna tid — t.ex. för att hen har lektion 08:40 och måste ha hunnit förbereda först.">
                     <div className="flex items-center gap-2">
                       <input type="time" className="input flex-1" value={form.latestStart != null ? minToTime(form.latestStart) : ''}
                         onChange={e => setForm({ ...form, latestStart: e.target.value ? timeToMin(e.target.value) : null })} />
@@ -1575,7 +1711,8 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, onSave, onClose,
               <div>
                 <p className="text-xs text-stone-600 mb-2" style={{ fontWeight: 500 }}>Sluttid</p>
                 <div className="grid grid-cols-2 gap-4">
-                  <Field label="Måste jobba minst till">
+                  <Field label="Måste jobba minst till"
+                    tip="Personen måste vara kvar minst till denna tid — t.ex. för att hens lektion slutar 14:00 och hen inte kan gå hem före dess.">
                     <div className="flex items-center gap-2">
                       <input type="time" className="input flex-1" value={form.earliestEnd != null ? minToTime(form.earliestEnd) : ''}
                         onChange={e => setForm({ ...form, earliestEnd: e.target.value ? timeToMin(e.target.value) : null })} />
@@ -1583,7 +1720,8 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, onSave, onClose,
                     </div>
                     <p className="text-[10px] text-stone-400 mt-1">t.ex. 14:00 om lektion slutar då</p>
                   </Field>
-                  <Field label="Senast tillåten">
+                  <Field label="Senast tillåten"
+                    tip="Personen får inte sluta efter denna tid — t.ex. för att hen ska hämta egna barn på dagis innan en viss tid.">
                     <div className="flex items-center gap-2">
                       <input type="time" className="input flex-1" value={form.latestEnd != null ? minToTime(form.latestEnd) : ''}
                         onChange={e => setForm({ ...form, latestEnd: e.target.value ? timeToMin(e.target.value) : null })} />
@@ -1602,6 +1740,14 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, onSave, onClose,
               Undantag som åsidosätter de generella reglerna ovan på en specifik dag — t.ex. "måste börja senast 08:00 på onsdagar".
             </p>
             <DayOverridesEditor form={form} setForm={setForm} />
+          </Section>
+
+          {/* Varannan vecka (jämn/udda) */}
+          <Section title="Varannan vecka">
+            <p className="text-xs text-stone-500 mb-3">
+              Olika regler för jämna och udda kalenderveckor — t.ex. "kan inte öppna udda veckor" om man har barnen då.
+            </p>
+            <ParityOverridesEditor form={form} setForm={setForm} />
           </Section>
 
           {/* Fredag */}
@@ -1712,11 +1858,19 @@ function Section({ title, children }) {
   );
 }
 
-function Field({ label, children }) {
-  return (<div><label className="text-xs text-stone-600 mb-1 block">{label}</label>{children}</div>);
+function Field({ label, tip, children }) {
+  return (
+    <div>
+      <label className="text-xs text-stone-600 mb-1 block">
+        {label}
+        {tip && <Tooltip text={tip} />}
+      </label>
+      {children}
+    </div>
+  );
 }
 
-function Toggle({ checked, onChange, label, hint }) {
+function Toggle({ checked, onChange, label, hint, tip }) {
   return (
     <div className="flex items-start gap-3">
       <button type="button" onClick={() => onChange(!checked)}
@@ -1724,8 +1878,11 @@ function Toggle({ checked, onChange, label, hint }) {
         <span className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform"
           style={{ transform: checked ? 'translateX(18px)' : 'translateX(2px)' }} />
       </button>
-      <div className="cursor-pointer" onClick={() => onChange(!checked)}>
-        <p className="text-sm text-stone-700">{label}</p>
+      <div className="cursor-pointer flex-1" onClick={() => onChange(!checked)}>
+        <p className="text-sm text-stone-700 inline-flex items-center">
+          {label}
+          {tip && <Tooltip text={tip} />}
+        </p>
         {hint && <p className="text-[10px] text-stone-500 mt-0.5">{hint}</p>}
       </div>
     </div>
@@ -1830,6 +1987,186 @@ function DayOverridesEditor({ form, setForm }) {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+// Editor för paritetsundantag — låter användaren sätta olika regler för jämna/udda kalenderveckor.
+function ParityOverridesEditor({ form, setForm }) {
+  const overrides = form.parityOverrides || {};
+
+  const FIELDS = [
+    { key: 'earliestStart', label: 'Tidigast börja' },
+    { key: 'latestStart',   label: 'Måste börja senast' },
+    { key: 'earliestEnd',   label: 'Måste jobba minst till' },
+    { key: 'latestEnd',     label: 'Senast sluta' },
+  ];
+
+  const PARITIES = [
+    { key: 'even', label: 'Jämn vecka', sub: 'v.18, 20, 22 osv' },
+    { key: 'odd',  label: 'Udda vecka', sub: 'v.17, 19, 21 osv' },
+  ];
+
+  const setField = (parKey, fieldKey, val) => {
+    const next = { ...overrides };
+    next[parKey] = { ...(next[parKey] || {}) };
+    if (val === '' || val == null) delete next[parKey][fieldKey];
+    else next[parKey][fieldKey] = timeToMin(val);
+    if (Object.keys(next[parKey]).length === 0) delete next[parKey];
+    setForm({ ...form, parityOverrides: next });
+  };
+
+  const clearParity = (parKey) => {
+    const next = { ...overrides };
+    delete next[parKey];
+    setForm({ ...form, parityOverrides: next });
+  };
+
+  const general = {
+    earliestStart: form.earliestStart, latestStart: form.latestStart,
+    earliestEnd:   form.earliestEnd,   latestEnd:   form.latestEnd,
+  };
+
+  return (
+    <div className="grid md:grid-cols-2 gap-3">
+      {PARITIES.map(par => {
+        const ov = overrides[par.key] || {};
+        const hasAny = Object.keys(ov).length > 0;
+        return (
+          <div key={par.key} className={`rounded-lg p-3 ring-1 ${hasAny ? 'bg-stone-50 ring-stone-200' : 'bg-white ring-stone-100'}`}>
+            <div className="flex items-center justify-between mb-2">
+              <div>
+                <span className="text-sm text-stone-800" style={{ fontWeight: 500 }}>{par.label}</span>
+                <span className="text-[10px] text-stone-500 ml-1.5">{par.sub}</span>
+              </div>
+              {hasAny && (
+                <button type="button" onClick={() => clearParity(par.key)}
+                  className="text-xs text-stone-500 hover:text-red-600 flex items-center gap-1">
+                  <Trash2 size={11} />Rensa
+                </button>
+              )}
+            </div>
+            <div className="space-y-2">
+              {FIELDS.map(f => {
+                const val = ov[f.key];
+                const generalVal = general[f.key];
+                const isOverriding = val != null;
+                return (
+                  <div key={f.key}>
+                    <label className="text-[10px] text-stone-600 block mb-0.5">
+                      {f.label}
+                      {!isOverriding && generalVal != null && (
+                        <span className="text-stone-400"> (generellt: {minToTime(generalVal)})</span>
+                      )}
+                    </label>
+                    <div className="flex items-center gap-1">
+                      <input type="time" className="input flex-1"
+                        value={val != null ? minToTime(val) : ''}
+                        onChange={e => setField(par.key, f.key, e.target.value)} />
+                      {isOverriding && (
+                        <button type="button" onClick={() => setField(par.key, f.key, '')}
+                          className="text-xs text-stone-400 hover:text-stone-700 px-1" title="Ta bort detta fält">×</button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// -------- Welcome Modal & Tour --------
+
+function WelcomeModal({ onClose, onStartTour }) {
+  const STEPS = [
+    { num: '1', title: 'Lägg till avdelningar', desc: 'Vad heter era avdelningar? Färgkoda dem så ni ser dem tydligt.' },
+    { num: '2', title: 'Lägg till personal', desc: 'En åt gången. Fyll i namn, tjänstgöring och eventuella villkor som lektionstider.' },
+    { num: '3', title: 'Justera bemanningskrav', desc: 'Hur många behöver vara på plats vid olika tider på dagen? Morgon, eftermiddag osv.' },
+    { num: '4', title: 'Generera schemaförslag', desc: 'Tryck på knappen — appen pusslar fram tre olika alternativ baserat på allas villkor.' },
+  ];
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: 'rgba(28, 25, 23, 0.5)' }}>
+      <div className="bg-white rounded-2xl shadow-2xl max-w-lg w-full overflow-hidden">
+        <div className="px-6 py-5 border-b border-stone-200">
+          <p className="text-xs uppercase tracking-widest text-stone-500 mb-1">Välkommen till SchemaFIX</p>
+          <h2 className="display-font text-3xl text-stone-800" style={{ letterSpacing: '-0.02em' }}>Så här kommer du igång</h2>
+          <p className="text-sm text-stone-600 mt-2">Fyra enkla steg för att skapa ert första schema.</p>
+        </div>
+        <div className="px-6 py-5 space-y-3">
+          {STEPS.map((s) => (
+            <div key={s.num} className="flex gap-3">
+              <div className="flex-shrink-0 w-8 h-8 rounded-full bg-stone-800 text-white flex items-center justify-center display-font text-sm">
+                {s.num}
+              </div>
+              <div className="pt-0.5">
+                <p className="text-sm text-stone-800" style={{ fontWeight: 500 }}>{s.title}</p>
+                <p className="text-xs text-stone-600 mt-0.5">{s.desc}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="px-6 py-4 border-t border-stone-200 bg-stone-50 flex gap-2 justify-between flex-wrap">
+          <button onClick={onClose}
+            className="px-4 py-2 text-sm rounded-lg text-stone-600 hover:bg-stone-100 transition">
+            Hoppa över
+          </button>
+          <button onClick={onStartTour}
+            className="px-5 py-2 text-sm rounded-lg bg-stone-800 text-white hover:bg-stone-900 transition flex items-center gap-2">
+            Visa mig hur <ArrowRight size={14} />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TourBubble({ step, onNext, onClose }) {
+  const STEPS = [
+    {
+      title: 'Steg 1 av 4 · Avdelningar',
+      desc: 'Här definierar du avdelningarna på fritidshemmet. Klicka "Lägg till avdelning" om ni har flera, eller döp om den befintliga. Färgen används för att markera personal i schemavyn.',
+    },
+    {
+      title: 'Steg 2 av 4 · Personal',
+      desc: 'Lägg till en kollega i taget. Klicka "Lägg till personal" eller redigera en befintlig. Tjänstgöring i procent (t.ex. 100% av 37,5h), ordinarie pass mån–tor, fredagsrutin och eventuella villkor som "måste börja senast 08:40 för lektion".',
+    },
+    {
+      title: 'Steg 3 av 4 · Bemanningskrav',
+      desc: 'Hur många personer behöver vara på plats vid olika tider? Här definierar du tidsblock — morgonfritids, skoldag, eftermiddag — med minsta antal personal. Appen flaggar när det inte stämmer.',
+    },
+    {
+      title: 'Steg 4 av 4 · Vecka & Generera',
+      desc: 'Här ser du schemat per dag och täckning över tiden. Tryck på "Generera schemaförslag" högst upp för att låta appen pussla fram tre alternativ baserat på allas villkor — eller justera manuellt genom att klicka på en person.',
+    },
+  ];
+  const cur = STEPS[step];
+  const isLast = step === STEPS.length - 1;
+  return (
+    <div className="fixed bottom-6 right-6 z-50 max-w-sm">
+      <div className="bg-stone-800 text-white rounded-2xl shadow-2xl p-5">
+        <div className="flex items-start justify-between mb-2 gap-3">
+          <p className="display-font text-base" style={{ fontWeight: 500 }}>{cur.title}</p>
+          <button onClick={onClose} className="text-stone-400 hover:text-white flex-shrink-0">
+            <X size={16} />
+          </button>
+        </div>
+        <p className="text-sm text-stone-300 mb-4 leading-relaxed">{cur.desc}</p>
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex gap-1">
+            {STEPS.map((_, i) => (
+              <span key={i} className={`w-1.5 h-1.5 rounded-full ${i === step ? 'bg-white' : 'bg-stone-600'}`} />
+            ))}
+          </div>
+          <button onClick={onNext}
+            className="px-4 py-1.5 text-sm rounded-lg bg-white text-stone-900 hover:bg-stone-100 transition flex items-center gap-1.5">
+            {isLast ? 'Klart' : 'Nästa'} {!isLast && <ArrowRight size={12} />}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
