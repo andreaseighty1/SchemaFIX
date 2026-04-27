@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>SchemaFIX — fritidshem</title>
+<title>Schemapussel — fritidshem</title>
 
 <!-- Tailwind via CDN för styling -->
 <script src="https://cdn.tailwindcss.com"></script>
@@ -414,6 +414,9 @@ function FritidsSchemaApp() {
   const [loaded, setLoaded] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [savedFileName, setSavedFileName] = useState(null);
+  // Referens till en öppnad fil (File System Access API). Kan inte sparas i localStorage,
+  // så den nollställs vid ny session — men då fortsätter Spara att fungera (faller tillbaka till nedladdning).
+  const [fileHandle, setFileHandle] = useState(null);
 
   // När cykellängden ändras: justera alla personers fridayRotation till rätt längd,
   // och håll currentFridayWeek inom giltigt intervall.
@@ -464,52 +467,124 @@ function FritidsSchemaApp() {
     setDirty(true);
   }, [staff, departments, coverageBlocks, fridayCycleWeeks, loaded]);
 
-  // Exportera till fil
-  const saveToFile = () => {
-    const data = {
-      version: 1,
-      exportedAt: new Date().toISOString(),
-      staff, departments, coverageBlocks, fridayCycleWeeks,
-    };
+  // Hjälp: bygg datapaketet att skriva till fil
+  const buildSaveData = () => ({
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    staff, departments, coverageBlocks, fridayCycleWeeks,
+  });
+
+  // Skriv data till en redan öppnad fil-handle
+  const writeToHandle = async (handle, data) => {
+    const writable = await handle.createWritable();
+    await writable.write(JSON.stringify(data, null, 2));
+    await writable.close();
+  };
+
+  // Spara: använder File System Access API om webbläsaren stöder det,
+  // annars faller den tillbaka till vanlig nedladdning (Hämtade filer).
+  const saveToFile = async (saveAs = false) => {
+    const data = buildSaveData();
+    const today = new Date().toISOString().slice(0, 10);
+    const defaultName = `fritidsschema-${today}.json`;
+
+    // Modern API (Chrome/Edge/Opera): visar en riktig "Spara som"-dialog
+    if (window.showSaveFilePicker) {
+      try {
+        let handle = fileHandle;
+        // Inget öppet handle eller "Spara som" begärt — visa dialog
+        if (!handle || saveAs) {
+          handle = await window.showSaveFilePicker({
+            suggestedName: savedFileName || defaultName,
+            types: [{
+              description: 'Schemafil',
+              accept: { 'application/json': ['.json'] },
+            }],
+          });
+          setFileHandle(handle);
+        }
+        await writeToHandle(handle, data);
+        setSavedFileName(handle.name);
+        setDirty(false);
+        return;
+      } catch (err) {
+        // Användaren avbröt dialogen — gör inget
+        if (err.name === 'AbortError') return;
+        // Annat fel — fall ner till fallback
+        console.error('File picker fel:', err);
+      }
+    }
+
+    // Fallback (Firefox/Safari): vanlig nedladdning till Hämtade filer
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    const today = new Date().toISOString().slice(0, 10);
-    const fname = `fritidsschema-${today}.json`;
     a.href = url;
-    a.download = fname;
+    a.download = savedFileName || defaultName;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+    setSavedFileName(a.download);
     setDirty(false);
-    setSavedFileName(fname);
   };
 
-  // Importera från fil
-  const loadFromFile = (file) => {
+  // Öppna fil: använder File System Access API om tillgängligt så att Spara
+  // sedan kan skriva tillbaka till samma fil utan ny dialog.
+  const openFile = async () => {
+    if (window.showOpenFilePicker) {
+      try {
+        const [handle] = await window.showOpenFilePicker({
+          types: [{
+            description: 'Schemafil',
+            accept: { 'application/json': ['.json'] },
+          }],
+        });
+        const file = await handle.getFile();
+        await loadFromFileObject(file);
+        setFileHandle(handle);
+      } catch (err) {
+        if (err.name !== 'AbortError') console.error('File picker fel:', err);
+      }
+      return;
+    }
+    // Fallback: trigga den dolda <input type="file">
+    document.getElementById('loadFileInput').click();
+  };
+
+  // Läs in en File-instans (gemensam för båda flöden)
+  const loadFromFileObject = (file) => new Promise((resolve) => {
     const reader = new FileReader();
     reader.onload = (e) => {
       try {
         const data = JSON.parse(e.target.result);
         if (!data.staff || !data.departments) {
           alert('Den här filen ser inte ut att vara ett sparat schema.');
-          return;
+          resolve(false); return;
         }
-        if (staff.length > 0 && !confirm('Detta ersätter all nuvarande data. Fortsätt?')) return;
+        if (staff.length > 0 && !confirm('Detta ersätter all nuvarande data. Fortsätt?')) {
+          resolve(false); return;
+        }
         setStaff(data.staff || []);
         setDepartments(data.departments || []);
         setCoverageBlocks(data.coverageBlocks || initialCoverageBlocks);
         setFridayCycleWeeksRaw(data.fridayCycleWeeks || 8);
         if (data.staff && data.staff.length > 0) nextId = Math.max(...data.staff.map(p => p.id), 99) + 1;
         setSavedFileName(file.name);
-        // Markera direkt som inte-dirty efter import
         setTimeout(() => setDirty(false), 50);
+        resolve(true);
       } catch (err) {
         alert('Kunde inte läsa filen: ' + err.message);
+        resolve(false);
       }
     };
     reader.readAsText(file);
+  });
+
+  // Bakåtkompatibel wrapper för den dolda <input type="file"> i fallback-läge
+  const loadFromFile = (file) => {
+    setFileHandle(null); // Ingen handle vid fallback
+    loadFromFileObject(file);
   };
 
   // Varna innan användaren stänger fliken om det finns osparade ändringar
@@ -645,9 +720,9 @@ function FritidsSchemaApp() {
         <header className="mb-8 flex items-end justify-between flex-wrap gap-4">
           <div>
             <p className="text-xs uppercase tracking-widest text-stone-500 mb-1">Fritidshem · schemaverktyg</p>
-            <h1 className="display-font text-4xl text-stone-800" style={{ letterSpacing: '-0.02em' }}>SchemaFIX</h1>
+            <h1 className="display-font text-4xl text-stone-800" style={{ letterSpacing: '-0.02em' }}>Schemapussel</h1>
             <div className="flex items-center gap-2 mt-1">
-              <p className="text-stone-600 text-sm">Prototyp v8 · spara/öppna fil</p>
+              <p className="text-stone-600 text-sm">Prototyp v9 · spara/öppna med rätt mappval</p>
               {dirty && (
                 <span className="inline-flex items-center gap-1 text-xs text-amber-700 bg-amber-50 ring-1 ring-amber-200 rounded-full px-2 py-0.5">
                   <Circle size={6} fill="currentColor" />
@@ -667,14 +742,23 @@ function FritidsSchemaApp() {
                   if (file) loadFromFile(file);
                   e.target.value = '';
                 }} />
-              <button onClick={() => document.getElementById('loadFileInput').click()}
-                className="px-3 py-2 rounded-lg text-sm bg-white text-stone-700 ring-1 ring-stone-200 hover:bg-stone-50 transition flex items-center gap-1.5">
+              <button onClick={openFile}
+                className="px-3 py-2 rounded-lg text-sm bg-white text-stone-700 ring-1 ring-stone-200 hover:bg-stone-50 transition flex items-center gap-1.5"
+                title="Öppna en sparad schemafil">
                 <Upload size={14} />Öppna
               </button>
-              <button onClick={saveToFile}
-                className={`px-3 py-2 rounded-lg text-sm ring-1 transition flex items-center gap-1.5 ${dirty ? 'bg-amber-50 text-amber-900 ring-amber-300 hover:bg-amber-100' : 'bg-white text-stone-700 ring-stone-200 hover:bg-stone-50'}`}>
+              <button onClick={() => saveToFile(false)}
+                className={`px-3 py-2 rounded-lg text-sm ring-1 transition flex items-center gap-1.5 ${dirty ? 'bg-amber-50 text-amber-900 ring-amber-300 hover:bg-amber-100' : 'bg-white text-stone-700 ring-stone-200 hover:bg-stone-50'}`}
+                title={fileHandle ? `Sparar till ${savedFileName}` : 'Välj plats och spara'}>
                 <Download size={14} />Spara
               </button>
+              {fileHandle && (
+                <button onClick={() => saveToFile(true)}
+                  className="px-3 py-2 rounded-lg text-sm bg-white text-stone-700 ring-1 ring-stone-200 hover:bg-stone-50 transition flex items-center gap-1.5"
+                  title="Spara som ny fil">
+                  Spara som...
+                </button>
+              )}
             </div>
             <button onClick={handleGenerate} disabled={generating || staff.length === 0}
               className="px-4 py-2.5 rounded-full text-sm bg-stone-800 text-white hover:bg-stone-900 transition flex items-center gap-2 disabled:opacity-50">
@@ -724,8 +808,9 @@ function FritidsSchemaApp() {
           staff={staff} setStaff={setStaff}
           fridayCycleWeeks={fridayCycleWeeks} setFridayCycleWeeks={setFridayCycleWeeks} />}
 
-        <footer className="mt-10 pt-6 border-t border-stone-200 text-xs text-stone-500">
-          Klicka på en person för att redigera detaljer. Tryck "Generera schemaförslag" när du vill att appen pusslar fram alternativ baserat på allas villkor.
+        <footer className="mt-10 pt-6 border-t border-stone-200 text-xs text-stone-500 flex justify-between items-start gap-4 flex-wrap">
+          <span>Klicka på en person för att redigera detaljer. Tryck "Generera schemaförslag" när du vill att appen pusslar fram alternativ baserat på allas villkor.</span>
+          <span className="text-stone-400 whitespace-nowrap">© 2026 Andreas Jonsson, Lärare i fritidshem</span>
         </footer>
       </div>
 
