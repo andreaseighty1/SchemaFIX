@@ -734,7 +734,7 @@ function FritidsSchemaApp() {
             <p className="text-xs uppercase tracking-widest text-stone-500 mb-1">Fritidshem · schemaverktyg</p>
             <h1 className="display-font text-4xl text-stone-800" style={{ letterSpacing: '-0.02em' }}>SchemaFIX</h1>
             <div className="flex items-center gap-2 mt-1">
-              <p className="text-stone-600 text-sm">Prototyp v10 · dagsspecifika undantag per person</p>
+              <p className="text-stone-600 text-sm">Prototyp v11 · datahantering samlad i Inställningar</p>
               {dirty && (
                 <span className="inline-flex items-center gap-1 text-xs text-amber-700 bg-amber-50 ring-1 ring-amber-200 rounded-full px-2 py-0.5">
                   <Circle size={6} fill="currentColor" />
@@ -814,11 +814,12 @@ function FritidsSchemaApp() {
             hasFridaySetup={staff.some(s => (s.hasFridayRotation && Array.isArray(s.fridayRotation) && s.fridayRotation.some(x => x)) || (!s.hasFridayRotation && s.fridayShift))} />
         )}
         {view === 'staff' && <StaffView staff={staff} violations={violations} onEdit={setEditingId} onAdd={addStaff}
-          onLoadExample={loadExample} onClearAll={clearAll} departments={departments} />}
+          onLoadExample={loadExample} departments={departments} />}
         {view === 'rules' && <RulesView blocks={coverageBlocks} setBlocks={setCoverageBlocks} />}
         {view === 'settings' && <SettingsView departments={departments} setDepartments={setDepartments}
           staff={staff} setStaff={setStaff}
-          fridayCycleWeeks={fridayCycleWeeks} setFridayCycleWeeks={setFridayCycleWeeks} />}
+          fridayCycleWeeks={fridayCycleWeeks} setFridayCycleWeeks={setFridayCycleWeeks}
+          onLoadExample={loadExample} onClearAll={clearAll} />}
 
         <footer className="mt-10 pt-6 border-t border-stone-200 text-xs text-stone-500 flex justify-between items-start gap-4 flex-wrap">
           <span>Klicka på en person för att redigera detaljer. Tryck "Generera schemaförslag" när du vill att appen pusslar fram alternativ baserat på allas villkor.</span>
@@ -1028,7 +1029,7 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
   );
 }
 
-function StaffView({ staff, violations, onEdit, onAdd, onLoadExample, onClearAll, departments }) {
+function StaffView({ staff, violations, onEdit, onAdd, onLoadExample, departments }) {
   if (staff.length === 0) {
     return (
       <div className="bg-white rounded-2xl ring-1 ring-stone-200 p-12 text-center">
@@ -1121,12 +1122,9 @@ function StaffView({ staff, violations, onEdit, onAdd, onLoadExample, onClearAll
         </table>
         <div className="px-4 py-3 bg-stone-50/50 border-t border-stone-200 flex justify-between items-center flex-wrap gap-2">
           <span className="text-xs text-stone-500">{staff.length} personer totalt</span>
-          <div className="flex items-center gap-3">
-            <button onClick={onClearAll} className="text-xs text-stone-500 hover:text-red-600">Töm allt</button>
-            <button onClick={onAdd} className="text-sm flex items-center gap-1.5 text-stone-700 hover:text-stone-900">
-              <Plus size={14} />Lägg till personal
-            </button>
-          </div>
+          <button onClick={onAdd} className="text-sm flex items-center gap-1.5 text-stone-700 hover:text-stone-900">
+            <Plus size={14} />Lägg till personal
+          </button>
         </div>
       </div>
 
@@ -1252,7 +1250,7 @@ function RulesView({ blocks, setBlocks }) {
 // -------- Settings View (departments etc.) --------
 
 function SettingsView({ departments, setDepartments, staff, setStaff,
-                        fridayCycleWeeks, setFridayCycleWeeks }) {
+                        fridayCycleWeeks, setFridayCycleWeeks, onLoadExample, onClearAll }) {
   const updateDept = (id, patch) => setDepartments(departments.map(d => d.id === id ? { ...d, ...patch } : d));
   const removeDept = (id) => {
     const usedBy = staff.filter(s => s.deptId === id);
@@ -1385,6 +1383,34 @@ function SettingsView({ departments, setDepartments, staff, setStaff,
             <p className="text-[10px] text-stone-400 mt-2">— betyder ledig den fredagen. Klicka på personen i Personal-fliken för att redigera deras tider.</p>
           </div>
         )}
+      </div>
+
+      {/* Data — exempel och rensning */}
+      <div className="bg-white rounded-2xl ring-1 ring-stone-200 p-5">
+        <h2 className="display-font text-xl text-stone-800">Data</h2>
+        <p className="text-sm text-stone-500 mt-0.5 mb-4">Återställning och exempeldata. Påverkar all personal — varnar först.</p>
+        <div className="space-y-3">
+          <div className="flex items-start justify-between gap-4 flex-wrap py-2">
+            <div className="flex-1 min-w-[200px]">
+              <p className="text-sm text-stone-800" style={{ fontWeight: 500 }}>Ladda exempeldata</p>
+              <p className="text-xs text-stone-500 mt-0.5">Fyller appen med tre avdelningar och tolv personer för att visa hur funktionerna fungerar. Ersätter befintlig data.</p>
+            </div>
+            <button onClick={onLoadExample}
+              className="px-4 py-2 rounded-lg text-sm bg-stone-100 text-stone-700 hover:bg-stone-200 transition whitespace-nowrap">
+              Ladda exempel
+            </button>
+          </div>
+          <div className="flex items-start justify-between gap-4 flex-wrap py-2 border-t border-stone-100 pt-3">
+            <div className="flex-1 min-w-[200px]">
+              <p className="text-sm text-stone-800" style={{ fontWeight: 500 }}>Töm all personal</p>
+              <p className="text-xs text-stone-500 mt-0.5">Tar bort alla personer. Avdelningar, bemanningskrav och fredagscykel behålls.</p>
+            </div>
+            <button onClick={onClearAll}
+              className="px-4 py-2 rounded-lg text-sm bg-white text-red-700 ring-1 ring-red-200 hover:bg-red-50 transition whitespace-nowrap">
+              Töm allt
+            </button>
+          </div>
+        </div>
       </div>
 
       <style>{`
