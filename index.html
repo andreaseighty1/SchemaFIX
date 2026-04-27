@@ -1,0 +1,1739 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SchemaFIX — fritidshem</title>
+
+<!-- Tailwind via CDN för styling -->
+<script src="https://cdn.tailwindcss.com"></script>
+
+<!-- React + ReactDOM -->
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+<!-- Babel för att kompilera JSX i webbläsaren -->
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<!-- lucide-react — vi använder den globala lucide UMD-byggen och plockar ikonerna manuellt -->
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+
+<style>
+  body { margin: 0; background: #FBF8F4; }
+  /* Försäkrar att font-imports fungerar innan Tailwind kommer på plats */
+  html, body, #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+// Bygg lucide-react-stilade komponenter ovanpå lucide UMD.
+// lucide UMD exponerar varje ikon som en array av barn-element: [[tag, attrs], [tag, attrs], ...]
+// Vi bygger en React-komponent som tar size/className/fill/style etc precis som lucide-react.
+(function() {
+  const { createElement: h } = React;
+  const iconNames = ['AlertCircle', 'Clock', 'Users', 'Calendar', 'CheckCircle2', 'ChevronRight', 'Edit3', 'Sparkles', 'X', 'Plus', 'Trash2', 'Wand2', 'Settings', 'Download', 'Upload', 'Circle'];
+  const defaultSvgAttrs = {
+    xmlns: 'http://www.w3.org/2000/svg',
+    viewBox: '0 0 24 24',
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+  };
+  const icons = {};
+  iconNames.forEach(name => {
+    icons[name] = function IconComponent(props = {}) {
+      const { size = 24, fill, color, className, style, ...rest } = props;
+      const iconChildren = window.lucide && window.lucide[name];
+      if (!iconChildren || !Array.isArray(iconChildren)) {
+        return h('span', { className, style });
+      }
+      const children = iconChildren.map((child, i) => {
+        const [tag, childAttrs] = child;
+        // Konvertera kebab-case attrs (stroke-width) → camelCase för React
+        const reactAttrs = {};
+        Object.entries(childAttrs || {}).forEach(([k, v]) => {
+          const reactKey = k.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+          reactAttrs[reactKey] = v;
+        });
+        return h(tag, { key: i, ...reactAttrs });
+      });
+      return h('svg', {
+        ...defaultSvgAttrs,
+        width: size, height: size,
+        fill: fill || defaultSvgAttrs.fill,
+        stroke: color || defaultSvgAttrs.stroke,
+        className, style,
+        ...rest,
+      }, ...children);
+    };
+  });
+  window.__icons = icons;
+})();
+</script>
+
+<script type="text/babel" data-presets="react">
+// Plocka ut ikon-komponenterna så att resten av koden kan använda dem direkt
+const { AlertCircle, Clock, Users, Calendar, CheckCircle2, ChevronRight, Edit3, Sparkles, X, Plus, Trash2, Wand2, Settings, Download, Upload, Circle } = window.__icons;
+const { useState, useMemo, useEffect } = React;
+
+
+
+// ==================== DATA ====================
+
+// Färgpalett för avdelningar — används för nya avdelningar i tur och ordning
+const DEPT_COLORS = ['#D97757', '#3D7A8C', '#8B6FA8', '#5C8A5E', '#B8860B', '#7A5C8E', '#A0522D', '#4A6FA5'];
+
+// Default-avdelning vid första start (en enda, döpas/ändras enkelt)
+const initialDepartments = [
+  { id: 'd1', name: 'Fritids', color: DEPT_COLORS[0] },
+];
+
+// Hjälp: räkna ut "soft" pastellvariant från huvudfärg
+function softColor(hex) {
+  if (!hex || hex.length < 7) return '#f5f5f4';
+  const r = parseInt(hex.slice(1,3), 16);
+  const g = parseInt(hex.slice(3,5), 16);
+  const b = parseInt(hex.slice(5,7), 16);
+  const blend = c => Math.round(c * 0.18 + 255 * 0.82);
+  const toHex = c => c.toString(16).padStart(2, '0');
+  return `#${toHex(blend(r))}${toHex(blend(g))}${toHex(blend(b))}`;
+}
+
+// Slå upp en avdelning från id (eller fallback om den raderats)
+function getDept(deptId, departments) {
+  return departments.find(d => d.id === deptId) || { id: '?', name: '(saknas)', color: '#999999' };
+}
+
+// Räkna ut målet i minuter från fullTimeHours + percent
+function getTargetMin(person) {
+  return Math.round(((person.fullTimeHours ?? 37.5) * 60 * (person.percent ?? 100)) / 100);
+}
+
+// Räkna ut en persons fredagspass för en given vecka i cykeln (1-indexerad).
+// Modell: varje person har sin EGNA lista av fredagspass (en per vecka i cykeln).
+// Det är samma struktur som i den ursprungliga Excel-filen — varje person har sin rad.
+function getFridayShift(person, week, cycleWeeks) {
+  if (!person.hasFridayRotation && person.fridayShift) return person.fridayShift;
+  if (person.hasFridayRotation && Array.isArray(person.fridayRotation) && person.fridayRotation.length > 0) {
+    const len = person.fridayRotation.length;
+    const idx = (((week - 1) % len) + len) % len;
+    return person.fridayRotation[idx] || null;
+  }
+  return null;
+}
+
+// Snittlig fredagstid över cykeln (för veckotim-räkning)
+function avgFridayMinutes(person, cycleWeeks) {
+  if (!person.hasFridayRotation && person.fridayShift) return dayMinutes(person.fridayShift);
+  if (!person.hasFridayRotation || !Array.isArray(person.fridayRotation) || person.fridayRotation.length === 0) return 0;
+  let sum = 0;
+  for (let w = 1; w <= cycleWeeks; w++) {
+    const sh = getFridayShift(person, w, cycleWeeks);
+    if (sh) sum += dayMinutes(sh);
+  }
+  return sum / cycleWeeks;
+}
+
+// Justera längden på en persons rotation-array (fyll med null eller trunkera)
+function resizeRotation(rotation, length) {
+  const cur = Array.isArray(rotation) ? rotation : [];
+  const out = new Array(length).fill(null);
+  for (let i = 0; i < Math.min(cur.length, length); i++) out[i] = cur[i];
+  return out;
+}
+
+const DAYS = [
+  { key: 'mon', label: 'Måndag', short: 'mån' },
+  { key: 'tue', label: 'Tisdag', short: 'tis' },
+  { key: 'wed', label: 'Onsdag', short: 'ons' },
+  { key: 'thu', label: 'Torsdag', short: 'tor' },
+];
+
+// Standardvärden för alla parametrar — gör koden nedan mer läsbar
+const DEFAULTS = {
+  fullTimeHours: 37.5, percent: 100,
+  fixedTimes: false, onlyAfternoons: false,
+  earliestStart: null, latestStart: null,
+  earliestEnd: null, latestEnd: null,
+  daysOff: [], hasFridayRotation: true, fridayShift: null, fridayRotation: null,
+};
+
+// Hjälpfunktion: bygger en personalpost med default-värden + det man skickar in
+const P = (fields) => ({ ...DEFAULTS, ...fields });
+
+// Tom start. EXAMPLE_STAFF + EXAMPLE_DEPARTMENTS kan laddas in via knapp.
+const initialStaff = [];
+
+const EXAMPLE_DEPARTMENTS = [
+  { id: 'd1', name: 'Jupiter',    color: '#D97757' },
+  { id: 'd2', name: 'Neptunus',   color: '#3D7A8C' },
+  { id: 'd3', name: 'Vintergatan',color: '#8B6FA8' },
+];
+
+// Exempel-bas: 8 turer som rullas igenom. Varje person får en kopia förskjuten med olika offset
+// så de inte alla har samma tider samma vecka.
+const _FRIDAY_BASE = [
+  ['06:00','14:30'],
+  ['07:00','15:30'],
+  ['08:00','16:30'],
+  ['09:30','17:00'],
+  ['10:00','17:45'],
+  null,                  // ledig vecka
+  ['06:30','15:00'],
+  ['07:30','16:00'],
+];
+function exampleRotation(offset) {
+  return _FRIDAY_BASE.map((_, i) => _FRIDAY_BASE[(i + offset) % _FRIDAY_BASE.length]);
+}
+
+const EXAMPLE_STAFF = [
+  P({ id: 1, name: 'Christina', deptId: 'd1', percent: 82, role: '',
+      sched: { mon:['08:00','16:20'], tue:['07:00','16:00'], wed:['07:05','16:00'], thu:['10:15','16:45'] },
+      fridayRotation: exampleRotation(0) }),
+  P({ id: 2, name: 'Gustav', deptId: 'd1', percent: 82, role: 'musik',
+      sched: { mon:['05:50','15:00'], tue:['10:15','17:45'], wed:['07:45','16:20'], thu:['08:45','16:15'] },
+      fridayRotation: exampleRotation(1) }),
+  P({ id: 3, name: 'Petter', deptId: 'd1', percent: 100, fullTimeHours: 37.75, role: '',
+      sched: { mon:['08:45','16:45'], tue:['07:45','16:20'], wed:['09:50','16:30'], thu:['06:45','15:30'] },
+      fixedTimes: true, hasFridayRotation: false, fridayShift: ['07:45','15:45'] }),
+  P({ id: 4, name: 'Anna', deptId: 'd2', percent: 82, role: 'rastkul',
+      sched: { mon:['11:00','17:45'], tue:['08:40','16:25'], wed:['07:15','16:30'], thu:['07:00','16:00'] },
+      fridayRotation: exampleRotation(2) }),
+  P({ id: 5, name: 'Markus', deptId: 'd2', percent: 82, role: 'rastkul',
+      sched: { mon:['07:15','16:25'], tue:['09:25','16:45'], wed:['05:50','15:00'], thu:['09:25','16:30'] },
+      fridayRotation: exampleRotation(3) }),
+  P({ id: 6, name: 'Andreas', deptId: 'd2', percent: 81.3, role: 'åk 3',
+      sched: { mon:['07:55','16:00'], tue:['07:00','16:15'], wed:['09:00','16:45'], thu:['08:30','16:25'] },
+      latestStart: 8*60+40,
+      hasFridayRotation: false, fridayShift: ['08:45','15:45'] }),
+  P({ id: 7, name: 'Mia', deptId: 'd3', percent: 82, role: 'åk 1',
+      sched: { mon:['08:00','16:00'], tue:['07:15','16:20'], wed:['11:00','17:45'], thu:['07:05','16:00'] },
+      latestStart: 8*60+40,
+      fridayRotation: exampleRotation(4) }),
+  P({ id: 8, name: 'Emma', deptId: 'd3', percent: 100, fullTimeHours: 37.75, role: '',
+      sched: { mon:['07:10','16:00'], tue:['09:10','16:30'], wed:['07:00','16:00'], thu:['10:55','17:45'] },
+      fridayRotation: exampleRotation(5) }),
+  P({ id: 9, name: 'Jonas W', deptId: 'd3', percent: 82, role: 'åk 5',
+      sched: { mon:['08:00','16:30'], tue:['05:50','15:00'], wed:['10:05','16:30'], thu:['07:15','16:00'] },
+      latestStart: 8*60+40,
+      fridayRotation: exampleRotation(6) }),
+  P({ id:10, name: 'Lars', deptId: 'd3', percent: 45.6, role: 'åk 2',
+      sched: { mon:['13:00','16:30'], tue:['13:00','16:15'], wed:['12:45','16:00'], thu:['13:00','16:30'] },
+      onlyAfternoons: true, hasFridayRotation: false }),
+  P({ id:11, name: 'Susanne', deptId: 'd3', percent: 82, role: 'fklass',
+      sched: { mon:['07:00','15:30'], tue:['09:10','16:30'], wed:['08:30','16:15'], thu:['05:50','15:00'] },
+      latestStart: 8*60+40,
+      fridayRotation: exampleRotation(7) }),
+  P({ id:12, name: 'Hampus', deptId: 'd3', percent: 82, role: '',
+      sched: { mon:['06:45','15:45'], tue:['06:45','15:30'], wed:['06:45','15:30'], thu:['07:45','15:45'] },
+      fixedTimes: true, hasFridayRotation: false, fridayShift: ['07:45','15:45'] }),
+];
+
+// Bemanningskrav som redigerbara block. Varje block: starttid–sluttid → minst N personer.
+// Tider är i minuter från midnatt (t.ex. 360 = 06:00).
+const initialCoverageBlocks = [
+  { id: 1, start: 350, end: 480, min: 2, label: 'Morgonfritids' },     // 05:50–08:00
+  { id: 2, start: 480, end: 780, min: 1, label: 'Skoldag' },            // 08:00–13:00
+  { id: 3, start: 780, end: 990, min: 4, label: 'Eftermiddagsfritids' },// 13:00–16:30
+  { id: 4, start: 990, end: 1065, min: 2, label: 'Sen eftermiddag' },   // 16:30–17:45
+];
+
+// Konvertera block till 15-min slots som resten av koden använder
+function blocksToSlots(blocks) {
+  const arr = [];
+  for (let m = 330; m < 1080; m += 15) {
+    let min = 0;
+    for (const b of blocks) {
+      if (m >= b.start && m < b.end) { min = b.min; break; }
+    }
+    arr.push({ start: m, min });
+  }
+  return arr;
+}
+
+// ==================== HELPERS ====================
+
+function timeToMin(t) { if (!t) return null; const [h, m] = t.split(':').map(Number); return h * 60 + m; }
+function minToTime(m) { const h = Math.floor(m / 60); const mm = m % 60; return `${String(h).padStart(2, '0')}:${String(mm).padStart(2, '0')}`; }
+function minToHM(min) { const h = Math.floor(Math.abs(min) / 60); const m = Math.abs(min) % 60; const sign = min < 0 ? '-' : ''; return `${sign}${h} h ${m} min`; }
+function dayMinutes(sched) { return timeToMin(sched[1]) - timeToMin(sched[0]); }
+function weeklyMinutes(staff, cycleWeeks = 8) {
+  let total = 0;
+  for (const d of DAYS) if (staff.sched?.[d.key]) total += dayMinutes(staff.sched[d.key]);
+  total += avgFridayMinutes(staff, cycleWeeks);
+  return Math.round(total);
+}
+
+// ==================== SCHEDULE GENERATOR (Simulated Annealing) ====================
+
+function computeSlots(staff, dayKey, coverage) {
+  return coverage.map(slot => {
+    let count = 0;
+    for (const p of staff) {
+      const sh = p.sched[dayKey];
+      if (!sh) continue;
+      const start = timeToMin(sh[0]);
+      const end = timeToMin(sh[1]);
+      if (start <= slot.start && end > slot.start) count++;
+    }
+    return { ...slot, count };
+  });
+}
+
+function scheduleScore(staff, coverage, cycleWeeks, weights = { gap: 30, hours: 2, over: 1 }) {
+  let score = 0;
+  // Hour target
+  for (const p of staff) {
+    const wm = weeklyMinutes(p, cycleWeeks);
+    score -= Math.abs(wm - getTargetMin(p)) * weights.hours;
+  }
+  // Coverage (mån-tor)
+  for (const d of DAYS) {
+    const slots = computeSlots(staff, d.key, coverage);
+    for (const s of slots) {
+      if (s.count < s.min) score -= (s.min - s.count) ** 2 * weights.gap;
+      if (s.count > s.min + 2) score -= (s.count - s.min - 2) * weights.over;
+    }
+  }
+  return score;
+}
+
+function isShiftLegal(person, dayKey, newShift) {
+  const start = timeToMin(newShift[0]);
+  const end = timeToMin(newShift[1]);
+  if (start === null || end === null) return false;
+  if (end - start < 60) return false;
+  if (start < 330 || end > 1080) return false;
+  if (person.onlyAfternoons && start < 720) return false;
+  if (person.earliestStart != null && start < person.earliestStart) return false;
+  if (person.latestStart  != null && start > person.latestStart)  return false;
+  if (person.earliestEnd  != null && end   < person.earliestEnd)  return false;
+  if (person.latestEnd    != null && end   > person.latestEnd)    return false;
+  if ((person.daysOff || []).includes(dayKey)) return false;
+  return true;
+}
+
+function attemptMutation(staff) {
+  const mutables = staff.filter(p => !p.fixedTimes);
+  if (mutables.length === 0) return null;
+  const p = mutables[Math.floor(Math.random() * mutables.length)];
+  const validDays = DAYS.filter(d => p.sched[d.key] && !(p.daysOff || []).includes(d.key));
+  if (validDays.length === 0) return null;
+  const d = validDays[Math.floor(Math.random() * validDays.length)];
+  const sh = p.sched[d.key];
+
+  const which = Math.random() < 0.5 ? 0 : 1;
+  const stepUnits = 1 + Math.floor(Math.random() * 4);
+  const delta = (Math.random() < 0.5 ? -15 : 15) * stepUnits;
+  const newShift = [...sh];
+  newShift[which] = minToTime(timeToMin(sh[which]) + delta);
+
+  if (!isShiftLegal(p, d.key, newShift)) return null;
+
+  return staff.map(person => person.id === p.id
+    ? { ...person, sched: { ...person.sched, [d.key]: newShift } }
+    : person
+  );
+}
+
+function runSearch(initialStaff, coverage, cycleWeeks, weights, iterations = 2500) {
+  let current = initialStaff.map(p => ({ ...p, sched: { ...p.sched } }));
+  let currentScore = scheduleScore(current, coverage, cycleWeeks, weights);
+  let best = current;
+  let bestScore = currentScore;
+  let temp = 80;
+  const coolRate = 0.9985;
+
+  for (let i = 0; i < iterations; i++) {
+    const cand = attemptMutation(current);
+    if (!cand) continue;
+    const cs = scheduleScore(cand, coverage, cycleWeeks, weights);
+    const delta = cs - currentScore;
+    if (delta >= 0 || Math.random() < Math.exp(delta / temp)) {
+      current = cand;
+      currentScore = cs;
+      if (cs > bestScore) { best = cand; bestScore = cs; }
+    }
+    temp *= coolRate;
+  }
+  return best;
+}
+
+function summarizeSchedule(staff, coverage, cycleWeeks) {
+  let totalGaps = 0, totalGapMinutes = 0;
+  for (const d of DAYS) {
+    const slots = computeSlots(staff, d.key, coverage);
+    for (const s of slots) if (s.count < s.min) { totalGaps++; totalGapMinutes += 15 * (s.min - s.count); }
+  }
+  let totalHourDev = 0, peopleOff = 0;
+  for (const p of staff) {
+    const dev = weeklyMinutes(p, cycleWeeks) - getTargetMin(p);
+    totalHourDev += Math.abs(dev);
+    if (Math.abs(dev) > 5) peopleOff++;
+  }
+  return { totalGaps, totalGapMinutes, totalHourDev, peopleOff };
+}
+
+function generateAlternatives(initialStaff, coverage, cycleWeeks) {
+  const variants = [
+    { label: 'Bemannings­fokus', desc: 'Prioriterar att alla pass är täckta', weights: { gap: 50, hours: 1, over: 1 } },
+    { label: 'Tim­fokus',        desc: 'Prioriterar exakta veckotimmar',     weights: { gap: 15, hours: 5, over: 1 } },
+    { label: 'Balanserat',       desc: 'Väger båda målen lika',                weights: { gap: 30, hours: 2, over: 1 } },
+  ];
+  return variants.map(v => {
+    const result = runSearch(initialStaff, coverage, cycleWeeks, v.weights, 2500);
+    return { ...v, staff: result, summary: summarizeSchedule(result, coverage, cycleWeeks) };
+  });
+}
+
+// ==================== UI ====================
+
+const TIMELINE_START = 330;
+const TIMELINE_END   = 1080;
+const TIMELINE_RANGE = TIMELINE_END - TIMELINE_START;
+const pctFromMin = m => ((m - TIMELINE_START) / TIMELINE_RANGE) * 100;
+
+let nextId = 100;
+
+function FritidsSchemaApp() {
+  const [staff, setStaff] = useState(initialStaff);
+  const [departments, setDepartments] = useState(initialDepartments);
+  const [coverageBlocks, setCoverageBlocks] = useState(initialCoverageBlocks);
+  const [fridayCycleWeeks, setFridayCycleWeeksRaw] = useState(8);
+  const [currentFridayWeek, setCurrentFridayWeek] = useState(1);
+  const coverage = useMemo(() => blocksToSlots(coverageBlocks), [coverageBlocks]);
+  const [activeDay, setActiveDay] = useState('mon');
+  const [view, setView] = useState('schedule');
+  const [editingId, setEditingId] = useState(null);
+  const [generating, setGenerating] = useState(false);
+  const [alternatives, setAlternatives] = useState(null);
+  const [loaded, setLoaded] = useState(false);
+  const [dirty, setDirty] = useState(false);
+  const [savedFileName, setSavedFileName] = useState(null);
+
+  // När cykellängden ändras: justera alla personers fridayRotation till rätt längd,
+  // och håll currentFridayWeek inom giltigt intervall.
+  const setFridayCycleWeeks = (n) => {
+    const clamped = Math.max(1, Math.min(20, n || 1));
+    setFridayCycleWeeksRaw(clamped);
+    setStaff(prev => prev.map(s => ({
+      ...s,
+      fridayRotation: s.hasFridayRotation
+        ? resizeRotation(s.fridayRotation, clamped)
+        : s.fridayRotation,
+    })));
+    setCurrentFridayWeek(w => Math.min(Math.max(1, w), clamped));
+  };
+
+  // ----- Persistens -----
+  // Autospar i localStorage som backup. Den primära "sanningen" är dock filen
+  // som användaren själv exporterar/importerar — så data följer med mellan datorer/kollegor.
+  const STORAGE_KEY = 'fritids-schema-v1';
+
+  // Ladda backup vid start
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data.staff) {
+          setStaff(data.staff);
+          if (data.staff.length > 0) nextId = Math.max(...data.staff.map(p => p.id), 99) + 1;
+        }
+        if (data.departments) setDepartments(data.departments);
+        if (data.coverageBlocks) setCoverageBlocks(data.coverageBlocks);
+        if (data.fridayCycleWeeks) setFridayCycleWeeksRaw(data.fridayCycleWeeks);
+        if (data.savedFileName) setSavedFileName(data.savedFileName);
+      }
+    } catch {}
+    setLoaded(true);
+  }, []);
+
+  // Autospar till localStorage vid varje ändring + markera som "ändrat sedan senaste filsparning"
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        staff, departments, coverageBlocks, fridayCycleWeeks, savedFileName,
+      }));
+    } catch {}
+    setDirty(true);
+  }, [staff, departments, coverageBlocks, fridayCycleWeeks, loaded]);
+
+  // Exportera till fil
+  const saveToFile = () => {
+    const data = {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      staff, departments, coverageBlocks, fridayCycleWeeks,
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const today = new Date().toISOString().slice(0, 10);
+    const fname = `fritidsschema-${today}.json`;
+    a.href = url;
+    a.download = fname;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    setDirty(false);
+    setSavedFileName(fname);
+  };
+
+  // Importera från fil
+  const loadFromFile = (file) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = JSON.parse(e.target.result);
+        if (!data.staff || !data.departments) {
+          alert('Den här filen ser inte ut att vara ett sparat schema.');
+          return;
+        }
+        if (staff.length > 0 && !confirm('Detta ersätter all nuvarande data. Fortsätt?')) return;
+        setStaff(data.staff || []);
+        setDepartments(data.departments || []);
+        setCoverageBlocks(data.coverageBlocks || initialCoverageBlocks);
+        setFridayCycleWeeksRaw(data.fridayCycleWeeks || 8);
+        if (data.staff && data.staff.length > 0) nextId = Math.max(...data.staff.map(p => p.id), 99) + 1;
+        setSavedFileName(file.name);
+        // Markera direkt som inte-dirty efter import
+        setTimeout(() => setDirty(false), 50);
+      } catch (err) {
+        alert('Kunde inte läsa filen: ' + err.message);
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  // Varna innan användaren stänger fliken om det finns osparade ändringar
+  useEffect(() => {
+    if (!dirty) return;
+    const handler = (e) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, [dirty]);
+
+  const loadExample = () => {
+    if (staff.length > 0 && !confirm('Detta ersätter den personal och avdelningar som finns nu. Fortsätt?')) return;
+    setStaff(EXAMPLE_STAFF);
+    setDepartments(EXAMPLE_DEPARTMENTS);
+    setFridayCycleWeeksRaw(8);
+    nextId = Math.max(...EXAMPLE_STAFF.map(p => p.id)) + 1;
+  };
+  const clearAll = () => {
+    if (!confirm('Detta tar bort all personal. Avdelningar behålls. Är du säker?')) return;
+    setStaff([]);
+  };
+
+  const dayData = useMemo(() => {
+    let present;
+    if (activeDay === 'fri') {
+      present = staff
+        .filter(s => !(s.daysOff || []).includes('fri'))
+        .map(s => {
+          const sh = getFridayShift(s, currentFridayWeek, fridayCycleWeeks);
+          if (!sh) return null;
+          return { ...s, _friShift: sh, startMin: timeToMin(sh[0]), endMin: timeToMin(sh[1]) };
+        })
+        .filter(Boolean)
+        .sort((a, b) => a.startMin - b.startMin);
+    } else {
+      present = staff.filter(s => s.sched[activeDay] && !(s.daysOff || []).includes(activeDay))
+        .map(s => ({ ...s, startMin: timeToMin(s.sched[activeDay][0]), endMin: timeToMin(s.sched[activeDay][1]) }))
+        .sort((a, b) => a.startMin - b.startMin);
+    }
+    const slots = coverage.map(slot => {
+      const count = present.filter(p => p.startMin <= slot.start && p.endMin > slot.start).length;
+      return { ...slot, count, gap: count < slot.min };
+    });
+    return { present, slots, gaps: slots.filter(s => s.gap) };
+  }, [staff, activeDay, coverage, currentFridayWeek, fridayCycleWeeks]);
+
+  const violations = useMemo(() => {
+    const v = [];
+    for (const s of staff) {
+      const wm = weeklyMinutes(s, fridayCycleWeeks);
+      const dev = wm - getTargetMin(s);
+      if (Math.abs(dev) > 5) {
+        v.push({ id: s.id, name: s.name, severity: Math.abs(dev) > 60 ? 'high' : 'med',
+          msg: `${dev > 0 ? 'Över' : 'Under'} timmål med ${minToHM(Math.abs(dev))} (${minToHM(wm)} av ${minToHM(getTargetMin(s))})` });
+      }
+      if (s.onlyAfternoons) {
+        for (const d of DAYS) {
+          if (s.sched[d.key] && timeToMin(s.sched[d.key][0]) < 720)
+            v.push({ id: s.id, name: s.name, severity: 'high', msg: `${d.label}: börjar ${s.sched[d.key][0]} men ska bara jobba eftermiddag` });
+        }
+      }
+      if (s.earliestStart != null) {
+        for (const d of DAYS) {
+          if (s.sched[d.key] && timeToMin(s.sched[d.key][0]) < s.earliestStart)
+            v.push({ id: s.id, name: s.name, severity: 'high', msg: `${d.label}: börjar ${s.sched[d.key][0]} men tidigaste tillåtna är ${minToTime(s.earliestStart)}` });
+        }
+      }
+      if (s.latestStart != null) {
+        for (const d of DAYS) {
+          if (s.sched[d.key] && timeToMin(s.sched[d.key][0]) > s.latestStart)
+            v.push({ id: s.id, name: s.name, severity: 'high', msg: `${d.label}: börjar ${s.sched[d.key][0]} men måste börja senast ${minToTime(s.latestStart)} (t.ex. lektion)` });
+        }
+      }
+      if (s.earliestEnd != null) {
+        for (const d of DAYS) {
+          if (s.sched[d.key] && timeToMin(s.sched[d.key][1]) < s.earliestEnd)
+            v.push({ id: s.id, name: s.name, severity: 'high', msg: `${d.label}: slutar ${s.sched[d.key][1]} men måste jobba minst till ${minToTime(s.earliestEnd)}` });
+        }
+      }
+      if (s.latestEnd != null) {
+        for (const d of DAYS) {
+          if (s.sched[d.key] && timeToMin(s.sched[d.key][1]) > s.latestEnd)
+            v.push({ id: s.id, name: s.name, severity: 'high', msg: `${d.label}: slutar ${s.sched[d.key][1]} men senaste tillåtna är ${minToTime(s.latestEnd)}` });
+        }
+      }
+    }
+    return v;
+  }, [staff, fridayCycleWeeks]);
+
+  const updateStaff = (updated) => setStaff(prev => prev.map(s => s.id === updated.id ? updated : s));
+  const removeStaff = (id) => setStaff(prev => prev.filter(s => s.id !== id));
+  const addStaff = () => {
+    if (departments.length === 0) {
+      alert('Lägg till minst en avdelning under "Inställningar" först.');
+      setView('settings');
+      return;
+    }
+    const newPerson = P({
+      id: nextId++, name: 'Ny anställd', deptId: departments[0].id, role: '',
+      sched: { mon:['08:00','15:45'], tue:['08:00','15:45'], wed:['08:00','15:45'], thu:['08:00','15:45'] },
+      fridayRotation: new Array(fridayCycleWeeks).fill(null),
+    });
+    setStaff([...staff, newPerson]);
+    setEditingId(newPerson.id);
+  };
+
+  const handleGenerate = async () => {
+    setGenerating(true);
+    setAlternatives(null);
+    await new Promise(r => setTimeout(r, 50));
+    const alts = generateAlternatives(staff, coverage, fridayCycleWeeks);
+    setAlternatives(alts);
+    setGenerating(false);
+  };
+
+  const applyAlternative = (alt) => {
+    setStaff(alt.staff);
+    setAlternatives(null);
+  };
+
+  return (
+    <div className="min-h-screen w-full" style={{ backgroundColor: '#FBF8F4', fontFamily: '"Geist", -apple-system, system-ui, sans-serif' }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Geist:wght@400;500;600&display=swap');
+        body { font-family: "Geist", system-ui, sans-serif; }
+        .display-font { font-family: "Fraunces", Georgia, serif; font-feature-settings: "ss01"; }
+      `}</style>
+
+      <div className="max-w-7xl mx-auto px-6 py-8">
+        <header className="mb-8 flex items-end justify-between flex-wrap gap-4">
+          <div>
+            <p className="text-xs uppercase tracking-widest text-stone-500 mb-1">Fritidshem · schemaverktyg</p>
+            <h1 className="display-font text-4xl text-stone-800" style={{ letterSpacing: '-0.02em' }}>SchemaFIX</h1>
+            <div className="flex items-center gap-2 mt-1">
+              <p className="text-stone-600 text-sm">Prototyp v8 · spara/öppna fil</p>
+              {dirty && (
+                <span className="inline-flex items-center gap-1 text-xs text-amber-700 bg-amber-50 ring-1 ring-amber-200 rounded-full px-2 py-0.5">
+                  <Circle size={6} fill="currentColor" />
+                  Osparade ändringar
+                </span>
+              )}
+              {!dirty && savedFileName && (
+                <span className="text-xs text-stone-500">Sparat som {savedFileName}</span>
+              )}
+            </div>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <div className="flex gap-1">
+              <input type="file" accept="application/json,.json" id="loadFileInput" style={{ display: 'none' }}
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) loadFromFile(file);
+                  e.target.value = '';
+                }} />
+              <button onClick={() => document.getElementById('loadFileInput').click()}
+                className="px-3 py-2 rounded-lg text-sm bg-white text-stone-700 ring-1 ring-stone-200 hover:bg-stone-50 transition flex items-center gap-1.5">
+                <Upload size={14} />Öppna
+              </button>
+              <button onClick={saveToFile}
+                className={`px-3 py-2 rounded-lg text-sm ring-1 transition flex items-center gap-1.5 ${dirty ? 'bg-amber-50 text-amber-900 ring-amber-300 hover:bg-amber-100' : 'bg-white text-stone-700 ring-stone-200 hover:bg-stone-50'}`}>
+                <Download size={14} />Spara
+              </button>
+            </div>
+            <button onClick={handleGenerate} disabled={generating || staff.length === 0}
+              className="px-4 py-2.5 rounded-full text-sm bg-stone-800 text-white hover:bg-stone-900 transition flex items-center gap-2 disabled:opacity-50">
+              <Wand2 size={14} />
+              {generating ? 'Räknar...' : 'Generera schemaförslag'}
+            </button>
+            <div className="flex gap-1 p-1 rounded-full bg-stone-200/60 flex-wrap">
+              {[
+                { k: 'schedule', label: 'Vecka', icon: Calendar },
+                { k: 'staff',    label: 'Personal', icon: Users },
+                { k: 'rules',    label: 'Bemanning', icon: Clock },
+                { k: 'settings', label: 'Inställningar', icon: Settings },
+              ].map(t => {
+                const Icon = t.icon;
+                return (
+                  <button key={t.k} onClick={() => setView(t.k)}
+                    className={`px-4 py-2 rounded-full text-sm flex items-center gap-2 transition ${view === t.k ? 'bg-white shadow-sm text-stone-900' : 'text-stone-600 hover:text-stone-900'}`}>
+                    <Icon size={14} />{t.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </header>
+
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+          <StatCard label="Personal" value={staff.length} sub="aktiva" />
+          <StatCard label="Veckotimmar tot." value={minToHM(staff.reduce((a, s) => a + weeklyMinutes(s), 0))} />
+          <StatCard label="Täckningsgap" value={dayData.gaps.length} sub={`på ${activeDay === 'fri' ? 'fredag' : DAYS.find(d => d.key === activeDay).label.toLowerCase()}`}
+            highlight={dayData.gaps.length > 0 ? 'warn' : 'ok'} />
+          <StatCard label="Regelbrott" value={violations.length}
+            highlight={violations.length > 0 ? 'warn' : 'ok'} sub={violations.length > 0 ? 'se Personal-fliken' : 'allt ok'} />
+        </div>
+
+        {view === 'schedule' && (
+          <ScheduleView dayData={dayData} activeDay={activeDay} setActiveDay={setActiveDay} onEdit={setEditingId}
+            staffCount={staff.length} onGoToStaff={() => setView('staff')} onLoadExample={loadExample}
+            departments={departments}
+            fridayCycleWeeks={fridayCycleWeeks} currentFridayWeek={currentFridayWeek}
+            setCurrentFridayWeek={setCurrentFridayWeek}
+            hasFridaySetup={staff.some(s => (s.hasFridayRotation && Array.isArray(s.fridayRotation) && s.fridayRotation.some(x => x)) || (!s.hasFridayRotation && s.fridayShift))} />
+        )}
+        {view === 'staff' && <StaffView staff={staff} violations={violations} onEdit={setEditingId} onAdd={addStaff}
+          onLoadExample={loadExample} onClearAll={clearAll} departments={departments} />}
+        {view === 'rules' && <RulesView blocks={coverageBlocks} setBlocks={setCoverageBlocks} />}
+        {view === 'settings' && <SettingsView departments={departments} setDepartments={setDepartments}
+          staff={staff} setStaff={setStaff}
+          fridayCycleWeeks={fridayCycleWeeks} setFridayCycleWeeks={setFridayCycleWeeks} />}
+
+        <footer className="mt-10 pt-6 border-t border-stone-200 text-xs text-stone-500">
+          Klicka på en person för att redigera detaljer. Tryck "Generera schemaförslag" när du vill att appen pusslar fram alternativ baserat på allas villkor.
+        </footer>
+      </div>
+
+      {editingId !== null && (
+        <StaffEditModal staff={staff.find(s => s.id === editingId)}
+          departments={departments}
+          fridayCycleWeeks={fridayCycleWeeks}
+          onSave={(updated) => { updateStaff(updated); setEditingId(null); }}
+          onClose={() => setEditingId(null)}
+          onRemove={(id) => { removeStaff(id); setEditingId(null); }} />
+      )}
+
+      {generating && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center" style={{ backgroundColor: 'rgba(28, 25, 23, 0.4)' }}>
+          <div className="bg-white rounded-2xl p-8 shadow-2xl text-center max-w-sm">
+            <div className="display-font text-2xl text-stone-800 mb-2">Pusslar...</div>
+            <p className="text-sm text-stone-600">Testar tusentals justeringar för att hitta tre olika alternativ åt er.</p>
+            <div className="mt-4 h-1 bg-stone-200 rounded-full overflow-hidden">
+              <div className="h-full bg-stone-800 animate-pulse" style={{ width: '40%' }} />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {alternatives && (
+        <AlternativesModal alternatives={alternatives} currentStaff={staff} coverage={coverage}
+          departments={departments}
+          onApply={applyAlternative} onClose={() => setAlternatives(null)} />
+      )}
+    </div>
+  );
+}
+
+// ==================== SUBCOMPONENTS ====================
+
+function StatCard({ label, value, sub, highlight }) {
+  const ring = highlight === 'warn' ? 'ring-1 ring-orange-300 bg-orange-50/60'
+             : highlight === 'ok'   ? 'ring-1 ring-emerald-200 bg-emerald-50/40'
+             : 'ring-1 ring-stone-200 bg-white';
+  return (
+    <div className={`rounded-xl p-4 ${ring}`}>
+      <p className="text-xs uppercase tracking-wider text-stone-500">{label}</p>
+      <p className="display-font text-2xl mt-1 text-stone-800">{value}</p>
+      {sub && <p className="text-xs text-stone-500 mt-0.5">{sub}</p>}
+    </div>
+  );
+}
+
+function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, onGoToStaff, onLoadExample, departments,
+                        fridayCycleWeeks, currentFridayWeek, setCurrentFridayWeek, hasFridaySetup }) {
+  const ticks = []; for (let m = 360; m <= TIMELINE_END; m += 60) ticks.push(m);
+  const maxCount = Math.max(...dayData.slots.map(s => s.count), 5);
+  const isFriday = activeDay === 'fri';
+  const dayLabel = isFriday ? 'Fredag' : DAYS.find(d => d.key === activeDay).label;
+
+  if (staffCount === 0) {
+    return (
+      <div className="bg-white rounded-2xl ring-1 ring-stone-200 p-12 text-center">
+        <div className="display-font text-2xl text-stone-800 mb-2">Inget schema än</div>
+        <p className="text-sm text-stone-500 mb-6 max-w-md mx-auto">
+          Lägg till personalen som ska schemaläggas. Varje person får individuella villkor — arbetstid, undervisningstid, fasta dagar — som appen tar hänsyn till när den föreslår scheman.
+        </p>
+        <div className="flex gap-2 justify-center">
+          <button onClick={onGoToStaff} className="px-5 py-2.5 rounded-lg bg-stone-800 text-white hover:bg-stone-900 transition text-sm flex items-center gap-2">
+            <Users size={14} />Gå till Personal
+          </button>
+          <button onClick={onLoadExample} className="px-5 py-2.5 rounded-lg bg-stone-100 text-stone-700 hover:bg-stone-200 transition text-sm">
+            Ladda exempeldata
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div className="flex gap-2 flex-wrap">
+          {DAYS.map(d => (
+            <button key={d.key} onClick={() => setActiveDay(d.key)}
+              className={`px-4 py-2 rounded-lg text-sm transition ${activeDay === d.key ? 'bg-stone-800 text-white' : 'bg-white text-stone-700 ring-1 ring-stone-200 hover:bg-stone-50'}`}>
+              {d.label}
+            </button>
+          ))}
+          <button key="fri" onClick={() => setActiveDay('fri')}
+            className={`px-4 py-2 rounded-lg text-sm transition ${isFriday ? 'bg-stone-800 text-white' : 'bg-white text-stone-700 ring-1 ring-stone-200 hover:bg-stone-50'}`}>
+            Fredag
+          </button>
+        </div>
+        {isFriday && hasFridaySetup && (
+          <div className="flex items-center gap-2 bg-white ring-1 ring-stone-200 rounded-lg px-2 py-1">
+            <button onClick={() => setCurrentFridayWeek(w => ((w - 2 + fridayCycleWeeks) % fridayCycleWeeks) + 1)}
+              className="p-1 hover:bg-stone-100 rounded text-stone-600">‹</button>
+            <span className="text-sm tabular-nums text-stone-700 px-2">
+              Vecka <span className="display-font" style={{ fontWeight: 500 }}>{currentFridayWeek}</span> av {fridayCycleWeeks}
+            </span>
+            <button onClick={() => setCurrentFridayWeek(w => (w % fridayCycleWeeks) + 1)}
+              className="p-1 hover:bg-stone-100 rounded text-stone-600">›</button>
+          </div>
+        )}
+      </div>
+
+      {isFriday && !hasFridaySetup && (
+        <div className="bg-amber-50 ring-1 ring-amber-200 rounded-lg p-4 flex items-start gap-3">
+          <AlertCircle size={16} className="text-amber-700 mt-0.5 flex-shrink-0" />
+          <div className="text-sm text-stone-700">
+            <p style={{ fontWeight: 500 }}>Ingen fredagsrutin ifylld än</p>
+            <p className="text-xs text-stone-600 mt-1">Klicka på en person i Personal-fliken och fyll i deras fredagstider.</p>
+          </div>
+        </div>
+      )}
+
+      <div className="bg-white rounded-2xl ring-1 ring-stone-200 p-5">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="display-font text-xl text-stone-800">{dayLabel}{isFriday && hasFridaySetup ? ` · vecka ${currentFridayWeek}` : ''}</h2>
+          <div className="flex gap-3 text-xs flex-wrap">
+            {departments.map(d => (
+              <span key={d.id} className="flex items-center gap-1.5">
+                <span className="w-2.5 h-2.5 rounded-sm" style={{ backgroundColor: d.color }} />
+                <span className="text-stone-600">{d.name}</span>
+              </span>
+            ))}
+          </div>
+        </div>
+
+        <div className="relative h-6 mb-2 ml-32 border-b border-stone-200">
+          {ticks.map(m => (
+            <div key={m} className="absolute top-0 text-[10px] text-stone-400" style={{ left: `${pctFromMin(m)}%`, transform: 'translateX(-50%)' }}>
+              {minToTime(m)}<div className="w-px h-1.5 bg-stone-300 mx-auto mt-0.5" />
+            </div>
+          ))}
+        </div>
+
+        <div className="space-y-1.5">
+          {dayData.present.length === 0 && (
+            <p className="text-sm text-stone-400 italic py-4 text-center">Ingen personal arbetar denna {isFriday ? 'fredag' : 'dag'}</p>
+          )}
+          {dayData.present.map(p => {
+            const dept = getDept(p.deptId, departments);
+            const soft = softColor(dept.color);
+            const shiftLabel = isFriday
+              ? `${p._friShift[0]}–${p._friShift[1]}`
+              : `${p.sched[activeDay][0]}–${p.sched[activeDay][1]}`;
+            return (
+              <div key={p.id} className="flex items-center group">
+                <div className="w-32 pr-3 text-right">
+                  <button onClick={() => onEdit(p.id)} className="text-sm text-stone-800 hover:text-stone-900 truncate flex items-center gap-1 ml-auto">
+                    <Edit3 size={10} className="opacity-0 group-hover:opacity-50 transition" />{p.name}
+                  </button>
+                  {p.role && <p className="text-[10px] text-stone-500 truncate">{p.role}</p>}
+                </div>
+                <div className="flex-1 relative h-7 bg-stone-50 rounded-md cursor-pointer" onClick={() => onEdit(p.id)}>
+                  <div className="absolute h-full rounded-md flex items-center px-2 transition-all hover:opacity-90"
+                    style={{ left: `${pctFromMin(p.startMin)}%`, width: `${pctFromMin(p.endMin) - pctFromMin(p.startMin)}%`,
+                      backgroundColor: soft, borderLeft: `3px solid ${dept.color}` }}>
+                    <span className="text-[11px] truncate text-stone-700" style={{ fontWeight: 500 }}>
+                      {shiftLabel}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="mt-6 pt-4 border-t border-stone-100">
+          <div className="flex items-center justify-between mb-2">
+            <p className="text-xs uppercase tracking-wider text-stone-500">Antal personal per 15 min</p>
+            {dayData.gaps.length > 0 ? (
+              <span className="text-xs text-orange-600 flex items-center gap-1">
+                <AlertCircle size={12} />{dayData.gaps.length} gap mot bemanningskrav
+              </span>
+            ) : (
+              <span className="text-xs text-emerald-600 flex items-center gap-1">
+                <CheckCircle2 size={12} />Täcker alla krav
+              </span>
+            )}
+          </div>
+          <div className="ml-32 relative h-16 bg-stone-50 rounded-md overflow-hidden">
+            {dayData.slots.map(s => {
+              const w = 100 / dayData.slots.length;
+              const left = ((s.start - TIMELINE_START) / TIMELINE_RANGE) * 100;
+              const h = (s.count / maxCount) * 100;
+              return <div key={s.start} className="absolute bottom-0" style={{ left: `${left}%`, width: `${w}%`, height: `${h}%`,
+                backgroundColor: s.gap ? '#F59E0B' : '#475569', opacity: s.gap ? 0.85 : 0.55 }} />;
+            })}
+            {dayData.slots.map(s => {
+              const left = ((s.start - TIMELINE_START) / TIMELINE_RANGE) * 100;
+              const w = 100 / dayData.slots.length;
+              const h = (s.min / maxCount) * 100;
+              return <div key={`m${s.start}`} className="absolute" style={{ left: `${left}%`, width: `${w}%`,
+                bottom: `${h}%`, height: '1px', backgroundColor: '#dc2626', opacity: 0.6 }} />;
+            })}
+          </div>
+          <div className="ml-32 mt-1 flex items-center gap-4 text-[10px] text-stone-500">
+            <span className="flex items-center gap-1"><span className="w-2 h-2" style={{ backgroundColor: '#475569', opacity: 0.55 }} />Faktisk</span>
+            <span className="flex items-center gap-1"><span className="w-2 h-2" style={{ backgroundColor: '#F59E0B', opacity: 0.85 }} />Under min</span>
+            <span className="flex items-center gap-1"><span className="w-3 h-px" style={{ backgroundColor: '#dc2626' }} />Krav</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StaffView({ staff, violations, onEdit, onAdd, onLoadExample, onClearAll, departments }) {
+  if (staff.length === 0) {
+    return (
+      <div className="bg-white rounded-2xl ring-1 ring-stone-200 p-12 text-center">
+        <Users size={32} className="mx-auto text-stone-300 mb-3" />
+        <div className="display-font text-2xl text-stone-800 mb-2">Lägg till första personen</div>
+        <p className="text-sm text-stone-500 mb-6 max-w-md mx-auto">
+          Börja med en person i taget. Du kan ange namn, avdelning, tjänstgöringsgrad i procent, ordinarie pass mån–tor, fredagsrutin och eventuella villkor som t.ex. "måste vara på plats senast 08:40 för lektion".
+        </p>
+        <div className="flex gap-2 justify-center flex-wrap">
+          <button onClick={onAdd} className="px-5 py-2.5 rounded-lg bg-stone-800 text-white hover:bg-stone-900 transition text-sm flex items-center gap-2">
+            <Plus size={14} />Lägg till personal
+          </button>
+          <button onClick={onLoadExample} className="px-5 py-2.5 rounded-lg bg-stone-100 text-stone-700 hover:bg-stone-200 transition text-sm">
+            Ladda exempeldata
+          </button>
+        </div>
+        <p className="text-xs text-stone-400 mt-6 max-w-sm mx-auto">
+          Exempeldatan är fritidshemmet jag använde när jag byggde prototypen — bra för att se hur appen fungerar med riktig komplexitet.
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-4">
+      <div className="bg-white rounded-2xl ring-1 ring-stone-200 overflow-hidden">
+        <table className="w-full text-sm">
+          <thead className="bg-stone-50 border-b border-stone-200">
+            <tr className="text-left text-xs uppercase tracking-wider text-stone-500">
+              <th className="px-4 py-3">Namn</th><th className="px-4 py-3">Avdelning</th>
+              <th className="px-4 py-3">Roll</th>
+              <th className="px-4 py-3 text-right">Tjänst</th>
+              <th className="px-4 py-3 text-right">Mål</th>
+              <th className="px-4 py-3 text-right">Faktisk</th>
+              <th className="px-4 py-3 text-right">Diff</th>
+              <th className="px-4 py-3">Villkor</th>
+              <th className="px-4 py-3"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {staff.map(s => {
+              const wm = weeklyMinutes(s);
+              const targetMin = getTargetMin(s);
+              const diff = wm - targetMin;
+              const off = Math.abs(diff) > 5;
+              const dept = getDept(s.deptId, departments);
+              const tags = [];
+              if (s.fixedTimes) tags.push('Fast tid');
+              if (s.onlyAfternoons) tags.push('Endast em.');
+              if (s.earliestStart != null) tags.push(`Tidigast ${minToTime(s.earliestStart)}`);
+              if (s.latestStart  != null) tags.push(`Senast börja ${minToTime(s.latestStart)}`);
+              if (s.earliestEnd  != null) tags.push(`Minst till ${minToTime(s.earliestEnd)}`);
+              if (s.latestEnd    != null) tags.push(`Senast ${minToTime(s.latestEnd)}`);
+              if ((s.daysOff || []).length > 0) tags.push(`Ledig ${s.daysOff.map(d => DAYS.find(x => x.key === d).short).join(', ')}`);
+              if (!s.hasFridayRotation && s.fridayShift) tags.push('Fast fredag');
+              return (
+                <tr key={s.id} className="border-b border-stone-100 last:border-0 hover:bg-stone-50/50">
+                  <td className="px-4 py-3"><p className="text-stone-800" style={{ fontWeight: 500 }}>{s.name}</p></td>
+                  <td className="px-4 py-3">
+                    <span className="inline-flex items-center gap-1.5 text-xs">
+                      <span className="w-2 h-2 rounded-sm" style={{ backgroundColor: dept.color }} />
+                      {dept.name}
+                    </span>
+                  </td>
+                  <td className="px-4 py-3 text-stone-600">{s.role || '—'}</td>
+                  <td className="px-4 py-3 text-right text-stone-700 tabular-nums text-xs">
+                    {(s.percent ?? 100)}% av {(s.fullTimeHours ?? 37.5)}h
+                  </td>
+                  <td className="px-4 py-3 text-right text-stone-700 tabular-nums">{minToHM(targetMin)}</td>
+                  <td className={`px-4 py-3 text-right tabular-nums ${off ? (diff > 0 ? 'text-orange-600' : 'text-amber-700') : 'text-stone-700'}`}>{minToHM(wm)}</td>
+                  <td className={`px-4 py-3 text-right tabular-nums text-xs ${off ? (diff > 0 ? 'text-orange-600' : 'text-amber-700') : 'text-stone-400'}`}>
+                    {off ? `${diff > 0 ? '+' : ''}${minToHM(Math.abs(diff))}` : '✓'}
+                  </td>
+                  <td className="px-4 py-3">
+                    <div className="flex flex-wrap gap-1">
+                      {tags.length === 0 && <span className="text-xs text-stone-400">—</span>}
+                      {tags.map((c, i) => (<span key={i} className="text-[10px] px-1.5 py-0.5 rounded bg-stone-100 text-stone-700">{c}</span>))}
+                    </div>
+                  </td>
+                  <td className="px-4 py-3">
+                    <button onClick={() => onEdit(s.id)} className="text-xs text-stone-500 hover:text-stone-900 flex items-center gap-1">
+                      <Edit3 size={12} />Redigera
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        <div className="px-4 py-3 bg-stone-50/50 border-t border-stone-200 flex justify-between items-center flex-wrap gap-2">
+          <span className="text-xs text-stone-500">{staff.length} personer totalt</span>
+          <div className="flex items-center gap-3">
+            <button onClick={onClearAll} className="text-xs text-stone-500 hover:text-red-600">Töm allt</button>
+            <button onClick={onAdd} className="text-sm flex items-center gap-1.5 text-stone-700 hover:text-stone-900">
+              <Plus size={14} />Lägg till personal
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {violations.length > 0 && (
+        <div className="bg-orange-50 ring-1 ring-orange-200 rounded-xl p-4">
+          <div className="flex items-center gap-2 mb-3">
+            <AlertCircle size={14} className="text-orange-600" />
+            <p className="text-xs uppercase tracking-wider text-orange-700">Att kolla på ({violations.length})</p>
+          </div>
+          <ul className="space-y-1.5">
+            {violations.map((v, i) => (
+              <li key={i} className="text-sm text-stone-700 flex items-start gap-2">
+                <ChevronRight size={14} className={`mt-0.5 flex-shrink-0 ${v.severity === 'high' ? 'text-orange-600' : 'text-amber-500'}`} />
+                <span><span style={{ fontWeight: 500 }}>{v.name}:</span> {v.msg}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RulesView({ blocks, setBlocks }) {
+  const updateBlock = (id, patch) => setBlocks(blocks.map(b => b.id === id ? { ...b, ...patch } : b));
+  const removeBlock = (id) => setBlocks(blocks.filter(b => b.id !== id));
+  const addBlock = () => {
+    const newId = Math.max(0, ...blocks.map(b => b.id)) + 1;
+    const lastEnd = blocks.length > 0 ? Math.max(...blocks.map(b => b.end)) : 480;
+    setBlocks([...blocks, { id: newId, start: lastEnd, end: lastEnd + 60, min: 1, label: 'Nytt block' }]);
+  };
+
+  // Sortera kronologiskt för visning
+  const sorted = [...blocks].sort((a, b) => a.start - b.start);
+
+  // Visualisera täckning över hela dagen
+  const slots = blocksToSlots(blocks);
+  const maxMin = Math.max(...slots.map(s => s.min), 1);
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-white rounded-2xl ring-1 ring-stone-200 p-5">
+        <div className="flex items-start justify-between mb-4">
+          <div>
+            <h2 className="display-font text-xl text-stone-800">Bemanningskrav</h2>
+            <p className="text-sm text-stone-500 mt-0.5">Definiera tidsblock och minsta antal personal i varje. Justera inför nytt läsår.</p>
+          </div>
+        </div>
+
+        {/* Visuell översikt */}
+        <div className="mb-5">
+          <p className="text-[10px] uppercase tracking-wider text-stone-500 mb-1.5">Visualisering</p>
+          <div className="relative h-12 bg-stone-50 rounded-md overflow-hidden ring-1 ring-stone-100">
+            {slots.map(s => {
+              const left = ((s.start - TIMELINE_START) / TIMELINE_RANGE) * 100;
+              const w = 100 / slots.length;
+              const h = (s.min / maxMin) * 100;
+              return <div key={s.start} className="absolute bottom-0"
+                style={{ left: `${left}%`, width: `${w}%`, height: `${h}%`, backgroundColor: '#475569', opacity: 0.55 }} />;
+            })}
+            {[6, 8, 10, 12, 14, 16, 18].map(h => (
+              <div key={h} className="absolute top-0 bottom-0 border-l border-stone-300 text-[9px] text-stone-400 pl-1"
+                style={{ left: `${pctFromMin(h*60)}%` }}>{h}</div>
+            ))}
+          </div>
+        </div>
+
+        {/* Redigerbar lista */}
+        <div className="space-y-2">
+          <div className="grid grid-cols-12 gap-2 text-[10px] uppercase tracking-wider text-stone-500 px-2 pb-1">
+            <div className="col-span-3">Namn på block</div>
+            <div className="col-span-3">Tid</div>
+            <div className="col-span-4">Minsta personal</div>
+            <div className="col-span-2"></div>
+          </div>
+          {sorted.map(b => (
+            <div key={b.id} className="grid grid-cols-12 gap-2 items-center py-2 px-2 rounded-lg hover:bg-stone-50">
+              <input className="rules-input col-span-3" value={b.label}
+                onChange={e => updateBlock(b.id, { label: e.target.value })} placeholder="ex. Morgonfritids" />
+              <div className="col-span-3 flex items-center gap-1">
+                <input type="time" className="rules-input flex-1"
+                  value={minToTime(b.start)} onChange={e => updateBlock(b.id, { start: timeToMin(e.target.value) })} />
+                <span className="text-stone-400 text-xs">–</span>
+                <input type="time" className="rules-input flex-1"
+                  value={minToTime(b.end)} onChange={e => updateBlock(b.id, { end: timeToMin(e.target.value) })} />
+              </div>
+              <div className="col-span-4 flex items-center gap-2">
+                <button type="button" onClick={() => updateBlock(b.id, { min: Math.max(0, b.min - 1) })}
+                  className="w-7 h-7 rounded bg-stone-100 hover:bg-stone-200 text-stone-700">−</button>
+                <span className="display-font text-lg text-stone-800 w-8 text-center tabular-nums">{b.min}</span>
+                <button type="button" onClick={() => updateBlock(b.id, { min: b.min + 1 })}
+                  className="w-7 h-7 rounded bg-stone-100 hover:bg-stone-200 text-stone-700">+</button>
+                <span className="text-xs text-stone-500 ml-1">personer</span>
+              </div>
+              <div className="col-span-2 flex justify-end">
+                <button onClick={() => removeBlock(b.id)} className="text-stone-400 hover:text-red-600 p-1">
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <button onClick={addBlock}
+          className="mt-3 text-sm text-stone-700 hover:text-stone-900 flex items-center gap-1.5 px-3 py-2 rounded-lg hover:bg-stone-100">
+          <Plus size={14} />Lägg till block
+        </button>
+
+        <div className="mt-5 pt-4 border-t border-stone-100 text-xs text-stone-500">
+          <p>💡 Tips: ändringar här påverkar både täckningsberäkningen i Vecka-vyn och vad generatorn försöker uppfylla.
+          Om block överlappar används det första (i tidsordning).</p>
+        </div>
+      </div>
+
+      <style>{`
+        .rules-input { background: white; border: 1px solid #e7e5e4; border-radius: 6px; padding: 5px 8px; font-size: 13px; color: #1c1917; outline: none; }
+        .rules-input:focus { border-color: #78716c; box-shadow: 0 0 0 2px rgba(120, 113, 108, 0.1); }
+      `}</style>
+    </div>
+  );
+}
+
+// -------- Settings View (departments etc.) --------
+
+function SettingsView({ departments, setDepartments, staff, setStaff,
+                        fridayCycleWeeks, setFridayCycleWeeks }) {
+  const updateDept = (id, patch) => setDepartments(departments.map(d => d.id === id ? { ...d, ...patch } : d));
+  const removeDept = (id) => {
+    const usedBy = staff.filter(s => s.deptId === id);
+    if (usedBy.length > 0) {
+      if (!confirm(`${usedBy.length} person(er) tillhör denna avdelning: ${usedBy.map(s => s.name).join(', ')}. De kommer behöva bytas till en annan avdelning manuellt. Fortsätt?`)) return;
+    }
+    setDepartments(departments.filter(d => d.id !== id));
+  };
+  const addDept = () => {
+    const newId = 'd' + (Math.max(0, ...departments.map(d => parseInt(d.id.replace('d','')) || 0)) + 1);
+    const usedColors = departments.map(d => d.color);
+    const nextColor = DEPT_COLORS.find(c => !usedColors.includes(c)) || DEPT_COLORS[departments.length % DEPT_COLORS.length];
+    setDepartments([...departments, { id: newId, name: 'Ny avdelning', color: nextColor }]);
+  };
+
+  const counts = Object.fromEntries(departments.map(d => [d.id, staff.filter(s => s.deptId === d.id).length]));
+  const orphaned = staff.filter(s => !departments.find(d => d.id === s.deptId));
+  const rotators = staff.filter(s => s.hasFridayRotation);
+
+  return (
+    <div className="space-y-4">
+      {/* Avdelningar */}
+      <div className="bg-white rounded-2xl ring-1 ring-stone-200 p-5">
+        <div className="flex items-start justify-between mb-4">
+          <div>
+            <h2 className="display-font text-xl text-stone-800">Avdelningar</h2>
+            <p className="text-sm text-stone-500 mt-0.5">Lägg till, döp om, ändra färg eller ta bort avdelningar.</p>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <div className="grid grid-cols-12 gap-2 text-[10px] uppercase tracking-wider text-stone-500 px-2 pb-1">
+            <div className="col-span-1">Färg</div>
+            <div className="col-span-6">Namn</div>
+            <div className="col-span-3">Personal</div>
+            <div className="col-span-2"></div>
+          </div>
+          {departments.map(d => (
+            <div key={d.id} className="grid grid-cols-12 gap-2 items-center py-2 px-2 rounded-lg hover:bg-stone-50">
+              <div className="col-span-1 flex items-center">
+                <input type="color" className="w-8 h-8 rounded cursor-pointer border-0 p-0"
+                  value={d.color} onChange={e => updateDept(d.id, { color: e.target.value })} />
+              </div>
+              <div className="col-span-6">
+                <input className="rules-input w-full" value={d.name}
+                  onChange={e => updateDept(d.id, { name: e.target.value })} placeholder="Avdelningsnamn" />
+              </div>
+              <div className="col-span-3 text-sm text-stone-600">
+                {counts[d.id] || 0} {counts[d.id] === 1 ? 'person' : 'personer'}
+              </div>
+              <div className="col-span-2 flex justify-end">
+                <button onClick={() => removeDept(d.id)} className="text-stone-400 hover:text-red-600 p-1">
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <button onClick={addDept}
+          className="mt-3 text-sm text-stone-700 hover:text-stone-900 flex items-center gap-1.5 px-3 py-2 rounded-lg hover:bg-stone-100">
+          <Plus size={14} />Lägg till avdelning
+        </button>
+
+        {orphaned.length > 0 && (
+          <div className="mt-5 pt-4 border-t border-orange-200 bg-orange-50/50 -mx-5 -mb-5 px-5 py-4 rounded-b-2xl">
+            <div className="flex items-start gap-2">
+              <AlertCircle size={14} className="text-orange-600 mt-0.5 flex-shrink-0" />
+              <div className="flex-1">
+                <p className="text-sm text-stone-700" style={{ fontWeight: 500 }}>{orphaned.length} person(er) saknar avdelning</p>
+                <p className="text-xs text-stone-600 mt-1">{orphaned.map(o => o.name).join(', ')} — gå till Personal-fliken och tilldela dem en avdelning.</p>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Fredagsrullen */}
+      <div className="bg-white rounded-2xl ring-1 ring-stone-200 p-5">
+        <div className="flex items-start justify-between mb-4 gap-4 flex-wrap">
+          <div>
+            <h2 className="display-font text-xl text-stone-800">Fredagsrullen</h2>
+            <p className="text-sm text-stone-500 mt-0.5 max-w-md">
+              Cykellängd är hur många veckor rullen är. Varje person fyller i sina egna fredagstider — en rad per vecka — när du redigerar dem i Personal-fliken.
+            </p>
+          </div>
+          <div className="flex items-center gap-2 bg-stone-50 rounded-lg px-3 py-2">
+            <span className="text-xs text-stone-600">Cykellängd:</span>
+            <input type="number" min="1" max="20" className="rules-input w-16 text-center"
+              value={fridayCycleWeeks}
+              onChange={e => setFridayCycleWeeks(Math.max(1, Math.min(20, parseInt(e.target.value) || 1)))} />
+            <span className="text-xs text-stone-600">veckor</span>
+          </div>
+        </div>
+
+        {rotators.length === 0 ? (
+          <div className="bg-stone-50 rounded-lg p-6 text-center text-sm text-stone-500">
+            Ingen i personalen är markerad som "ingår i fredagsrullen" än. Klicka på en person i Personal-fliken och bocka i det.
+          </div>
+        ) : (
+          <div>
+            <p className="text-xs uppercase tracking-wider text-stone-500 mb-3">Översikt av rullen</p>
+            <div className="overflow-x-auto">
+              <table className="text-xs w-full">
+                <thead>
+                  <tr className="text-stone-500">
+                    <th className="text-left px-2 py-1 sticky left-0 bg-white">Person</th>
+                    {Array.from({ length: fridayCycleWeeks }).map((_, w) => (
+                      <th key={w} className="text-center px-2 py-1 min-w-[72px]">v{w + 1}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {rotators.map(p => (
+                    <tr key={p.id} className="border-t border-stone-100">
+                      <td className="px-2 py-1.5 sticky left-0 bg-white text-stone-800" style={{ fontWeight: 500 }}>{p.name}</td>
+                      {Array.from({ length: fridayCycleWeeks }).map((_, w) => {
+                        const sh = getFridayShift(p, w + 1, fridayCycleWeeks);
+                        return (
+                          <td key={w} className="px-2 py-1.5 text-center text-stone-600 tabular-nums">
+                            {sh ? `${sh[0]}–${sh[1]}` : <span className="text-stone-300">—</span>}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p className="text-[10px] text-stone-400 mt-2">— betyder ledig den fredagen. Klicka på personen i Personal-fliken för att redigera deras tider.</p>
+          </div>
+        )}
+      </div>
+
+      <style>{`
+        .rules-input { background: white; border: 1px solid #e7e5e4; border-radius: 6px; padding: 5px 8px; font-size: 13px; color: #1c1917; outline: none; }
+        .rules-input:focus { border-color: #78716c; box-shadow: 0 0 0 2px rgba(120, 113, 108, 0.1); }
+        .rules-input:disabled { background: #f5f5f4; color: #a8a29e; }
+      `}</style>
+    </div>
+  );
+}
+
+// -------- Edit Modal --------
+
+function StaffEditModal({ staff, departments, fridayCycleWeeks, onSave, onClose, onRemove }) {
+  const [form, setForm] = useState(() => {
+    const cp = JSON.parse(JSON.stringify(staff));
+    // Säkerställ att rotationen har rätt längd när modalen öppnas
+    if (cp.hasFridayRotation) {
+      cp.fridayRotation = resizeRotation(cp.fridayRotation, fridayCycleWeeks);
+    }
+    return cp;
+  });
+  const wm = weeklyMinutes(form, fridayCycleWeeks);
+  const targetMin = getTargetMin(form);
+  const diff = wm - targetMin;
+  const off = Math.abs(diff) > 5;
+  const dept = getDept(form.deptId, departments);
+
+  // Uppdatera en enskild fredagsvecka i rullen
+  const updateFridayWeek = (weekIdx, idx, val) => {
+    const next = resizeRotation(form.fridayRotation, fridayCycleWeeks);
+    const cur = next[weekIdx] || ['',''];
+    next[weekIdx] = idx === 0 ? [val, cur[1]] : [cur[0], val];
+    if (!next[weekIdx][0] && !next[weekIdx][1]) next[weekIdx] = null;
+    setForm({ ...form, fridayRotation: next });
+  };
+  const setWeekOff = (weekIdx, off) => {
+    const next = resizeRotation(form.fridayRotation, fridayCycleWeeks);
+    next[weekIdx] = off ? null : ['07:00','15:30'];
+    setForm({ ...form, fridayRotation: next });
+  };
+
+  const updateShift = (day, idx, val) => {
+    const newSched = { ...form.sched };
+    if (!newSched[day]) newSched[day] = ['',''];
+    newSched[day] = [...newSched[day]];
+    newSched[day][idx] = val;
+    setForm({ ...form, sched: newSched });
+  };
+  const toggleDayOff = (day) => {
+    const cur = form.daysOff || [];
+    setForm({ ...form, daysOff: cur.includes(day) ? cur.filter(d => d !== day) : [...cur, day] });
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: 'rgba(28, 25, 23, 0.4)' }} onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+        <div className="sticky top-0 bg-white border-b border-stone-200 px-6 py-4 flex items-center justify-between z-10">
+          <div>
+            <h2 className="display-font text-2xl text-stone-800">{form.name}</h2>
+            <p className="text-xs text-stone-500">{dept.name}{form.role ? ` · ${form.role}` : ''}</p>
+          </div>
+          <button onClick={onClose} className="text-stone-400 hover:text-stone-700"><X size={20} /></button>
+        </div>
+
+        <div className="p-6 space-y-6">
+          {/* Grunduppgifter */}
+          <Section title="Grunduppgifter">
+            <div className="grid grid-cols-2 gap-4">
+              <Field label="Namn"><input className="input" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} /></Field>
+              <Field label="Roll/undervisning"><input className="input" value={form.role} onChange={e => setForm({ ...form, role: e.target.value })} placeholder="ex. åk 1, musik" /></Field>
+              <Field label="Avdelning">
+                <select className="input" value={form.deptId || ''} onChange={e => setForm({ ...form, deptId: e.target.value })}>
+                  {departments.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+                </select>
+              </Field>
+              <div></div>
+            </div>
+            <div className="mt-4">
+              <p className="text-xs text-stone-600 mb-2" style={{ fontWeight: 500 }}>Tjänstgöring</p>
+              <div className="grid grid-cols-2 gap-4">
+                <Field label="Heltid på arbetsplats">
+                  <div className="flex items-center gap-2">
+                    <input type="number" min="0" max="50" step="0.25" className="input flex-1"
+                      value={form.fullTimeHours ?? 37.5}
+                      onChange={e => setForm({ ...form, fullTimeHours: parseFloat(e.target.value) || 0 })} />
+                    <span className="text-xs text-stone-500">timmar</span>
+                  </div>
+                  <p className="text-[10px] text-stone-400 mt-1">t.ex. 37,5h för fritidspedagog</p>
+                </Field>
+                <Field label="Tjänstgöringsgrad">
+                  <div className="flex items-center gap-2">
+                    <input type="number" min="0" max="200" step="1" className="input flex-1"
+                      value={form.percent ?? 100}
+                      onChange={e => setForm({ ...form, percent: parseFloat(e.target.value) || 0 })} />
+                    <span className="text-xs text-stone-500">%</span>
+                  </div>
+                  <p className="text-[10px] text-stone-400 mt-1">100% = heltid, 75% = 75% av heltid osv</p>
+                </Field>
+              </div>
+              <div className="mt-2 bg-stone-50 rounded p-2 text-xs text-stone-600">
+                Beräknat veckotidsmål: <span className="text-stone-800 tabular-nums" style={{ fontWeight: 500 }}>{minToHM(targetMin)}</span>
+              </div>
+            </div>
+          </Section>
+
+          {/* Pass per dag */}
+          <Section title="Pass mån–tor">
+            <div className="space-y-2">
+              {DAYS.map(d => {
+                const isOff = (form.daysOff || []).includes(d.key);
+                return (
+                  <div key={d.key} className={`flex items-center gap-3 flex-wrap py-1 rounded ${isOff ? 'opacity-40' : ''}`}>
+                    <span className="text-sm text-stone-700 w-20">{d.label}</span>
+                    <input type="time" className="input w-32" value={form.sched[d.key]?.[0] || ''} disabled={isOff} onChange={e => updateShift(d.key, 0, e.target.value)} />
+                    <span className="text-stone-400">–</span>
+                    <input type="time" className="input w-32" value={form.sched[d.key]?.[1] || ''} disabled={isOff} onChange={e => updateShift(d.key, 1, e.target.value)} />
+                    {form.sched[d.key]?.[0] && form.sched[d.key]?.[1] && !isOff && (
+                      <span className="text-xs text-stone-500 ml-1">{minToHM(dayMinutes(form.sched[d.key]))}</span>
+                    )}
+                    <button type="button" onClick={() => toggleDayOff(d.key)}
+                      className={`ml-auto text-[10px] px-2 py-0.5 rounded ${isOff ? 'bg-stone-700 text-white' : 'bg-stone-100 text-stone-600 hover:bg-stone-200'}`}>
+                      {isOff ? 'Ledig' : 'Markera som ledig'}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </Section>
+
+          {/* Begränsningar */}
+          <Section title="Begränsningar för automatisk pussling">
+            <p className="text-xs text-stone-500 mb-3">Dessa villkor respekteras när appen genererar förslag.</p>
+            <div className="space-y-2.5">
+              <Toggle checked={form.fixedTimes} onChange={v => setForm({ ...form, fixedTimes: v })}
+                label="Fast tid varje vecka" hint="Generatorn rör inte denna persons pass alls" />
+              <Toggle checked={form.onlyAfternoons} onChange={v => setForm({ ...form, onlyAfternoons: v })}
+                label="Endast eftermiddag" hint="Får aldrig börja före kl 12:00" />
+            </div>
+            <div className="mt-4 space-y-4">
+              <div>
+                <p className="text-xs text-stone-600 mb-2" style={{ fontWeight: 500 }}>Starttid</p>
+                <div className="grid grid-cols-2 gap-4">
+                  <Field label="Tidigast tillåten">
+                    <div className="flex items-center gap-2">
+                      <input type="time" className="input flex-1" value={form.earliestStart != null ? minToTime(form.earliestStart) : ''}
+                        onChange={e => setForm({ ...form, earliestStart: e.target.value ? timeToMin(e.target.value) : null })} />
+                      {form.earliestStart != null && <button onClick={() => setForm({ ...form, earliestStart: null })} className="text-xs text-stone-500 hover:text-stone-800">×</button>}
+                    </div>
+                    <p className="text-[10px] text-stone-400 mt-1">Får inte börja före denna tid</p>
+                  </Field>
+                  <Field label="Måste börja senast">
+                    <div className="flex items-center gap-2">
+                      <input type="time" className="input flex-1" value={form.latestStart != null ? minToTime(form.latestStart) : ''}
+                        onChange={e => setForm({ ...form, latestStart: e.target.value ? timeToMin(e.target.value) : null })} />
+                      {form.latestStart != null && <button onClick={() => setForm({ ...form, latestStart: null })} className="text-xs text-stone-500 hover:text-stone-800">×</button>}
+                    </div>
+                    <p className="text-[10px] text-stone-400 mt-1">t.ex. 08:40 om lektion börjar då</p>
+                  </Field>
+                </div>
+              </div>
+              <div>
+                <p className="text-xs text-stone-600 mb-2" style={{ fontWeight: 500 }}>Sluttid</p>
+                <div className="grid grid-cols-2 gap-4">
+                  <Field label="Måste jobba minst till">
+                    <div className="flex items-center gap-2">
+                      <input type="time" className="input flex-1" value={form.earliestEnd != null ? minToTime(form.earliestEnd) : ''}
+                        onChange={e => setForm({ ...form, earliestEnd: e.target.value ? timeToMin(e.target.value) : null })} />
+                      {form.earliestEnd != null && <button onClick={() => setForm({ ...form, earliestEnd: null })} className="text-xs text-stone-500 hover:text-stone-800">×</button>}
+                    </div>
+                    <p className="text-[10px] text-stone-400 mt-1">t.ex. 14:00 om lektion slutar då</p>
+                  </Field>
+                  <Field label="Senast tillåten">
+                    <div className="flex items-center gap-2">
+                      <input type="time" className="input flex-1" value={form.latestEnd != null ? minToTime(form.latestEnd) : ''}
+                        onChange={e => setForm({ ...form, latestEnd: e.target.value ? timeToMin(e.target.value) : null })} />
+                      {form.latestEnd != null && <button onClick={() => setForm({ ...form, latestEnd: null })} className="text-xs text-stone-500 hover:text-stone-800">×</button>}
+                    </div>
+                    <p className="text-[10px] text-stone-400 mt-1">t.ex. 16:30 om hen ska hämta egna barn</p>
+                  </Field>
+                </div>
+              </div>
+            </div>
+          </Section>
+
+          {/* Fredag */}
+          <Section title="Fredagar">
+            <Toggle checked={form.hasFridayRotation}
+              onChange={v => setForm({
+                ...form,
+                hasFridayRotation: v,
+                fridayShift: v ? null : (form.fridayShift || ['07:45','15:45']),
+                fridayRotation: v ? resizeRotation(form.fridayRotation, fridayCycleWeeks) : null,
+              })}
+              label={`Ingår i fredagsrullen (${fridayCycleWeeks}-veckors cykel)`}
+              hint="Annars: fast fredagstid (eller alltid ledig)" />
+
+            {form.hasFridayRotation && (
+              <div className="mt-3 ml-6">
+                <p className="text-[10px] uppercase tracking-wider text-stone-500 mb-2">
+                  Fredagstider per vecka i cykeln
+                </p>
+                <div className="space-y-1.5">
+                  {Array.from({ length: fridayCycleWeeks }).map((_, w) => {
+                    const sh = (form.fridayRotation || [])[w];
+                    const isOff = sh == null;
+                    return (
+                      <div key={w} className="flex items-center gap-2 flex-wrap">
+                        <span className="display-font text-sm text-stone-700 w-10 tabular-nums text-center">
+                          v{w + 1}
+                        </span>
+                        <input type="time" className="input w-28" disabled={isOff}
+                          value={sh ? sh[0] : ''}
+                          onChange={e => updateFridayWeek(w, 0, e.target.value)} />
+                        <span className="text-stone-400 text-xs">–</span>
+                        <input type="time" className="input w-28" disabled={isOff}
+                          value={sh ? sh[1] : ''}
+                          onChange={e => updateFridayWeek(w, 1, e.target.value)} />
+                        {!isOff && (
+                          <span className="text-[10px] text-stone-500 tabular-nums ml-1">
+                            {minToHM(dayMinutes(sh))}
+                          </span>
+                        )}
+                        <button type="button" onClick={() => setWeekOff(w, !isOff)}
+                          className={`ml-auto text-[10px] px-2 py-0.5 rounded ${isOff ? 'bg-stone-700 text-white' : 'bg-stone-100 text-stone-600 hover:bg-stone-200'}`}>
+                          {isOff ? 'Ledig' : 'Markera som ledig'}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+                <p className="text-[10px] text-stone-400 mt-2">
+                  Snitt över cykeln räknas in i veckotidsmålet. Cykellängden ändras under Inställningar.
+                </p>
+              </div>
+            )}
+
+            {!form.hasFridayRotation && (
+              <div className="mt-3 ml-6 flex items-center gap-3 flex-wrap">
+                <span className="text-sm text-stone-700 w-20">Fast fredag</span>
+                <input type="time" className="input w-32" value={form.fridayShift?.[0] || ''} onChange={e => setForm({ ...form, fridayShift: [e.target.value, form.fridayShift?.[1] || ''] })} />
+                <span className="text-stone-400">–</span>
+                <input type="time" className="input w-32" value={form.fridayShift?.[1] || ''} onChange={e => setForm({ ...form, fridayShift: [form.fridayShift?.[0] || '', e.target.value] })} />
+                <button onClick={() => setForm({ ...form, fridayShift: null })} className="text-xs text-stone-500 hover:text-stone-800">×</button>
+              </div>
+            )}
+          </Section>
+
+          {/* Veckosumma */}
+          <div className={`rounded-lg p-4 flex items-center justify-between ${off ? 'bg-orange-50 ring-1 ring-orange-200' : 'bg-emerald-50 ring-1 ring-emerald-200'}`}>
+            <div className="flex items-center gap-2">
+              {off ? <AlertCircle size={16} className="text-orange-600" /> : <CheckCircle2 size={16} className="text-emerald-600" />}
+              <span className="text-xs uppercase tracking-wider text-stone-600">Veckotid</span>
+            </div>
+            <div className="text-right">
+              <span className="text-sm tabular-nums text-stone-800" style={{ fontWeight: 500 }}>
+                {minToHM(wm)} / {minToHM(targetMin)}
+              </span>
+              {off && <p className="text-xs text-orange-600 mt-0.5">{diff > 0 ? `${minToHM(diff)} för mycket` : `${minToHM(-diff)} för lite`}</p>}
+            </div>
+          </div>
+        </div>
+
+        <div className="sticky bottom-0 bg-white border-t border-stone-200 px-6 py-4 flex justify-between items-center">
+          <button onClick={() => { if (confirm(`Ta bort ${form.name}?`)) onRemove(form.id); }}
+            className="text-sm text-red-600 hover:text-red-800 flex items-center gap-1.5">
+            <Trash2 size={14} />Ta bort
+          </button>
+          <div className="flex gap-2">
+            <button onClick={onClose} className="px-4 py-2 text-sm rounded-lg text-stone-600 hover:bg-stone-100 transition">Avbryt</button>
+            <button onClick={() => onSave(form)} className="px-4 py-2 text-sm rounded-lg bg-stone-800 text-white hover:bg-stone-900 transition">Spara</button>
+          </div>
+        </div>
+
+        <style>{`
+          .input { background: white; border: 1px solid #e7e5e4; border-radius: 6px; padding: 6px 10px; font-size: 13px; color: #1c1917; outline: none; }
+          .input:focus { border-color: #78716c; box-shadow: 0 0 0 3px rgba(120, 113, 108, 0.1); }
+          .input:disabled { background: #f5f5f4; color: #a8a29e; cursor: not-allowed; }
+        `}</style>
+      </div>
+    </div>
+  );
+}
+
+function Section({ title, children }) {
+  return (
+    <div>
+      <h3 className="text-xs uppercase tracking-wider text-stone-500 mb-3 pb-1 border-b border-stone-100">{title}</h3>
+      {children}
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (<div><label className="text-xs text-stone-600 mb-1 block">{label}</label>{children}</div>);
+}
+
+function Toggle({ checked, onChange, label, hint }) {
+  return (
+    <div className="flex items-start gap-3">
+      <button type="button" onClick={() => onChange(!checked)}
+        className={`relative w-9 h-5 rounded-full transition flex-shrink-0 mt-0.5 ${checked ? 'bg-stone-800' : 'bg-stone-300'}`}>
+        <span className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform"
+          style={{ transform: checked ? 'translateX(18px)' : 'translateX(2px)' }} />
+      </button>
+      <div className="cursor-pointer" onClick={() => onChange(!checked)}>
+        <p className="text-sm text-stone-700">{label}</p>
+        {hint && <p className="text-[10px] text-stone-500 mt-0.5">{hint}</p>}
+      </div>
+    </div>
+  );
+}
+
+// -------- Alternatives Modal --------
+
+function AlternativesModal({ alternatives, currentStaff, coverage, departments, onApply, onClose }) {
+  const [previewIdx, setPreviewIdx] = useState(0);
+  const currentSummary = summarizeSchedule(currentStaff, coverage);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: 'rgba(28, 25, 23, 0.5)' }} onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl max-w-5xl w-full max-h-[92vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+        <div className="sticky top-0 bg-white border-b border-stone-200 px-6 py-4 flex items-center justify-between z-10">
+          <div>
+            <h2 className="display-font text-2xl text-stone-800">Tre schemaförslag</h2>
+            <p className="text-xs text-stone-500 mt-0.5">Klicka på ett kort för att förhandsgranska, "Tillämpa" för att använda</p>
+          </div>
+          <button onClick={onClose} className="text-stone-400 hover:text-stone-700"><X size={20} /></button>
+        </div>
+
+        <div className="p-6">
+          {/* Comparison cards */}
+          <div className="grid md:grid-cols-3 gap-3 mb-6">
+            {alternatives.map((alt, i) => {
+              const isSelected = previewIdx === i;
+              const better = (a, b) => a < b ? 'text-emerald-700' : a > b ? 'text-orange-600' : 'text-stone-600';
+              return (
+                <button key={i} onClick={() => setPreviewIdx(i)}
+                  className={`text-left rounded-xl p-4 transition ${isSelected ? 'bg-stone-800 text-white shadow-lg' : 'bg-stone-50 ring-1 ring-stone-200 hover:bg-stone-100'}`}>
+                  <p className={`text-[10px] uppercase tracking-wider ${isSelected ? 'text-stone-300' : 'text-stone-500'}`}>Alternativ {i + 1}</p>
+                  <h3 className={`display-font text-lg mt-1 ${isSelected ? 'text-white' : 'text-stone-800'}`}>{alt.label}</h3>
+                  <p className={`text-xs mt-1 ${isSelected ? 'text-stone-300' : 'text-stone-500'}`}>{alt.desc}</p>
+                  <div className="mt-3 pt-3 border-t border-stone-200/30 space-y-1 text-xs">
+                    <div className="flex justify-between">
+                      <span className={isSelected ? 'text-stone-300' : 'text-stone-500'}>Täckningsgap:</span>
+                      <span className={isSelected ? 'text-white' : better(alt.summary.totalGaps, currentSummary.totalGaps)} style={{ fontWeight: 500 }}>
+                        {alt.summary.totalGaps} {alt.summary.totalGapMinutes > 0 && `(${alt.summary.totalGapMinutes} min)`}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className={isSelected ? 'text-stone-300' : 'text-stone-500'}>Pers. m. tim-avvik.:</span>
+                      <span className={isSelected ? 'text-white' : better(alt.summary.peopleOff, currentSummary.peopleOff)} style={{ fontWeight: 500 }}>
+                        {alt.summary.peopleOff} pers.
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className={isSelected ? 'text-stone-300' : 'text-stone-500'}>Total tim-avvik.:</span>
+                      <span className={isSelected ? 'text-white' : better(alt.summary.totalHourDev, currentSummary.totalHourDev)} style={{ fontWeight: 500 }}>
+                        {minToHM(alt.summary.totalHourDev)}
+                      </span>
+                    </div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Comparison vs current */}
+          <div className="bg-stone-50 rounded-lg p-3 mb-6 text-xs text-stone-600 flex items-center gap-3 flex-wrap">
+            <span className="text-stone-500">Nuvarande schema till jämförelse:</span>
+            <span><span style={{ fontWeight: 500 }}>{currentSummary.totalGaps}</span> gap</span>
+            <span>·</span>
+            <span><span style={{ fontWeight: 500 }}>{currentSummary.peopleOff}</span> personer m. tim-avvikelse</span>
+            <span>·</span>
+            <span>tot. <span style={{ fontWeight: 500 }}>{minToHM(currentSummary.totalHourDev)}</span> avvikelse</span>
+          </div>
+
+          {/* Preview of selected */}
+          <PreviewSchedule staff={alternatives[previewIdx].staff} originalStaff={currentStaff} coverage={coverage} departments={departments} />
+
+          <div className="flex justify-end gap-2 mt-6">
+            <button onClick={onClose} className="px-4 py-2 text-sm rounded-lg text-stone-600 hover:bg-stone-100 transition">Avbryt</button>
+            <button onClick={() => onApply(alternatives[previewIdx])}
+              className="px-5 py-2 text-sm rounded-lg bg-stone-800 text-white hover:bg-stone-900 transition flex items-center gap-2">
+              <Wand2 size={14} />Tillämpa alternativ {previewIdx + 1}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PreviewSchedule({ staff, originalStaff, coverage, departments }) {
+  const origMap = Object.fromEntries(originalStaff.map(p => [p.id, p]));
+  return (
+    <div className="space-y-4">
+      <p className="text-xs uppercase tracking-wider text-stone-500">Förhandsgranskning · ändringar markerade i färg</p>
+      {DAYS.map(d => {
+        const present = staff.filter(s => s.sched[d.key] && !(s.daysOff || []).includes(d.key))
+          .map(s => ({ ...s, startMin: timeToMin(s.sched[d.key][0]), endMin: timeToMin(s.sched[d.key][1]) }))
+          .sort((a, b) => a.startMin - b.startMin);
+        const slots = computeSlots(staff, d.key, coverage);
+        const gaps = slots.filter(s => s.count < s.min).length;
+        return (
+          <div key={d.key} className="bg-white ring-1 ring-stone-200 rounded-lg p-3">
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-sm text-stone-700" style={{ fontWeight: 500 }}>{d.label}</p>
+              <span className={`text-[10px] px-2 py-0.5 rounded ${gaps === 0 ? 'bg-emerald-50 text-emerald-700' : 'bg-orange-50 text-orange-700'}`}>
+                {gaps === 0 ? 'Täcker krav' : `${gaps} gap`}
+              </span>
+            </div>
+            <div className="space-y-0.5">
+              {present.map(p => {
+                const orig = origMap[p.id];
+                const origSh = orig.sched[d.key];
+                const changed = !origSh || origSh[0] !== p.sched[d.key][0] || origSh[1] !== p.sched[d.key][1];
+                const dept = getDept(p.deptId, departments);
+                const soft = softColor(dept.color);
+                return (
+                  <div key={p.id} className="flex items-center text-xs">
+                    <span className="w-24 text-right pr-2 text-stone-700 truncate">{p.name}</span>
+                    <div className="flex-1 relative h-5 bg-stone-50 rounded">
+                      <div className="absolute h-full rounded flex items-center px-1.5"
+                        style={{ left: `${pctFromMin(p.startMin)}%`, width: `${pctFromMin(p.endMin) - pctFromMin(p.startMin)}%`,
+                          backgroundColor: changed ? '#fef3c7' : soft, borderLeft: `2px solid ${changed ? '#d97706' : dept.color}` }}>
+                        <span className="text-[10px] truncate text-stone-700">
+                          {p.sched[d.key][0]}–{p.sched[d.key][1]}
+                          {changed && <span className="text-amber-700 ml-1">★</span>}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+
+// ----- Mount -----
+const rootEl = document.getElementById('root');
+ReactDOM.createRoot(rootEl).render(React.createElement(FritidsSchemaApp));
+
+</script>
+</body>
+</html>
