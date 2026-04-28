@@ -209,81 +209,222 @@ const DEFAULTS = {
 // Hjälpfunktion: bygger en personalpost med default-värden + det man skickar in
 const P = (fields) => ({ ...DEFAULTS, ...fields });
 
-// Tom start. EXAMPLE_STAFF + EXAMPLE_DEPARTMENTS kan laddas in via knapp.
+// Tom start. Exempelscenarier kan laddas in via knapp.
 const initialStaff = [];
 
-const EXAMPLE_DEPARTMENTS = [
-  { id: 'd1', name: 'Jupiter',    color: '#D97757' },
-  { id: 'd2', name: 'Neptunus',   color: '#3D7A8C' },
-  { id: 'd3', name: 'Vintergatan',color: '#8B6FA8' },
+const initialFridayTemplateRotation = new Array(8).fill(null);
+const COVERAGE_SHARED = 'shared';
+const COVERAGE_DEPARTMENT = 'department';
+const EXAMPLE_FRIDAY_TEMPLATE_EARLY = [
+  ['06:15','14:15'],
+  ['06:45','14:45'],
+  ['07:15','15:15'],
+  ['08:00','16:00'],
+  ['09:00','17:00'],
+  null,
+  ['07:00','15:00'],
+  ['08:15','16:15'],
 ];
 
-// Exempel-bas: 8 turer som rullas igenom. Varje person får en kopia förskjuten med olika offset
-// så de inte alla har samma tider samma vecka.
-const _FRIDAY_BASE = [
-  ['06:00','14:30'],
-  ['07:00','15:30'],
-  ['08:00','16:30'],
-  ['09:30','17:00'],
-  ['10:00','17:45'],
-  null,                  // ledig vecka
-  ['06:30','15:00'],
-  ['07:30','16:00'],
+const EXAMPLE_FRIDAY_TEMPLATE_BALANCED = [
+  ['06:30','14:30'],
+  ['07:00','15:00'],
+  ['07:45','15:45'],
+  ['08:30','16:30'],
+  ['09:15','17:00'],
+  null,
+  ['06:45','14:45'],
+  ['08:00','16:00'],
 ];
-function exampleRotation(offset) {
-  return _FRIDAY_BASE.map((_, i) => _FRIDAY_BASE[(i + offset) % _FRIDAY_BASE.length]);
+
+const EXAMPLE_FRIDAY_TEMPLATE_LATE = [
+  ['07:00','15:00'],
+  ['07:45','15:45'],
+  ['08:30','16:30'],
+  ['09:15','17:00'],
+  ['10:00','17:45'],
+  null,
+  ['08:00','16:00'],
+  ['09:00','16:45'],
+];
+
+function exampleBlock(start, end, min, label, scopeType = COVERAGE_SHARED, deptId = null) {
+  return { id: Math.random(), start, end, min, label, scopeType, deptId };
 }
 
-const initialFridayTemplateRotation = new Array(8).fill(null);
+function buildExampleStaff(specs, cycleWeeks = 8) {
+  return specs.map((spec, idx) => P({
+    id: spec.id ?? idx + 1,
+    name: spec.name,
+    deptId: spec.deptId,
+    role: spec.role || '',
+    percent: spec.percent ?? 100,
+    fullTimeHours: spec.fullTimeHours ?? 37.5,
+    fixedTimes: !!spec.fixedTimes,
+    onlyAfternoons: !!spec.onlyAfternoons,
+    earliestStart: spec.earliestStart ?? null,
+    latestStart: spec.latestStart ?? null,
+    earliestEnd: spec.earliestEnd ?? null,
+    latestEnd: spec.latestEnd ?? null,
+    dayOverrides: spec.dayOverrides || {},
+    parityOverrides: spec.parityOverrides || {},
+    daysOff: spec.daysOff || [],
+    hasFridayRotation: spec.hasFridayRotation !== false,
+    fridayUseTemplate: !!spec.fridayUseTemplate,
+    fridayTemplateStartWeek: spec.fridayTemplateStartWeek || 1,
+    fridayTemplateOverrides: spec.fridayTemplateOverrides || {},
+    fridayRotation: spec.hasFridayRotation === false ? null : resizeRotation(spec.fridayRotation || [], cycleWeeks),
+    fridayShift: spec.hasFridayRotation === false ? (spec.fridayShift || null) : null,
+    sched: spec.sched || {},
+  }));
+}
 
-const EXAMPLE_STAFF = [
-  P({ id: 1, name: 'Christina', deptId: 'd1', percent: 82, role: '',
-      sched: { mon:['08:00','16:20'], tue:['07:00','16:00'], wed:['07:05','16:00'], thu:['10:15','16:45'] },
-      fridayRotation: exampleRotation(0) }),
-  P({ id: 2, name: 'Gustav', deptId: 'd1', percent: 82, role: 'musik',
-      sched: { mon:['05:50','15:00'], tue:['10:15','17:45'], wed:['07:45','16:20'], thu:['08:45','16:15'] },
-      fridayRotation: exampleRotation(1) }),
-  P({ id: 3, name: 'Petter', deptId: 'd1', percent: 100, fullTimeHours: 37.75, role: '',
-      sched: { mon:['08:45','16:45'], tue:['07:45','16:20'], wed:['09:50','16:30'], thu:['06:45','15:30'] },
-      fixedTimes: true, hasFridayRotation: false, fridayShift: ['07:45','15:45'] }),
-  P({ id: 4, name: 'Anna', deptId: 'd2', percent: 82, role: 'rastkul',
-      sched: { mon:['11:00','17:45'], tue:['08:40','16:25'], wed:['07:15','16:30'], thu:['07:00','16:00'] },
-      fridayRotation: exampleRotation(2) }),
-  P({ id: 5, name: 'Markus', deptId: 'd2', percent: 82, role: 'rastkul',
-      sched: { mon:['07:15','16:25'], tue:['09:25','16:45'], wed:['05:50','15:00'], thu:['09:25','16:30'] },
-      fridayRotation: exampleRotation(3) }),
-  P({ id: 6, name: 'Andreas', deptId: 'd2', percent: 81.3, role: 'åk 3',
-      sched: { mon:['07:55','16:00'], tue:['07:00','16:15'], wed:['09:00','16:45'], thu:['08:30','16:25'] },
-      latestStart: 8*60+40,
-      hasFridayRotation: false, fridayShift: ['08:45','15:45'] }),
-  P({ id: 7, name: 'Mia', deptId: 'd3', percent: 82, role: 'åk 1',
-      sched: { mon:['08:00','16:00'], tue:['07:15','16:20'], wed:['11:00','17:45'], thu:['07:05','16:00'] },
-      latestStart: 8*60+40,
-      fridayRotation: exampleRotation(4) }),
-  P({ id: 8, name: 'Emma', deptId: 'd3', percent: 100, fullTimeHours: 37.75, role: '',
-      sched: { mon:['07:10','16:00'], tue:['09:10','16:30'], wed:['07:00','16:00'], thu:['10:55','17:45'] },
-      fridayRotation: exampleRotation(5) }),
-  P({ id: 9, name: 'Jonas W', deptId: 'd3', percent: 82, role: 'åk 5',
-      sched: { mon:['08:00','16:30'], tue:['05:50','15:00'], wed:['10:05','16:30'], thu:['07:15','16:00'] },
-      latestStart: 8*60+40,
-      fridayRotation: exampleRotation(6) }),
-  P({ id:10, name: 'Lars', deptId: 'd3', percent: 45.6, role: 'åk 2',
-      sched: { mon:['13:00','16:30'], tue:['13:00','16:15'], wed:['12:45','16:00'], thu:['13:00','16:30'] },
-      onlyAfternoons: true, hasFridayRotation: false }),
-  P({ id:11, name: 'Susanne', deptId: 'd3', percent: 82, role: 'fklass',
-      sched: { mon:['07:00','15:30'], tue:['09:10','16:30'], wed:['08:30','16:15'], thu:['05:50','15:00'] },
-      latestStart: 8*60+40,
-      fridayRotation: exampleRotation(7) }),
-  P({ id:12, name: 'Hampus', deptId: 'd3', percent: 82, role: '',
-      sched: { mon:['06:45','15:45'], tue:['06:45','15:30'], wed:['06:45','15:30'], thu:['07:45','15:45'] },
-      fixedTimes: true, hasFridayRotation: false, fridayShift: ['07:45','15:45'] }),
+function buildExampleScenario({ id, name, description, departments, coverageBlocks, fridayCycleWeeks = 8, fridayTemplateRotation = initialFridayTemplateRotation, staffSpecs }) {
+  return {
+    id,
+    name,
+    description,
+    departments,
+    coverageBlocks,
+    fridayCycleWeeks,
+    fridayTemplateRotation: resizeRotation(fridayTemplateRotation, fridayCycleWeeks),
+    staff: buildExampleStaff(staffSpecs, fridayCycleWeeks),
+  };
+}
+
+const EXAMPLE_SCENARIOS = [
+  buildExampleScenario({
+    id: 'compact-two-depts',
+    name: 'Litet fritids · 2 avdelningar',
+    description: 'Kompakt upplägg med samlad morgon, två olika eftermiddagsstarter och mestadels parametrar i stället för färdiga pass.',
+    departments: [
+      { id: 'd1', name: 'Eken', color: '#D97757' },
+      { id: 'd2', name: 'Aspen', color: '#3D7A8C' },
+    ],
+    coverageBlocks: [
+      exampleBlock(360, 480, 2, 'Samlad morgon'),
+      exampleBlock(480, 795, 1, 'Mitt på dagen'),
+      exampleBlock(795, 990, 2, 'Eken eftermiddag', COVERAGE_DEPARTMENT, 'd1'),
+      exampleBlock(855, 990, 2, 'Aspen eftermiddag', COVERAGE_DEPARTMENT, 'd2'),
+      exampleBlock(990, 1065, 2, 'Samlad stängning'),
+    ],
+    fridayTemplateRotation: EXAMPLE_FRIDAY_TEMPLATE_BALANCED,
+    staffSpecs: [
+      { name: 'Alva Berg', deptId: 'd1', role: 'fklass', percent: 100, latestStart: 8*60+15, fridayUseTemplate: true, fridayTemplateStartWeek: 1 },
+      { name: 'Nils Ek', deptId: 'd1', role: 'åk 1', percent: 82, latestStart: 8*60+40, earliestEnd: 15*60, fridayUseTemplate: true, fridayTemplateStartWeek: 2 },
+      { name: 'Mira Holm', deptId: 'd1', role: 'resurs', percent: 55, onlyAfternoons: true, earliestStart: 12*60+30, latestEnd: 17*60, daysOff: ['fri'], hasFridayRotation: false },
+      { name: 'Otto Lind', deptId: 'd2', role: 'åk 2', percent: 100, earliestStart: 6*60, latestEnd: 16*60+30, dayOverrides: { wed: { latestStart: 8*60 } }, fridayUseTemplate: true, fridayTemplateStartWeek: 4 },
+      { name: 'Selma Nor', deptId: 'd2', role: 'skapande', percent: 78, latestStart: 9*60+15, earliestEnd: 15*60+30, fridayUseTemplate: true, fridayTemplateStartWeek: 5 },
+      { name: 'Vide Sjö', deptId: 'd2', role: 'musik', percent: 60, onlyAfternoons: true, earliestStart: 12*60, latestEnd: 17*60+15, daysOff: ['wed', 'fri'], hasFridayRotation: false },
+      { name: 'Tora Dal', deptId: 'd2', role: '', percent: 90, earliestStart: 7*60, earliestEnd: 15*60+45, parityOverrides: { odd: { latestStart: 8*60+30 } }, fridayUseTemplate: true, fridayTemplateStartWeek: 7 },
+    ],
+  }),
+  buildExampleScenario({
+    id: 'three-depts-staggered',
+    name: 'Mellanstort fritids · 3 avdelningar',
+    description: 'Tre avdelningar med olika eftermiddagsstarter, fler deltider och en central fredagsmall att rotera på.',
+    departments: [
+      { id: 'd1', name: 'Solen', color: '#D97757' },
+      { id: 'd2', name: 'Månen', color: '#5C8A5E' },
+      { id: 'd3', name: 'Stjärnan', color: '#8B6FA8' },
+    ],
+    coverageBlocks: [
+      exampleBlock(360, 480, 3, 'Samlad morgon'),
+      exampleBlock(480, 780, 1, 'Skoldel'),
+      exampleBlock(795, 1020, 2, 'Solen eftermiddag', COVERAGE_DEPARTMENT, 'd1'),
+      exampleBlock(795, 1020, 2, 'Månen eftermiddag', COVERAGE_DEPARTMENT, 'd2'),
+      exampleBlock(855, 1020, 2, 'Stjärnan eftermiddag', COVERAGE_DEPARTMENT, 'd3'),
+      exampleBlock(1020, 1065, 3, 'Gemensam stängning'),
+    ],
+    fridayTemplateRotation: EXAMPLE_FRIDAY_TEMPLATE_EARLY,
+    staffSpecs: [
+      { name: 'Ria Frost', deptId: 'd1', role: 'fklass', percent: 100, latestStart: 8*60+20, fridayUseTemplate: true, fridayTemplateStartWeek: 1 },
+      { name: 'Leo Park', deptId: 'd1', role: 'idrott', percent: 82, earliestEnd: 15*60, fridayUseTemplate: true, fridayTemplateStartWeek: 2 },
+      { name: 'Sana Vinter', deptId: 'd1', role: 'resurs', percent: 75, onlyAfternoons: true, earliestStart: 12*60+45, latestEnd: 17*60+30, daysOff: ['fri'], hasFridayRotation: false },
+      { name: 'Max Flod', deptId: 'd2', role: '', percent: 100, earliestStart: 6*60+15, latestEnd: 16*60, fridayUseTemplate: true, fridayTemplateStartWeek: 3 },
+      { name: 'Elin Storm', deptId: 'd2', role: 'åk 3', percent: 82, latestStart: 8*60+40, parityOverrides: { even: { latestEnd: 16*60+15 } }, fridayUseTemplate: true, fridayTemplateStartWeek: 4 },
+      { name: 'Noah Hage', deptId: 'd2', role: 'praktisk-estetisk', percent: 60, onlyAfternoons: true, latestEnd: 17*60+45, dayOverrides: { tue: { earliestStart: 13*60+15 } }, fridayUseTemplate: true, fridayTemplateStartWeek: 5 },
+      { name: 'Inez Ljung', deptId: 'd3', role: 'rast', percent: 100, latestStart: 9*60, fridayUseTemplate: true, fridayTemplateStartWeek: 6 },
+      { name: 'Milo Edén', deptId: 'd3', role: 'åk 4', percent: 82, earliestStart: 7*60+15, earliestEnd: 15*60+30, fridayUseTemplate: true, fridayTemplateStartWeek: 7 },
+      { name: 'Tilde Gran', deptId: 'd3', role: 'skapande', percent: 70, onlyAfternoons: true, daysOff: ['wed'], latestEnd: 17*60, hasFridayRotation: false },
+      { name: 'Aron Qvist', deptId: 'd3', role: '', percent: 50, onlyAfternoons: true, daysOff: ['fri'], earliestStart: 12*60, latestEnd: 16*60+45, hasFridayRotation: false },
+      { name: 'Nora Sved', deptId: 'd1', role: '', percent: 45, onlyAfternoons: true, daysOff: ['mon', 'fri'], latestEnd: 17*60, hasFridayRotation: false },
+    ],
+  }),
+  buildExampleScenario({
+    id: 'large-five-depts',
+    name: 'Stort fritids · 5 avdelningar',
+    description: 'Många avdelningar, fler personalgrupper och tillräckligt mycket variation för att pressa generatorn ordentligt.',
+    departments: [
+      { id: 'd1', name: 'Linden', color: '#D97757' },
+      { id: 'd2', name: 'Björken', color: '#3D7A8C' },
+      { id: 'd3', name: 'Granen', color: '#8B6FA8' },
+      { id: 'd4', name: 'Eken', color: '#5C8A5E' },
+      { id: 'd5', name: 'Gläntan', color: '#B8860B' },
+    ],
+    coverageBlocks: [
+      exampleBlock(360, 480, 4, 'Samlad morgon'),
+      exampleBlock(480, 780, 2, 'Skoldel'),
+      exampleBlock(780, 1005, 2, 'Linden eftermiddag', COVERAGE_DEPARTMENT, 'd1'),
+      exampleBlock(780, 1005, 2, 'Björken eftermiddag', COVERAGE_DEPARTMENT, 'd2'),
+      exampleBlock(780, 1005, 2, 'Granen eftermiddag', COVERAGE_DEPARTMENT, 'd3'),
+      exampleBlock(855, 1005, 2, 'Eken eftermiddag', COVERAGE_DEPARTMENT, 'd4'),
+      exampleBlock(855, 1005, 2, 'Gläntan eftermiddag', COVERAGE_DEPARTMENT, 'd5'),
+      exampleBlock(1005, 1065, 4, 'Gemensam stängning'),
+    ],
+    fridayTemplateRotation: EXAMPLE_FRIDAY_TEMPLATE_LATE,
+    staffSpecs: [
+      { name: 'Freja Vale', deptId: 'd1', role: 'fklass', percent: 100, latestStart: 8*60+15, fridayUseTemplate: true, fridayTemplateStartWeek: 1 },
+      { name: 'Hugo Natt', deptId: 'd1', role: 'åk 1', percent: 82, earliestEnd: 15*60+15, fridayUseTemplate: true, fridayTemplateStartWeek: 2 },
+      { name: 'Nea Bro', deptId: 'd1', role: '', percent: 58, onlyAfternoons: true, earliestStart: 12*60+30, latestEnd: 17*60+15, daysOff: ['fri'], hasFridayRotation: false },
+      { name: 'Ville Myr', deptId: 'd2', role: 'åk 2', percent: 100, earliestStart: 6*60, fridayUseTemplate: true, fridayTemplateStartWeek: 3 },
+      { name: 'Alba Sjö', deptId: 'd2', role: 'resurs', percent: 82, latestStart: 8*60+40, parityOverrides: { odd: { latestStart: 8*60 } }, fridayUseTemplate: true, fridayTemplateStartWeek: 4 },
+      { name: 'Lo Rune', deptId: 'd2', role: '', percent: 62, onlyAfternoons: true, latestEnd: 17*60+45, hasFridayRotation: false, daysOff: ['wed'] },
+      { name: 'Signe Duv', deptId: 'd3', role: 'åk 3', percent: 100, earliestStart: 7*60, latestEnd: 16*60+15, fridayUseTemplate: true, fridayTemplateStartWeek: 5 },
+      { name: 'Adam Vik', deptId: 'd3', role: 'rast', percent: 82, dayOverrides: { thu: { latestStart: 8*60+15 } }, fridayUseTemplate: true, fridayTemplateStartWeek: 6 },
+      { name: 'Kajsa Hed', deptId: 'd3', role: '', percent: 70, onlyAfternoons: true, earliestStart: 12*60+45, daysOff: ['fri'], hasFridayRotation: false },
+      { name: 'Liam Torr', deptId: 'd4', role: 'åk 4', percent: 100, latestStart: 9*60, fridayUseTemplate: true, fridayTemplateStartWeek: 7 },
+      { name: 'Rut Silf', deptId: 'd4', role: '', percent: 82, earliestEnd: 15*60+30, fridayUseTemplate: true, fridayTemplateStartWeek: 8 },
+      { name: 'Joel Alm', deptId: 'd4', role: 'skapande', percent: 55, onlyAfternoons: true, latestEnd: 17*60, daysOff: ['mon'], hasFridayRotation: false },
+      { name: 'Maja North', deptId: 'd5', role: 'åk 5', percent: 100, earliestStart: 7*60+15, latestEnd: 17*60, fridayUseTemplate: true, fridayTemplateStartWeek: 2 },
+      { name: 'Elliot Sund', deptId: 'd5', role: 'musik', percent: 82, latestStart: 8*60+30, fridayUseTemplate: true, fridayTemplateStartWeek: 4 },
+      { name: 'Ylva Klar', deptId: 'd5', role: '', percent: 68, onlyAfternoons: true, earliestStart: 12*60, latestEnd: 17*60+30, hasFridayRotation: false, daysOff: ['fri'] },
+      { name: 'Dante Moberg', deptId: 'd5', role: 'resurs', percent: 50, onlyAfternoons: true, daysOff: ['tue', 'fri'], latestEnd: 16*60+45, hasFridayRotation: false },
+    ],
+  }),
+  buildExampleScenario({
+    id: 'stress-test-gaps',
+    name: 'Stress-test · avsiktligt tajt',
+    description: 'Lite färre personer än behoven kräver. Bra när du vill se hur generatorn prioriterar och var gapen hamnar.',
+    departments: [
+      { id: 'd1', name: 'Ängen', color: '#D97757' },
+      { id: 'd2', name: 'Skogen', color: '#3D7A8C' },
+      { id: 'd3', name: 'Bryggan', color: '#8B6FA8' },
+    ],
+    coverageBlocks: [
+      exampleBlock(360, 480, 3, 'Samlad morgon'),
+      exampleBlock(480, 780, 2, 'Skoldel'),
+      exampleBlock(780, 1020, 3, 'Ängen eftermiddag', COVERAGE_DEPARTMENT, 'd1'),
+      exampleBlock(780, 1020, 2, 'Skogen eftermiddag', COVERAGE_DEPARTMENT, 'd2'),
+      exampleBlock(855, 1020, 2, 'Bryggan eftermiddag', COVERAGE_DEPARTMENT, 'd3'),
+      exampleBlock(1020, 1065, 3, 'Gemensam stängning'),
+    ],
+    fridayTemplateRotation: EXAMPLE_FRIDAY_TEMPLATE_BALANCED,
+    staffSpecs: [
+      { name: 'Ivar Bjäll', deptId: 'd1', role: 'fklass', percent: 100, latestStart: 8*60+20, fridayUseTemplate: true, fridayTemplateStartWeek: 1 },
+      { name: 'Lova Form', deptId: 'd1', role: '', percent: 82, earliestEnd: 15*60+15, fridayUseTemplate: true, fridayTemplateStartWeek: 3 },
+      { name: 'Moa Kust', deptId: 'd1', role: '', percent: 55, onlyAfternoons: true, earliestStart: 12*60+30, latestEnd: 17*60+15, hasFridayRotation: false, daysOff: ['fri'] },
+      { name: 'Axel Damm', deptId: 'd2', role: 'åk 2', percent: 100, earliestStart: 6*60+15, fridayUseTemplate: true, fridayTemplateStartWeek: 2 },
+      { name: 'Juni Orr', deptId: 'd2', role: '', percent: 75, latestStart: 8*60+45, dayOverrides: { mon: { latestStart: 8*60 } }, fridayUseTemplate: true, fridayTemplateStartWeek: 4 },
+      { name: 'Noel Strand', deptId: 'd3', role: 'åk 4', percent: 82, latestStart: 9*60, fridayUseTemplate: true, fridayTemplateStartWeek: 5 },
+      { name: 'Tyra Bergq', deptId: 'd3', role: '', percent: 60, onlyAfternoons: true, earliestStart: 12*60, latestEnd: 17*60+30, hasFridayRotation: false, daysOff: ['wed'] },
+      { name: 'Melker Ryd', deptId: 'd3', role: 'resurs', percent: 45, onlyAfternoons: true, daysOff: ['fri'], latestEnd: 16*60+30, hasFridayRotation: false },
+    ],
+  }),
 ];
 
 // Bemanningskrav som redigerbara block. Varje block: starttid–sluttid → minst N personer.
 // Tider är i minuter från midnatt (t.ex. 360 = 06:00).
-const COVERAGE_SHARED = 'shared';
-const COVERAGE_DEPARTMENT = 'department';
-
 const initialCoverageBlocks = [
   { id: 1, start: 350, end: 480, min: 2, label: 'Morgonfritids', scopeType: COVERAGE_SHARED, deptId: null },     // 05:50–08:00
   { id: 2, start: 480, end: 780, min: 1, label: 'Skoldag', scopeType: COVERAGE_SHARED, deptId: null },            // 08:00–13:00
@@ -552,12 +693,19 @@ function personMatchesCoverageScope(person, scope) {
   return scope.scopeType !== COVERAGE_DEPARTMENT || person.deptId === scope.deptId;
 }
 
-function computeSlots(staff, dayKey, coverageSlots, scope = { scopeType: COVERAGE_SHARED, deptId: null }) {
+function getShiftForDay(person, dayKey, options = {}) {
+  if (dayKey === 'fri') {
+    return getFridayShift(person, options.fridayWeek || 1, options.cycleWeeks || 8, options.fridayTemplateRotation || []);
+  }
+  return person.sched?.[dayKey] || null;
+}
+
+function computeSlots(staff, dayKey, coverageSlots, scope = { scopeType: COVERAGE_SHARED, deptId: null }, options = {}) {
   return coverageSlots.map(slot => {
     let count = 0;
     for (const p of staff) {
       if (!personMatchesCoverageScope(p, scope)) continue;
-      const sh = p.sched[dayKey];
+      const sh = getShiftForDay(p, dayKey, options);
       if (!sh) continue;
       const start = timeToMin(sh[0]);
       const end = timeToMin(sh[1]);
@@ -583,6 +731,20 @@ function scheduleScore(staff, coverageScopes, cycleWeeks, fridayTemplateRotation
         if (s.count > s.min + 2) score -= (s.count - s.min - 2) * weights.over;
       }
     }
+  }
+  // Coverage (fredag) räknas som snitt över rullen så fredagen väger som en vanlig veckodag.
+  if (cycleWeeks > 0) {
+    let fridayPenalty = 0;
+    for (let week = 1; week <= cycleWeeks; week++) {
+      for (const scope of coverageScopes) {
+        const slots = computeSlots(staff, 'fri', scope.slots, scope, { fridayWeek: week, cycleWeeks, fridayTemplateRotation });
+        for (const s of slots) {
+          if (s.count < s.min) fridayPenalty += (s.min - s.count) ** 2 * weights.gap;
+          if (s.count > s.min + 2) fridayPenalty += (s.count - s.min - 2) * weights.over;
+        }
+      }
+    }
+    score -= fridayPenalty / cycleWeeks;
   }
   return score;
 }
@@ -673,6 +835,23 @@ function summarizeSchedule(staff, coverageScopes, cycleWeeks, fridayTemplateRota
       for (const s of slots) if (s.count < s.min) { totalGaps++; totalGapMinutes += 15 * (s.min - s.count); }
     }
   }
+  if (cycleWeeks > 0) {
+    let fridayGaps = 0;
+    let fridayGapMinutes = 0;
+    for (let week = 1; week <= cycleWeeks; week++) {
+      for (const scope of coverageScopes) {
+        const slots = computeSlots(staff, 'fri', scope.slots, scope, { fridayWeek: week, cycleWeeks, fridayTemplateRotation });
+        for (const s of slots) {
+          if (s.count < s.min) {
+            fridayGaps++;
+            fridayGapMinutes += 15 * (s.min - s.count);
+          }
+        }
+      }
+    }
+    totalGaps += Math.round(fridayGaps / cycleWeeks);
+    totalGapMinutes += Math.round(fridayGapMinutes / cycleWeeks);
+  }
   let totalHourDev = 0, peopleOff = 0;
   for (const p of staff) {
     const dev = weeklyMinutes(p, cycleWeeks, fridayTemplateRotation) - getTargetMin(p);
@@ -758,6 +937,7 @@ function FritidsSchemaApp() {
   // så den nollställs vid ny session — men då fortsätter Spara att fungera (faller tillbaka till nedladdning).
   const [fileHandle, setFileHandle] = useState(null);
   const [showWelcome, setShowWelcome] = useState(false);
+  const [showExamplePicker, setShowExamplePicker] = useState(false);
   const [tourStep, setTourStep] = useState(null); // null = ingen tur aktiv, annars 0..3
 
   // När cykellängden ändras: justera alla personers fridayRotation till rätt längd,
@@ -989,14 +1169,23 @@ function FritidsSchemaApp() {
     return () => window.removeEventListener('beforeunload', handler);
   }, [dirty]);
 
+  const applyExampleScenario = (scenario) => {
+    if (!scenario) return;
+    if (staff.length > 0 && !confirm(`Detta ersätter nuvarande data med testscenariot "${scenario.name}". Fortsätt?`)) return;
+    const preparedStaff = prepareStaffForUse(scenario.staff, scenario.fridayCycleWeeks, scenario.fridayTemplateRotation);
+    setStaff(preparedStaff);
+    setDepartments(scenario.departments);
+    setCoverageBlocks(normalizeCoverageBlocks(scenario.coverageBlocks, scenario.departments));
+    setFridayCycleWeeksRaw(scenario.fridayCycleWeeks);
+    setFridayTemplateRotation(resizeRotation(scenario.fridayTemplateRotation, scenario.fridayCycleWeeks));
+    setCurrentFridayWeek(1);
+    setFileHandle(null);
+    setSavedFileName(null);
+    nextId = Math.max(...preparedStaff.map(p => p.id), 99) + 1;
+    setShowExamplePicker(false);
+  };
   const loadExample = () => {
-    if (staff.length > 0 && !confirm('Detta ersätter den personal och avdelningar som finns nu. Fortsätt?')) return;
-    setStaff(prepareStaffForUse(EXAMPLE_STAFF, 8, _FRIDAY_BASE));
-    setDepartments(EXAMPLE_DEPARTMENTS);
-    setCoverageBlocks(normalizeCoverageBlocks(initialCoverageBlocks, EXAMPLE_DEPARTMENTS));
-    setFridayCycleWeeksRaw(8);
-    setFridayTemplateRotation(resizeRotation(_FRIDAY_BASE, 8));
-    nextId = Math.max(...EXAMPLE_STAFF.map(p => p.id)) + 1;
+    setShowExamplePicker(true);
   };
   const clearAll = () => {
     if (!confirm('Detta tar bort all personal. Avdelningar behålls. Är du säker?')) return;
@@ -1300,6 +1489,10 @@ function FritidsSchemaApp() {
           onApply={applyAlternative} onClose={() => setAlternatives(null)} />
       )}
 
+      {showExamplePicker && (
+        <ExampleDataModal scenarios={EXAMPLE_SCENARIOS} onSelect={applyExampleScenario} onClose={() => setShowExamplePicker(false)} />
+      )}
+
       {showWelcome && (
         <WelcomeModal onClose={dismissWelcome} onStartTour={startTour} />
       )}
@@ -1390,7 +1583,7 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
             <Users size={14} />Gå till Personal
           </button>
           <button onClick={onLoadExample} className="px-5 py-2.5 rounded-lg bg-stone-100 text-stone-700 hover:bg-stone-200 transition text-sm">
-            Ladda exempeldata
+            Välj exempeldata
           </button>
         </div>
       </div>
@@ -1571,14 +1764,14 @@ function StaffView({ staff, fridayCycleWeeks, fridayTemplateRotation, violations
         <Users size={32} className="mx-auto text-stone-300 mb-3" />
         <div className="display-font text-2xl text-stone-800 mb-2">Lägg till första personen</div>
         <p className="text-sm text-stone-500 mb-6 max-w-md mx-auto">
-          Börja med en person i taget. Du kan ange namn, avdelning, tjänstgöringsgrad i procent, ordinarie pass mån–tor, fredagsrutin och eventuella villkor som t.ex. "måste vara på plats senast 08:40 för lektion".
+          Börja med en person i taget. Du kan ange namn, avdelning, tjänstgöringsgrad, fredagsrutin och villkor som styr när personen kan arbeta. Veckopassen kan användas som utgångsläge eller fyllas ut från reglerna.
         </p>
         <div className="flex gap-2 justify-center flex-wrap">
           <button onClick={onAdd} className="px-5 py-2.5 rounded-lg bg-stone-800 text-white hover:bg-stone-900 transition text-sm flex items-center gap-2">
             <Plus size={14} />Lägg till personal
           </button>
           <button onClick={onLoadExample} className="px-5 py-2.5 rounded-lg bg-stone-100 text-stone-700 hover:bg-stone-200 transition text-sm">
-            Ladda exempeldata
+            Välj exempeldata
           </button>
         </div>
         <p className="text-xs text-stone-400 mt-6 max-w-sm mx-auto">
@@ -1590,7 +1783,7 @@ function StaffView({ staff, fridayCycleWeeks, fridayTemplateRotation, violations
   return (
     <div className="space-y-4">
       <TabIntro>
-        Lägg till och redigera personalen. Klicka på en person för att fylla i pass mån–tor, fredagsrutin, tjänstgöringsgrad och eventuella villkor som lektionstider eller varannan-vecka-schema. Listan visar varje persons mål jämfört med faktisk arbetstid.
+        Lägg till och redigera personalen. Klicka på en person för att fylla i avdelning, tjänstgöringsgrad, utgångspass, fredagsrutin och villkor som lektionstider eller varannan-vecka-schema. Listan visar varje persons mål jämfört med faktisk arbetstid.
       </TabIntro>
       <div className="bg-white rounded-2xl ring-1 ring-stone-200 overflow-hidden">
         <table className="w-full text-sm">
@@ -2018,16 +2211,16 @@ function SettingsView({ departments, setDepartments, staff, setStaff, coverageBl
       {/* Data — exempel och rensning */}
       <div className="bg-white rounded-2xl ring-1 ring-stone-200 p-5">
         <h2 className="display-font text-xl text-stone-800">Data</h2>
-        <p className="text-sm text-stone-500 mt-0.5 mb-4">Återställning och exempeldata. Påverkar all personal — varnar först.</p>
+        <p className="text-sm text-stone-500 mt-0.5 mb-4">Återställning och flera olika testscenarier. Påverkar all personal och ersätter nuvarande data.</p>
         <div className="space-y-3">
           <div className="flex items-start justify-between gap-4 flex-wrap py-2">
             <div className="flex-1 min-w-[200px]">
               <p className="text-sm text-stone-800" style={{ fontWeight: 500 }}>Ladda exempeldata</p>
-              <p className="text-xs text-stone-500 mt-0.5">Fyller appen med tre avdelningar och tolv personer för att visa hur funktionerna fungerar. Ersätter befintlig data.</p>
+              <p className="text-xs text-stone-500 mt-0.5">Öppnar flera påhittade testscenarier med olika storlek, avdelningar och bemanningskrav. Veckopass för mån–tor är inte färdigifyllda.</p>
             </div>
             <button onClick={onLoadExample}
               className="px-4 py-2 rounded-lg text-sm bg-stone-100 text-stone-700 hover:bg-stone-200 transition whitespace-nowrap">
-              Ladda exempel
+              Välj scenario
             </button>
           </div>
           <div className="flex items-start justify-between gap-4 flex-wrap py-2 border-t border-stone-100 pt-3">
@@ -2740,14 +2933,66 @@ function ParityOverridesEditor({ form, setForm }) {
   );
 }
 
+function ExampleDataModal({ scenarios, onSelect, onClose }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: 'rgba(28, 25, 23, 0.5)' }} onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl max-w-4xl w-full max-h-[92vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+        <div className="sticky top-0 bg-white border-b border-stone-200 px-6 py-4 flex items-center justify-between z-10">
+          <div>
+            <h2 className="display-font text-2xl text-stone-800">Välj exempeldata</h2>
+            <p className="text-xs text-stone-500 mt-0.5">Alla scenarier använder påhittade namn. Veckopass för mån–tor är inte färdigifyllda, utan generatorn utgår från parametrarna.</p>
+          </div>
+          <button onClick={onClose} className="text-stone-400 hover:text-stone-700"><X size={20} /></button>
+        </div>
+
+        <div className="p-6 grid md:grid-cols-2 gap-4">
+          {scenarios.map((scenario) => {
+            const rotating = scenario.staff.filter(person => person.hasFridayRotation).length;
+            const deptBlocks = scenario.coverageBlocks.filter(block => block.scopeType === COVERAGE_DEPARTMENT).length;
+            const sharedBlocks = scenario.coverageBlocks.filter(block => block.scopeType !== COVERAGE_DEPARTMENT).length;
+            return (
+              <button key={scenario.id} onClick={() => onSelect(scenario)}
+                className="text-left bg-stone-50 ring-1 ring-stone-200 rounded-2xl p-5 hover:bg-stone-100 transition">
+                <p className="text-[10px] uppercase tracking-wider text-stone-500">Testscenario</p>
+                <h3 className="display-font text-xl text-stone-800 mt-1">{scenario.name}</h3>
+                <p className="text-sm text-stone-600 mt-2 leading-relaxed">{scenario.description}</p>
+                <div className="mt-4 grid grid-cols-2 gap-2 text-xs text-stone-600">
+                  <div className="bg-white rounded-lg px-3 py-2 ring-1 ring-stone-200">
+                    <span style={{ fontWeight: 500 }}>{scenario.staff.length}</span> personer
+                  </div>
+                  <div className="bg-white rounded-lg px-3 py-2 ring-1 ring-stone-200">
+                    <span style={{ fontWeight: 500 }}>{scenario.departments.length}</span> avdelningar
+                  </div>
+                  <div className="bg-white rounded-lg px-3 py-2 ring-1 ring-stone-200">
+                    <span style={{ fontWeight: 500 }}>{sharedBlocks}</span> gemensamma block
+                  </div>
+                  <div className="bg-white rounded-lg px-3 py-2 ring-1 ring-stone-200">
+                    <span style={{ fontWeight: 500 }}>{deptBlocks}</span> avdelningsblock
+                  </div>
+                </div>
+                <p className="text-[11px] text-stone-500 mt-3">
+                  {rotating > 0
+                    ? `${rotating} personer använder fredagsrull eller mall`
+                    : 'Ingen fredagstid är förifylld på individnivå'}
+                </p>
+                <p className="text-[11px] text-stone-400 mt-1">Klicka för att ladda detta scenario.</p>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // -------- Welcome Modal & Tour --------
 
 function WelcomeModal({ onClose, onStartTour }) {
   const STEPS = [
     { num: '1', title: 'Lägg till avdelningar', desc: 'Vad heter era avdelningar? Färgkoda dem så ni ser dem tydligt.' },
-    { num: '2', title: 'Lägg till personal', desc: 'En åt gången. Fyll i namn, tjänstgöring och eventuella villkor som lektionstider.' },
-    { num: '3', title: 'Justera bemanningskrav', desc: 'Hur många behöver vara på plats vid olika tider på dagen? Morgon, eftermiddag osv.' },
-    { num: '4', title: 'Generera schemaförslag', desc: 'Tryck på knappen — appen pusslar fram tre olika alternativ baserat på allas villkor.' },
+    { num: '2', title: 'Lägg till personal', desc: 'En åt gången. Fyll i avdelning, tjänstgöring, fredagsrutin och villkor som styr när personen kan arbeta.' },
+    { num: '3', title: 'Justera bemanningskrav', desc: 'Lägg gemensamma block och avdelningsblock så appen vet hur bemanningen ska se ut över dagen.' },
+    { num: '4', title: 'Generera schemaförslag', desc: 'Tryck på knappen — appen pusslar fram tre olika alternativ baserat på bemanningskrav, fredagsupplägg och allas villkor.' },
   ];
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: 'rgba(28, 25, 23, 0.5)' }}>
@@ -2793,15 +3038,15 @@ function TourBubble({ step, onNext, onClose }) {
     },
     {
       title: 'Steg 2 av 4 · Personal',
-      desc: 'Lägg till en kollega i taget. Klicka "Lägg till personal" eller redigera en befintlig. Tjänstgöring i procent (t.ex. 100% av 37,5h), ordinarie pass mån–tor, fredagsrutin och eventuella villkor som "måste börja senast 08:40 för lektion".',
+      desc: 'Lägg till en kollega i taget. Klicka "Lägg till personal" eller redigera en befintlig. Tjänstgöring i procent, avdelning, fredagsrutin och villkor som "måste börja senast 08:40 för lektion" är viktigast. Veckopassen kan användas som utgångsläge.',
     },
     {
       title: 'Steg 3 av 4 · Bemanningskrav',
-      desc: 'Hur många personer behöver vara på plats vid olika tider? Här definierar du tidsblock — morgonfritids, skoldag, eftermiddag — med minsta antal personal. Appen flaggar när det inte stämmer.',
+      desc: 'Hur många personer behöver vara på plats vid olika tider? Här definierar du tidsblock med minsta antal personal, antingen gemensamt eller per avdelning. Appen flaggar när det inte stämmer.',
     },
     {
       title: 'Steg 4 av 4 · Vecka & Generera',
-      desc: 'Här ser du schemat per dag och täckning över tiden. Tryck på "Generera schemaförslag" högst upp för att låta appen pussla fram tre alternativ baserat på allas villkor — eller justera manuellt genom att klicka på en person.',
+      desc: 'Här ser du schemat per dag och täckning över tiden. Tryck på "Generera schemaförslag" högst upp för att låta appen pussla fram tre alternativ baserat på avdelningsbemanning, fredagar och allas villkor — eller justera manuellt genom att klicka på en person.',
     },
   ];
   const cur = STEPS[step];
@@ -2844,7 +3089,7 @@ function AlternativesModal({ alternatives, currentStaff, coverageScopes, fridayC
         <div className="sticky top-0 bg-white border-b border-stone-200 px-6 py-4 flex items-center justify-between z-10">
           <div>
             <h2 className="display-font text-2xl text-stone-800">Tre schemaförslag</h2>
-            <p className="text-xs text-stone-500 mt-0.5">Klicka på ett kort för att förhandsgranska, "Tillämpa" för att använda</p>
+            <p className="text-xs text-stone-500 mt-0.5">Klicka på ett kort för att förhandsgranska, "Tillämpa" för att använda. Fredag räknas med som snitt över rullen.</p>
           </div>
           <button onClick={onClose} className="text-stone-400 hover:text-stone-700"><X size={20} /></button>
         </div>
