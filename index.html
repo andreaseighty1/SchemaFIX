@@ -107,6 +107,9 @@ function softColor(hex) {
 function getDept(deptId, departments) {
   return departments.find(d => d.id === deptId) || { id: '?', name: '(saknas)', color: '#999999' };
 }
+function getDayMeta(dayKey) {
+  return DAY_META.find(day => day.key === dayKey) || { key: dayKey, label: dayKey, short: dayKey };
+}
 
 // Returnerar den effektiva tidsbegränsningen för en person på en specifik dag.
 // Prioritetsordning: dagsundantag > paritetsundantag (jämn/udda vecka) > generell regel.
@@ -186,6 +189,7 @@ const DAYS = [
   { key: 'wed', label: 'Onsdag', short: 'ons' },
   { key: 'thu', label: 'Torsdag', short: 'tor' },
 ];
+const DAY_META = [...DAYS, { key: 'fri', label: 'Fredag', short: 'fre' }];
 const ALL_DAY_KEYS = [...DAYS.map(d => d.key), 'fri'];
 const CONSTRAINT_KEYS = ['earliestStart', 'latestStart', 'earliestEnd', 'latestEnd'];
 
@@ -969,11 +973,11 @@ function FritidsSchemaApp() {
     let foundData = false;
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        foundData = true;
-        const data = JSON.parse(raw);
-        if (data.staff) {
-          const normalizedStaff = prepareStaffForUse(data.staff, data.fridayCycleWeeks || 8, data.fridayTemplateRotation || []);
+        if (raw) {
+          foundData = true;
+          const data = JSON.parse(raw);
+          if (data.staff) {
+          const normalizedStaff = normalizeStaffList(data.staff, data.fridayCycleWeeks || 8);
           setStaff(normalizedStaff);
           if (normalizedStaff.length > 0) nextId = Math.max(...normalizedStaff.map(p => p.id), 99) + 1;
         }
@@ -1027,7 +1031,7 @@ function FritidsSchemaApp() {
     if (!loaded) return;
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({
-        staff: prepareStaffForUse(staff, fridayCycleWeeks, fridayTemplateRotation),
+        staff: normalizeStaffList(staff, fridayCycleWeeks),
         departments, coverageBlocks: normalizedCoverageBlocks, fridayCycleWeeks, fridayTemplateRotation, savedFileName,
       }));
     } catch {}
@@ -1038,7 +1042,7 @@ function FritidsSchemaApp() {
   const buildSaveData = () => ({
     version: 2,
     exportedAt: new Date().toISOString(),
-    staff: prepareStaffForUse(staff, fridayCycleWeeks, fridayTemplateRotation),
+    staff: normalizeStaffList(staff, fridayCycleWeeks),
     departments, coverageBlocks: normalizedCoverageBlocks, fridayCycleWeeks, fridayTemplateRotation,
   });
 
@@ -1134,13 +1138,13 @@ function FritidsSchemaApp() {
           resolve(false); return;
         }
         const loadedDepartments = data.departments || [];
-        const preparedStaff = prepareStaffForUse(data.staff || [], data.fridayCycleWeeks || 8, data.fridayTemplateRotation || []);
-        setStaff(preparedStaff);
+        const normalizedStaff = normalizeStaffList(data.staff || [], data.fridayCycleWeeks || 8);
+        setStaff(normalizedStaff);
         setDepartments(loadedDepartments);
         setCoverageBlocks(normalizeCoverageBlocks(data.coverageBlocks || initialCoverageBlocks, loadedDepartments));
         setFridayCycleWeeksRaw(data.fridayCycleWeeks || 8);
         setFridayTemplateRotation(resizeRotation(data.fridayTemplateRotation, data.fridayCycleWeeks || 8));
-        if (preparedStaff.length > 0) nextId = Math.max(...preparedStaff.map(p => p.id), 99) + 1;
+        if (normalizedStaff.length > 0) nextId = Math.max(...normalizedStaff.map(p => p.id), 99) + 1;
         setSavedFileName(file.name);
         setTimeout(() => setDirty(false), 50);
         resolve(true);
@@ -1172,8 +1176,8 @@ function FritidsSchemaApp() {
   const applyExampleScenario = (scenario) => {
     if (!scenario) return;
     if (staff.length > 0 && !confirm(`Detta ersätter nuvarande data med testscenariot "${scenario.name}". Fortsätt?`)) return;
-    const preparedStaff = prepareStaffForUse(scenario.staff, scenario.fridayCycleWeeks, scenario.fridayTemplateRotation);
-    setStaff(preparedStaff);
+    const normalizedStaff = normalizeStaffList(scenario.staff, scenario.fridayCycleWeeks);
+    setStaff(normalizedStaff);
     setDepartments(scenario.departments);
     setCoverageBlocks(normalizeCoverageBlocks(scenario.coverageBlocks, scenario.departments));
     setFridayCycleWeeksRaw(scenario.fridayCycleWeeks);
@@ -1181,7 +1185,7 @@ function FritidsSchemaApp() {
     setCurrentFridayWeek(1);
     setFileHandle(null);
     setSavedFileName(null);
-    nextId = Math.max(...preparedStaff.map(p => p.id), 99) + 1;
+    nextId = Math.max(...normalizedStaff.map(p => p.id), 99) + 1;
     setShowExamplePicker(false);
   };
   const loadExample = () => {
@@ -1297,10 +1301,7 @@ function FritidsSchemaApp() {
     return v;
   }, [staff, fridayCycleWeeks, fridayTemplateRotation]);
 
-  const updateStaff = (updated) => {
-    const prepared = preparePersonForUse(updated, fridayCycleWeeks, fridayTemplateRotation);
-    setStaff(prev => prev.map(s => s.id === updated.id ? prepared : s));
-  };
+  const updateStaff = (updated) => setStaff(prev => prev.map(s => s.id === updated.id ? normalizePerson(updated, fridayCycleWeeks) : s));
   const removeStaff = (id) => setStaff(prev => prev.filter(s => s.id !== id));
   const addStaff = () => {
     if (departments.length === 0) {
@@ -1319,7 +1320,6 @@ function FritidsSchemaApp() {
 
   const handleGenerate = async () => {
     const preparedStaff = prepareStaffForUse(staff, fridayCycleWeeks, fridayTemplateRotation);
-    setStaff(preparedStaff);
     setGenerating(true);
     setAlternatives(null);
     setGenerationProgress({ percent: 3, label: 'Förbereder...', detail: 'Samlar regler och bemanningskrav' });
@@ -1814,10 +1814,10 @@ function StaffView({ staff, fridayCycleWeeks, fridayTemplateRotation, violations
               if (s.earliestEnd  != null) tags.push(`Minst till ${minToTime(s.earliestEnd)}`);
               if (s.latestEnd    != null) tags.push(`Senast ${minToTime(s.latestEnd)}`);
               const overrideDays = Object.keys(s.dayOverrides || {}).filter(k => s.dayOverrides[k] && Object.values(s.dayOverrides[k]).some(v => v != null));
-              if (overrideDays.length > 0) tags.push(`Dagsundantag: ${overrideDays.map(k => DAYS.find(d => d.key === k).short).join(', ')}`);
+              if (overrideDays.length > 0) tags.push(`Dagsundantag: ${overrideDays.map(k => getDayMeta(k).short).join(', ')}`);
               const parityKeys = Object.keys(s.parityOverrides || {}).filter(k => s.parityOverrides[k] && Object.values(s.parityOverrides[k]).some(v => v != null));
               if (parityKeys.length > 0) tags.push(`Varannan: ${parityKeys.map(k => k === 'even' ? 'jämn' : 'udda').join(', ')}`);
-              if ((s.daysOff || []).length > 0) tags.push(`Ledig ${s.daysOff.map(d => DAYS.find(x => x.key === d).short).join(', ')}`);
+              if ((s.daysOff || []).length > 0) tags.push(`Ledig ${s.daysOff.map(d => getDayMeta(d).short).join(', ')}`);
               if (s.hasFridayRotation && s.fridayUseTemplate) tags.push(`Fredagsmall: start v${s.fridayTemplateStartWeek || 1}`);
               if (!s.hasFridayRotation && s.fridayShift) tags.push('Fast fredag');
               return (
