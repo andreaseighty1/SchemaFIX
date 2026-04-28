@@ -189,6 +189,7 @@ const DAYS = [
   { key: 'wed', label: 'Onsdag', short: 'ons' },
   { key: 'thu', label: 'Torsdag', short: 'tor' },
 ];
+const WEEKDAY_KEYS = DAYS.map(d => d.key);
 const DAY_META = [...DAYS, { key: 'fri', label: 'Fredag', short: 'fre' }];
 const ALL_DAY_KEYS = [...DAYS.map(d => d.key), 'fri'];
 const CONSTRAINT_KEYS = ['earliestStart', 'latestStart', 'earliestEnd', 'latestEnd'];
@@ -208,6 +209,8 @@ const DEFAULTS = {
   parityOverrides: {},
   daysOff: [], hasFridayRotation: true, fridayShift: null, fridayRotation: null,
   fridayUseTemplate: false, fridayTemplateStartWeek: 1, fridayTemplateOverrides: {},
+  allowedPassIds: [],
+  sched: {},
 };
 
 // Hjälpfunktion: bygger en personalpost med default-värden + det man skickar in
@@ -219,6 +222,18 @@ const initialStaff = [];
 const initialFridayTemplateRotation = new Array(8).fill(null);
 const COVERAGE_SHARED = 'shared';
 const COVERAGE_DEPARTMENT = 'department';
+function passDef(id, name, start, end, days = WEEKDAY_KEYS, deptId = '') {
+  return { id, name, start, end, days, deptId };
+}
+const initialPassBank = [
+  passDef('p-open-0600', 'Öppning', 360, 840, WEEKDAY_KEYS),
+  passDef('p-open-0630', 'Tidig mellan', 390, 870, WEEKDAY_KEYS),
+  passDef('p-school-0730', 'Skoldag', 450, 930, WEEKDAY_KEYS),
+  passDef('p-mid-0800', 'Mellan', 480, 960, WEEKDAY_KEYS),
+  passDef('p-f23-1315', 'Eftermiddag F-2', 795, 1020, WEEKDAY_KEYS),
+  passDef('p-345-1415', 'Eftermiddag 3-5', 855, 1020, WEEKDAY_KEYS),
+  passDef('p-close-0930', 'Stängning', 570, 1065, WEEKDAY_KEYS),
+];
 const EXAMPLE_FRIDAY_TEMPLATE_EARLY = [
   ['06:15','14:15'],
   ['06:45','14:45'],
@@ -251,9 +266,80 @@ const EXAMPLE_FRIDAY_TEMPLATE_LATE = [
   ['08:00','16:00'],
   ['09:00','16:45'],
 ];
+const EXAMPLE_PASS_BANK_COMPACT = [
+  passDef('compact-open', 'Öppning', 360, 840),
+  passDef('compact-mid', 'Mellan', 480, 960),
+  passDef('compact-f23', 'Eftermiddag F-2', 795, 1020),
+  passDef('compact-345', 'Eftermiddag 3-5', 855, 1020),
+  passDef('compact-close', 'Stängning', 570, 1065),
+];
+const EXAMPLE_PASS_BANK_STAGGERED = [
+  passDef('stag-open-a', 'Öppning 06:00', 360, 840),
+  passDef('stag-open-b', 'Öppning 06:30', 390, 870),
+  passDef('stag-school', 'Skoldag', 450, 930),
+  passDef('stag-f23', 'Eftermiddag F-2', 795, 1020),
+  passDef('stag-345', 'Eftermiddag 3-5', 855, 1020),
+  passDef('stag-close', 'Stängning', 585, 1065),
+];
+const EXAMPLE_PASS_BANK_LARGE = [
+  passDef('large-open', 'Öppning', 360, 840),
+  passDef('large-open-late', 'Tidig mellan', 405, 885),
+  passDef('large-school', 'Skoldag', 450, 930),
+  passDef('large-mid', 'Mellan', 480, 960),
+  passDef('large-f23-short', 'Eftermiddag kort F-2', 795, 975),
+  passDef('large-f23', 'Eftermiddag F-2', 795, 1020),
+  passDef('large-345', 'Eftermiddag 3-5', 855, 1020),
+  passDef('large-close', 'Stängning', 570, 1065),
+];
+const EXAMPLE_PASS_BANK_STRESS = [
+  passDef('stress-open', 'Öppning', 360, 840),
+  passDef('stress-school', 'Skoldag', 480, 945),
+  passDef('stress-f23', 'Eftermiddag F-2', 795, 1005),
+  passDef('stress-345', 'Eftermiddag 3-5', 855, 1005),
+  passDef('stress-close', 'Sen stängning', 600, 1065),
+];
 
 function exampleBlock(start, end, min, label, scopeType = COVERAGE_SHARED, deptId = null) {
   return { id: Math.random(), start, end, min, label, scopeType, deptId };
+}
+
+function normalizePassDays(days) {
+  const source = Array.isArray(days) && days.length > 0 ? days : WEEKDAY_KEYS;
+  return Array.from(new Set(source.filter(day => WEEKDAY_KEYS.includes(day))));
+}
+
+function normalizePass(pass, fallbackDays = WEEKDAY_KEYS) {
+  const days = normalizePassDays(pass?.days || fallbackDays);
+  const start = asNumber(pass?.start, 480);
+  const end = asNumber(pass?.end, 960);
+  const safeStart = clamp(roundToQuarter(start), 330, 1020);
+  const safeEnd = clamp(roundToQuarter(end), safeStart + 60, 1080);
+  return {
+    id: pass?.id || `pass-${Math.random().toString(36).slice(2, 8)}`,
+    name: pass?.name || `${minToTime(safeStart)}–${minToTime(safeEnd)}`,
+    start: safeStart,
+    end: safeEnd,
+    days,
+    deptId: pass?.deptId || '',
+  };
+}
+
+function normalizePassBank(passBank) {
+  const normalized = (Array.isArray(passBank) ? passBank : initialPassBank).map(pass => normalizePass(pass));
+  return normalized.length > 0 ? normalized : initialPassBank.map(pass => normalizePass(pass));
+}
+
+function passToShift(pass) {
+  if (!pass) return null;
+  return [minToTime(pass.start), minToTime(pass.end)];
+}
+
+function passDuration(pass) {
+  return Math.max(0, (pass?.end || 0) - (pass?.start || 0));
+}
+function shiftMatchesPass(shift, pass) {
+  if (!shift || !pass) return false;
+  return shift[0] === minToTime(pass.start) && shift[1] === minToTime(pass.end);
 }
 
 function buildExampleStaff(specs, cycleWeeks = 8) {
@@ -279,11 +365,12 @@ function buildExampleStaff(specs, cycleWeeks = 8) {
     fridayTemplateOverrides: spec.fridayTemplateOverrides || {},
     fridayRotation: spec.hasFridayRotation === false ? null : resizeRotation(spec.fridayRotation || [], cycleWeeks),
     fridayShift: spec.hasFridayRotation === false ? (spec.fridayShift || null) : null,
+    allowedPassIds: spec.allowedPassIds || [],
     sched: spec.sched || {},
   }));
 }
 
-function buildExampleScenario({ id, name, description, departments, coverageBlocks, fridayCycleWeeks = 8, fridayTemplateRotation = initialFridayTemplateRotation, staffSpecs }) {
+function buildExampleScenario({ id, name, description, departments, coverageBlocks, fridayCycleWeeks = 8, fridayTemplateRotation = initialFridayTemplateRotation, passBank = initialPassBank, staffSpecs }) {
   return {
     id,
     name,
@@ -292,6 +379,7 @@ function buildExampleScenario({ id, name, description, departments, coverageBloc
     coverageBlocks,
     fridayCycleWeeks,
     fridayTemplateRotation: resizeRotation(fridayTemplateRotation, fridayCycleWeeks),
+    passBank: normalizePassBank(passBank),
     staff: buildExampleStaff(staffSpecs, fridayCycleWeeks),
   };
 }
@@ -312,15 +400,16 @@ const EXAMPLE_SCENARIOS = [
       exampleBlock(855, 990, 2, 'Aspen eftermiddag', COVERAGE_DEPARTMENT, 'd2'),
       exampleBlock(990, 1065, 2, 'Samlad stängning'),
     ],
+    passBank: EXAMPLE_PASS_BANK_COMPACT,
     fridayTemplateRotation: EXAMPLE_FRIDAY_TEMPLATE_BALANCED,
     staffSpecs: [
-      { name: 'Alva Berg', deptId: 'd1', role: 'fklass', percent: 100, latestStart: 8*60+15, fridayUseTemplate: true, fridayTemplateStartWeek: 1 },
-      { name: 'Nils Ek', deptId: 'd1', role: 'åk 1', percent: 82, latestStart: 8*60+40, earliestEnd: 15*60, fridayUseTemplate: true, fridayTemplateStartWeek: 2 },
-      { name: 'Mira Holm', deptId: 'd1', role: 'resurs', percent: 55, onlyAfternoons: true, earliestStart: 12*60+30, latestEnd: 17*60, daysOff: ['fri'], hasFridayRotation: false },
-      { name: 'Otto Lind', deptId: 'd2', role: 'åk 2', percent: 100, earliestStart: 6*60, latestEnd: 16*60+30, dayOverrides: { wed: { latestStart: 8*60 } }, fridayUseTemplate: true, fridayTemplateStartWeek: 4 },
-      { name: 'Selma Nor', deptId: 'd2', role: 'skapande', percent: 78, latestStart: 9*60+15, earliestEnd: 15*60+30, fridayUseTemplate: true, fridayTemplateStartWeek: 5 },
-      { name: 'Vide Sjö', deptId: 'd2', role: 'musik', percent: 60, onlyAfternoons: true, earliestStart: 12*60, latestEnd: 17*60+15, daysOff: ['wed', 'fri'], hasFridayRotation: false },
-      { name: 'Tora Dal', deptId: 'd2', role: '', percent: 90, earliestStart: 7*60, earliestEnd: 15*60+45, parityOverrides: { odd: { latestStart: 8*60+30 } }, fridayUseTemplate: true, fridayTemplateStartWeek: 7 },
+      { name: 'Alva Berg', deptId: 'd1', role: 'fklass', percent: 100, latestStart: 8*60+15, fridayUseTemplate: true, fridayTemplateStartWeek: 1, allowedPassIds: ['compact-open', 'compact-mid', 'compact-close'] },
+      { name: 'Nils Ek', deptId: 'd1', role: 'åk 1', percent: 82, latestStart: 8*60+40, earliestEnd: 15*60, fridayUseTemplate: true, fridayTemplateStartWeek: 2, allowedPassIds: ['compact-mid', 'compact-f23', 'compact-close'] },
+      { name: 'Mira Holm', deptId: 'd1', role: 'resurs', percent: 55, onlyAfternoons: true, earliestStart: 12*60+30, latestEnd: 17*60, daysOff: ['fri'], hasFridayRotation: false, allowedPassIds: ['compact-f23', 'compact-345'] },
+      { name: 'Otto Lind', deptId: 'd2', role: 'åk 2', percent: 100, earliestStart: 6*60, latestEnd: 16*60+30, dayOverrides: { wed: { latestStart: 8*60 } }, fridayUseTemplate: true, fridayTemplateStartWeek: 4, allowedPassIds: ['compact-open', 'compact-mid'] },
+      { name: 'Selma Nor', deptId: 'd2', role: 'skapande', percent: 78, latestStart: 9*60+15, earliestEnd: 15*60+30, fridayUseTemplate: true, fridayTemplateStartWeek: 5, allowedPassIds: ['compact-mid', 'compact-f23', 'compact-345'] },
+      { name: 'Vide Sjö', deptId: 'd2', role: 'musik', percent: 60, onlyAfternoons: true, earliestStart: 12*60, latestEnd: 17*60+15, daysOff: ['wed', 'fri'], hasFridayRotation: false, allowedPassIds: ['compact-345'] },
+      { name: 'Tora Dal', deptId: 'd2', role: '', percent: 90, earliestStart: 7*60, earliestEnd: 15*60+45, parityOverrides: { odd: { latestStart: 8*60+30 } }, fridayUseTemplate: true, fridayTemplateStartWeek: 7, allowedPassIds: ['compact-open', 'compact-mid', 'compact-close'] },
     ],
   }),
   buildExampleScenario({
@@ -340,6 +429,7 @@ const EXAMPLE_SCENARIOS = [
       exampleBlock(855, 1020, 2, 'Stjärnan eftermiddag', COVERAGE_DEPARTMENT, 'd3'),
       exampleBlock(1020, 1065, 3, 'Gemensam stängning'),
     ],
+    passBank: EXAMPLE_PASS_BANK_STAGGERED,
     fridayTemplateRotation: EXAMPLE_FRIDAY_TEMPLATE_EARLY,
     staffSpecs: [
       { name: 'Ria Frost', deptId: 'd1', role: 'fklass', percent: 100, latestStart: 8*60+20, fridayUseTemplate: true, fridayTemplateStartWeek: 1 },
@@ -376,6 +466,7 @@ const EXAMPLE_SCENARIOS = [
       exampleBlock(855, 1005, 2, 'Gläntan eftermiddag', COVERAGE_DEPARTMENT, 'd5'),
       exampleBlock(1005, 1065, 4, 'Gemensam stängning'),
     ],
+    passBank: EXAMPLE_PASS_BANK_LARGE,
     fridayTemplateRotation: EXAMPLE_FRIDAY_TEMPLATE_LATE,
     staffSpecs: [
       { name: 'Freja Vale', deptId: 'd1', role: 'fklass', percent: 100, latestStart: 8*60+15, fridayUseTemplate: true, fridayTemplateStartWeek: 1 },
@@ -413,6 +504,7 @@ const EXAMPLE_SCENARIOS = [
       exampleBlock(855, 1020, 2, 'Bryggan eftermiddag', COVERAGE_DEPARTMENT, 'd3'),
       exampleBlock(1020, 1065, 3, 'Gemensam stängning'),
     ],
+    passBank: EXAMPLE_PASS_BANK_STRESS,
     fridayTemplateRotation: EXAMPLE_FRIDAY_TEMPLATE_BALANCED,
     staffSpecs: [
       { name: 'Ivar Bjäll', deptId: 'd1', role: 'fklass', percent: 100, latestStart: 8*60+20, fridayUseTemplate: true, fridayTemplateStartWeek: 1 },
@@ -572,6 +664,9 @@ function normalizeFridayTemplateOverrides(overrides, cycleWeeks = 8) {
   });
   return next;
 }
+function normalizeAllowedPassIds(allowedPassIds) {
+  return Array.from(new Set((Array.isArray(allowedPassIds) ? allowedPassIds : []).filter(id => typeof id === 'string' && id.trim() !== '')));
+}
 function getStrictConstraints(person, dayKey) {
   const evals = ['even', 'odd'].map(parity => ({
     earliestStart: getConstraint(person, dayKey, 'earliestStart', parity),
@@ -606,6 +701,7 @@ function normalizePerson(person, cycleWeeks = 8) {
     dayOverrides: normalizeDayOverrides(merged.dayOverrides),
     parityOverrides: normalizeParityOverrides(merged.parityOverrides),
     daysOff: Array.from(new Set((Array.isArray(merged.daysOff) ? merged.daysOff : []).filter(day => ALL_DAY_KEYS.includes(day)))),
+    allowedPassIds: normalizeAllowedPassIds(merged.allowedPassIds),
     hasFridayRotation,
     fridayShift: hasFridayRotation ? null : normalizeShift(merged.fridayShift),
     fridayRotation: hasFridayRotation ? resizeRotation((Array.isArray(merged.fridayRotation) ? merged.fridayRotation : []).map(normalizeShift), cycleWeeks) : null,
@@ -617,6 +713,24 @@ function normalizePerson(person, cycleWeeks = 8) {
 function normalizeStaffList(staff, cycleWeeks = 8) {
   return (Array.isArray(staff) ? staff : []).map(person => normalizePerson(person, cycleWeeks));
 }
+function getAllowedPassIdsForPerson(person, passBank = []) {
+  const availableIds = new Set(normalizePassBank(passBank).map(pass => pass.id));
+  const explicit = normalizeAllowedPassIds(person.allowedPassIds);
+  if (explicit.length === 0) return Array.from(availableIds);
+  return explicit.filter(id => availableIds.has(id));
+}
+
+function getEligiblePassesForDay(person, dayKey, passBank = []) {
+  if ((person.daysOff || []).includes(dayKey)) return [];
+  const allowedIds = new Set(getAllowedPassIdsForPerson(person, passBank));
+  return normalizePassBank(passBank).filter(pass => {
+    if (!allowedIds.has(pass.id)) return false;
+    if (!pass.days.includes(dayKey)) return false;
+    if (pass.deptId && pass.deptId !== person.deptId) return false;
+    return isShiftLegal(person, dayKey, passToShift(pass));
+  });
+}
+
 function getSuggestedDayMinutes(person, cycleWeeks, fridayTemplateRotation = []) {
   const explicitDayMinutes = DAYS
     .map(d => normalizeShift(person.sched?.[d.key]))
@@ -632,7 +746,8 @@ function getSuggestedDayMinutes(person, cycleWeeks, fridayTemplateRotation = [])
   const remaining = Math.max(workingDays * 60, getTargetMin(person) - fridayMinutes);
   return clamp(roundToQuarter(remaining / workingDays), 60, 600);
 }
-function buildSuggestedShift(person, dayKey, cycleWeeks, fridayTemplateRotation = []) {
+
+function buildFallbackShift(person, dayKey, cycleWeeks, fridayTemplateRotation = []) {
   if ((person.daysOff || []).includes(dayKey)) return null;
   const desiredMinutes = getSuggestedDayMinutes(person, cycleWeeks, fridayTemplateRotation);
   const preferredStart = person.onlyAfternoons ? 13 * 60 : 8 * 60;
@@ -669,26 +784,52 @@ function buildSuggestedShift(person, dayKey, cycleWeeks, fridayTemplateRotation 
   const fallback = fallbackEnd - fallbackStart >= 60 ? [minToTime(fallbackStart), minToTime(fallbackEnd)] : null;
   return fallback && isShiftLegal(person, dayKey, fallback) ? fallback : null;
 }
-function preparePersonForUse(person, cycleWeeks = 8, fridayTemplateRotation = []) {
+
+function buildSuggestedShift(person, dayKey, cycleWeeks, fridayTemplateRotation = [], passBank = []) {
+  const eligiblePasses = getEligiblePassesForDay(person, dayKey, passBank);
+  if (eligiblePasses.length > 0) {
+    const desiredMinutes = getSuggestedDayMinutes(person, cycleWeeks, fridayTemplateRotation);
+    const preferredStart = person.onlyAfternoons ? 13 * 60 : 8 * 60;
+    const ranked = eligiblePasses
+      .map(pass => ({
+        pass,
+        shift: passToShift(pass),
+        score: Math.abs(pass.start - preferredStart) + Math.abs(passDuration(pass) - desiredMinutes) * 2,
+      }))
+      .sort((a, b) => a.score - b.score || a.pass.start - b.pass.start);
+    return ranked[0].shift;
+  }
+  if (normalizePassBank(passBank).length > 0) return null;
+  return buildFallbackShift(person, dayKey, cycleWeeks, fridayTemplateRotation);
+}
+
+function preparePersonForUse(person, cycleWeeks = 8, fridayTemplateRotation = [], passBank = []) {
   const normalized = normalizePerson(person, cycleWeeks);
   const sched = { ...normalized.sched };
   DAYS.forEach(d => {
     if ((normalized.daysOff || []).includes(d.key)) return;
-    if (!normalizeShift(sched[d.key])) {
-      const autoShift = buildSuggestedShift(normalized, d.key, cycleWeeks, fridayTemplateRotation);
+    const eligiblePasses = getEligiblePassesForDay(normalized, d.key, passBank);
+    const currentShift = normalizeShift(sched[d.key]);
+    const isValidCurrentPass = currentShift && eligiblePasses.some(pass => shiftMatchesPass(currentShift, pass));
+    if (!isValidCurrentPass) {
+      const autoShift = buildSuggestedShift(normalized, d.key, cycleWeeks, fridayTemplateRotation, passBank);
       if (autoShift) sched[d.key] = autoShift;
+      else delete sched[d.key];
     }
   });
   return { ...normalized, sched };
 }
-function prepareStaffForUse(staff, cycleWeeks = 8, fridayTemplateRotation = []) {
-  return normalizeStaffList(staff, cycleWeeks).map(person => preparePersonForUse(person, cycleWeeks, fridayTemplateRotation));
+function prepareStaffForUse(staff, cycleWeeks = 8, fridayTemplateRotation = [], passBank = []) {
+  return normalizeStaffList(staff, cycleWeeks).map(person => preparePersonForUse(person, cycleWeeks, fridayTemplateRotation, passBank));
 }
 function weeklyMinutes(staff, cycleWeeks = 8, fridayTemplateRotation = []) {
   let total = 0;
   for (const d of DAYS) if (staff.sched?.[d.key]) total += dayMinutes(staff.sched[d.key]);
   total += avgFridayMinutes(staff, cycleWeeks, fridayTemplateRotation);
   return Math.round(total);
+}
+function hasWeekdaySchedule(person) {
+  return DAYS.some(d => normalizeShift(person.sched?.[d.key]));
 }
 
 // ==================== SCHEDULE GENERATOR (Simulated Annealing) ====================
@@ -769,22 +910,28 @@ function isShiftLegal(person, dayKey, newShift) {
   return true;
 }
 
-function attemptMutation(staff) {
+function attemptMutation(staff, passBank = [], cycleWeeks = 8, fridayTemplateRotation = []) {
   const mutables = staff.filter(p => !p.fixedTimes);
   if (mutables.length === 0) return null;
   const p = mutables[Math.floor(Math.random() * mutables.length)];
-  const validDays = DAYS.filter(d => p.sched[d.key] && !(p.daysOff || []).includes(d.key));
+  const validDays = DAYS.filter(d => !(p.daysOff || []).includes(d.key));
   if (validDays.length === 0) return null;
   const d = validDays[Math.floor(Math.random() * validDays.length)];
-  const sh = p.sched[d.key];
-
-  const which = Math.random() < 0.5 ? 0 : 1;
-  const stepUnits = 1 + Math.floor(Math.random() * 4);
-  const delta = (Math.random() < 0.5 ? -15 : 15) * stepUnits;
-  const newShift = [...sh];
-  newShift[which] = minToTime(timeToMin(sh[which]) + delta);
-
-  if (!isShiftLegal(p, d.key, newShift)) return null;
+  const eligiblePasses = getEligiblePassesForDay(p, d.key, passBank);
+  if (eligiblePasses.length === 0) return null;
+  const current = normalizeShift(p.sched?.[d.key]);
+  const possibleShifts = eligiblePasses
+    .map(passToShift)
+    .filter(shift => !current || shift[0] !== current[0] || shift[1] !== current[1]);
+  if (possibleShifts.length === 0) return null;
+  const preferred = buildSuggestedShift(p, d.key, cycleWeeks, fridayTemplateRotation, passBank);
+  const sorted = possibleShifts.sort((a, b) => {
+    if (!preferred) return 0;
+    const scoreA = Math.abs(timeToMin(a[0]) - timeToMin(preferred[0])) + Math.abs(dayMinutes(a) - dayMinutes(preferred));
+    const scoreB = Math.abs(timeToMin(b[0]) - timeToMin(preferred[0])) + Math.abs(dayMinutes(b) - dayMinutes(preferred));
+    return scoreA - scoreB;
+  });
+  const newShift = Math.random() < 0.7 ? sorted[0] : sorted[Math.floor(Math.random() * sorted.length)];
 
   return staff.map(person => person.id === p.id
     ? { ...person, sched: { ...person.sched, [d.key]: newShift } }
@@ -802,7 +949,7 @@ function yieldToBrowser() {
   });
 }
 
-async function runSearchAsync(initialStaff, coverageScopes, cycleWeeks, fridayTemplateRotation, weights, iterations = 2500, options = {}) {
+async function runSearchAsync(initialStaff, coverageScopes, cycleWeeks, fridayTemplateRotation, passBank, weights, iterations = 2500, options = {}) {
   const { chunkSize = 100, onProgress } = options;
   let current = initialStaff.map(p => ({ ...p, sched: { ...p.sched } }));
   let currentScore = scheduleScore(current, coverageScopes, cycleWeeks, fridayTemplateRotation, weights);
@@ -814,7 +961,7 @@ async function runSearchAsync(initialStaff, coverageScopes, cycleWeeks, fridayTe
   for (let chunkStart = 0; chunkStart < iterations; chunkStart += chunkSize) {
     const chunkEnd = Math.min(iterations, chunkStart + chunkSize);
     for (let i = chunkStart; i < chunkEnd; i++) {
-      const cand = attemptMutation(current);
+      const cand = attemptMutation(current, passBank, cycleWeeks, fridayTemplateRotation);
       if (!cand) continue;
       const cs = scheduleScore(cand, coverageScopes, cycleWeeks, fridayTemplateRotation, weights);
       const delta = cs - currentScore;
@@ -865,7 +1012,7 @@ function summarizeSchedule(staff, coverageScopes, cycleWeeks, fridayTemplateRota
   return { totalGaps, totalGapMinutes, totalHourDev, peopleOff };
 }
 
-async function generateAlternativesAsync(initialStaff, coverageScopes, cycleWeeks, fridayTemplateRotation, onProgress) {
+async function generateAlternativesAsync(initialStaff, coverageScopes, cycleWeeks, fridayTemplateRotation, passBank, onProgress) {
   const variants = [
     { label: 'Bemannings­fokus', desc: 'Prioriterar att alla pass är täckta', weights: { gap: 50, hours: 1, over: 1 } },
     { label: 'Tim­fokus',        desc: 'Prioriterar exakta veckotimmar',     weights: { gap: 15, hours: 5, over: 1 } },
@@ -879,6 +1026,7 @@ async function generateAlternativesAsync(initialStaff, coverageScopes, cycleWeek
       coverageScopes,
       cycleWeeks,
       fridayTemplateRotation,
+      passBank,
       v.weights,
       2500,
       {
@@ -917,6 +1065,7 @@ function FritidsSchemaApp() {
   const [staff, setStaff] = useState(initialStaff);
   const [departments, setDepartments] = useState(initialDepartments);
   const [coverageBlocks, setCoverageBlocks] = useState(initialCoverageBlocks);
+  const [passBank, setPassBank] = useState(() => normalizePassBank(initialPassBank));
   const [fridayCycleWeeks, setFridayCycleWeeksRaw] = useState(8);
   const [fridayTemplateRotation, setFridayTemplateRotation] = useState(initialFridayTemplateRotation);
   const [currentFridayWeek, setCurrentFridayWeek] = useState(1);
@@ -984,6 +1133,7 @@ function FritidsSchemaApp() {
         const loadedDepartments = data.departments || initialDepartments;
         if (data.departments) setDepartments(loadedDepartments);
         if (data.coverageBlocks) setCoverageBlocks(normalizeCoverageBlocks(data.coverageBlocks, loadedDepartments));
+        setPassBank(normalizePassBank(data.passBank || initialPassBank));
         if (data.fridayCycleWeeks) setFridayCycleWeeksRaw(data.fridayCycleWeeks);
         setFridayTemplateRotation(resizeRotation(data.fridayTemplateRotation, data.fridayCycleWeeks || 8));
         if (data.savedFileName) setSavedFileName(data.savedFileName);
@@ -1032,18 +1182,18 @@ function FritidsSchemaApp() {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({
         staff: normalizeStaffList(staff, fridayCycleWeeks),
-        departments, coverageBlocks: normalizedCoverageBlocks, fridayCycleWeeks, fridayTemplateRotation, savedFileName,
+        departments, coverageBlocks: normalizedCoverageBlocks, passBank: normalizePassBank(passBank), fridayCycleWeeks, fridayTemplateRotation, savedFileName,
       }));
     } catch {}
     setDirty(true);
-  }, [staff, departments, normalizedCoverageBlocks, fridayCycleWeeks, fridayTemplateRotation, loaded]);
+  }, [staff, departments, normalizedCoverageBlocks, passBank, fridayCycleWeeks, fridayTemplateRotation, loaded]);
 
   // Hjälp: bygg datapaketet att skriva till fil
   const buildSaveData = () => ({
-    version: 2,
+    version: 3,
     exportedAt: new Date().toISOString(),
     staff: normalizeStaffList(staff, fridayCycleWeeks),
-    departments, coverageBlocks: normalizedCoverageBlocks, fridayCycleWeeks, fridayTemplateRotation,
+    departments, coverageBlocks: normalizedCoverageBlocks, passBank: normalizePassBank(passBank), fridayCycleWeeks, fridayTemplateRotation,
   });
 
   // Skriv data till en redan öppnad fil-handle
@@ -1142,6 +1292,7 @@ function FritidsSchemaApp() {
         setStaff(normalizedStaff);
         setDepartments(loadedDepartments);
         setCoverageBlocks(normalizeCoverageBlocks(data.coverageBlocks || initialCoverageBlocks, loadedDepartments));
+        setPassBank(normalizePassBank(data.passBank || initialPassBank));
         setFridayCycleWeeksRaw(data.fridayCycleWeeks || 8);
         setFridayTemplateRotation(resizeRotation(data.fridayTemplateRotation, data.fridayCycleWeeks || 8));
         if (normalizedStaff.length > 0) nextId = Math.max(...normalizedStaff.map(p => p.id), 99) + 1;
@@ -1180,6 +1331,7 @@ function FritidsSchemaApp() {
     setStaff(normalizedStaff);
     setDepartments(scenario.departments);
     setCoverageBlocks(normalizeCoverageBlocks(scenario.coverageBlocks, scenario.departments));
+    setPassBank(normalizePassBank(scenario.passBank || initialPassBank));
     setFridayCycleWeeksRaw(scenario.fridayCycleWeeks);
     setFridayTemplateRotation(resizeRotation(scenario.fridayTemplateRotation, scenario.fridayCycleWeeks));
     setCurrentFridayWeek(1);
@@ -1248,7 +1400,7 @@ function FritidsSchemaApp() {
     for (const s of staff) {
       const wm = weeklyMinutes(s, fridayCycleWeeks, fridayTemplateRotation);
       const dev = wm - getTargetMin(s);
-      if (Math.abs(dev) > 5) {
+      if (hasWeekdaySchedule(s) && Math.abs(dev) > 5) {
         v.push({ id: s.id, name: s.name, severity: Math.abs(dev) > 60 ? 'high' : 'med',
           msg: `${dev > 0 ? 'Över' : 'Under'} timmål med ${minToHM(Math.abs(dev))} (${minToHM(wm)} av ${minToHM(getTargetMin(s))})` });
       }
@@ -1312,6 +1464,7 @@ function FritidsSchemaApp() {
     const newPerson = normalizePerson(P({
       id: nextId++, name: 'Ny anställd', deptId: departments[0].id, role: '',
       sched: {},
+      allowedPassIds: [],
       fridayRotation: new Array(fridayCycleWeeks).fill(null),
     }), fridayCycleWeeks);
     setStaff([...staff, newPerson]);
@@ -1319,7 +1472,7 @@ function FritidsSchemaApp() {
   };
 
   const handleGenerate = async () => {
-    const preparedStaff = prepareStaffForUse(staff, fridayCycleWeeks, fridayTemplateRotation);
+    const preparedStaff = prepareStaffForUse(staff, fridayCycleWeeks, fridayTemplateRotation, passBank);
     setGenerating(true);
     setAlternatives(null);
     setGenerationProgress({ percent: 3, label: 'Förbereder...', detail: 'Samlar regler och bemanningskrav' });
@@ -1330,6 +1483,7 @@ function FritidsSchemaApp() {
         coverageScopes,
         fridayCycleWeeks,
         fridayTemplateRotation,
+        passBank,
         setGenerationProgress
       );
       setGenerationProgress({ percent: 100, label: 'Klart', detail: 'Schemaförslagen är färdiga' });
@@ -1358,7 +1512,7 @@ function FritidsSchemaApp() {
             <p className="text-xs uppercase tracking-widest text-stone-500 mb-1">Fritidshem · schemaverktyg</p>
             <h1 className="display-font text-4xl text-stone-800" style={{ letterSpacing: '-0.02em' }}>SchemaFIX</h1>
             <div className="flex items-center gap-2 mt-1">
-              <p className="text-stone-600 text-sm">Prototyp v13 · välkomstvy, flikintroduktioner och tooltips</p>
+              <p className="text-stone-600 text-sm">Prototyp v14 · passbank, passstyrd generator och förenklat personalflöde</p>
               {dirty && (
                 <span className="inline-flex items-center gap-1 text-xs text-amber-700 bg-amber-50 ring-1 ring-amber-200 rounded-full px-2 py-0.5">
                   <Circle size={6} fill="currentColor" />
@@ -1446,6 +1600,7 @@ function FritidsSchemaApp() {
         {view === 'rules' && <RulesView blocks={normalizedCoverageBlocks} setBlocks={setCoverageBlocks} departments={departments} />}
         {view === 'settings' && <SettingsView departments={departments} setDepartments={setDepartments}
           staff={staff} setStaff={setStaff} coverageBlocks={normalizedCoverageBlocks} setCoverageBlocks={setCoverageBlocks}
+          passBank={passBank} setPassBank={setPassBank}
           fridayTemplateRotation={fridayTemplateRotation} setFridayTemplateRotation={setFridayTemplateRotation}
           fridayCycleWeeks={fridayCycleWeeks} setFridayCycleWeeks={setFridayCycleWeeks}
           onLoadExample={loadExample} onClearAll={clearAll} />}
@@ -1459,6 +1614,7 @@ function FritidsSchemaApp() {
       {editingId !== null && (
         <StaffEditModal staff={staff.find(s => s.id === editingId)}
           departments={departments}
+          passBank={passBank}
           fridayCycleWeeks={fridayCycleWeeks}
           fridayTemplateRotation={fridayTemplateRotation}
           onSave={(updated) => { updateStaff(updated); setEditingId(null); }}
@@ -1764,7 +1920,7 @@ function StaffView({ staff, fridayCycleWeeks, fridayTemplateRotation, violations
         <Users size={32} className="mx-auto text-stone-300 mb-3" />
         <div className="display-font text-2xl text-stone-800 mb-2">Lägg till första personen</div>
         <p className="text-sm text-stone-500 mb-6 max-w-md mx-auto">
-          Börja med en person i taget. Du kan ange namn, avdelning, tjänstgöringsgrad, fredagsrutin och villkor som styr när personen kan arbeta. Veckopassen kan användas som utgångsläge eller fyllas ut från reglerna.
+          Börja med en person i taget. Du anger främst avdelning, tjänstgöringsgrad, vilka pass personen får ta, fredagsrutin och villkor som styr när personen kan arbeta.
         </p>
         <div className="flex gap-2 justify-center flex-wrap">
           <button onClick={onAdd} className="px-5 py-2.5 rounded-lg bg-stone-800 text-white hover:bg-stone-900 transition text-sm flex items-center gap-2">
@@ -1775,7 +1931,7 @@ function StaffView({ staff, fridayCycleWeeks, fridayTemplateRotation, violations
           </button>
         </div>
         <p className="text-xs text-stone-400 mt-6 max-w-sm mx-auto">
-          Exempeldatan är fritidshemmet jag använde när jag byggde prototypen — bra för att se hur appen fungerar med riktig komplexitet.
+          Exempeldatan använder påhittade namn och olika typer av passbanker, så du kan testa generatorn utan att blanda in riktig personal.
         </p>
       </div>
     );
@@ -1783,7 +1939,7 @@ function StaffView({ staff, fridayCycleWeeks, fridayTemplateRotation, violations
   return (
     <div className="space-y-4">
       <TabIntro>
-        Lägg till och redigera personalen. Klicka på en person för att fylla i avdelning, tjänstgöringsgrad, utgångspass, fredagsrutin och villkor som lektionstider eller varannan-vecka-schema. Listan visar varje persons mål jämfört med faktisk arbetstid.
+        Lägg till och redigera personalen. Börja med reglerna och passurvalet, och använd manuell veckoredigering först när du vill finjustera enskilda dagar. Listan visar varje persons mål jämfört med faktisk arbetstid.
       </TabIntro>
       <div className="bg-white rounded-2xl ring-1 ring-stone-200 overflow-hidden">
         <table className="w-full text-sm">
@@ -1804,7 +1960,8 @@ function StaffView({ staff, fridayCycleWeeks, fridayTemplateRotation, violations
               const wm = weeklyMinutes(s, fridayCycleWeeks, fridayTemplateRotation);
               const targetMin = getTargetMin(s);
               const diff = wm - targetMin;
-              const off = Math.abs(diff) > 5;
+              const hasGeneratedWeek = hasWeekdaySchedule(s);
+              const off = hasGeneratedWeek && Math.abs(diff) > 5;
               const dept = getDept(s.deptId, departments);
               const tags = [];
               if (s.fixedTimes) tags.push('Fast tid');
@@ -1813,6 +1970,8 @@ function StaffView({ staff, fridayCycleWeeks, fridayTemplateRotation, violations
               if (s.latestStart  != null) tags.push(`Senast börja ${minToTime(s.latestStart)}`);
               if (s.earliestEnd  != null) tags.push(`Minst till ${minToTime(s.earliestEnd)}`);
               if (s.latestEnd    != null) tags.push(`Senast ${minToTime(s.latestEnd)}`);
+              if ((s.allowedPassIds || []).length === 0) tags.push('Alla pass');
+              if ((s.allowedPassIds || []).length > 0) tags.push(`${s.allowedPassIds.length} valda pass`);
               const overrideDays = Object.keys(s.dayOverrides || {}).filter(k => s.dayOverrides[k] && Object.values(s.dayOverrides[k]).some(v => v != null));
               if (overrideDays.length > 0) tags.push(`Dagsundantag: ${overrideDays.map(k => getDayMeta(k).short).join(', ')}`);
               const parityKeys = Object.keys(s.parityOverrides || {}).filter(k => s.parityOverrides[k] && Object.values(s.parityOverrides[k]).some(v => v != null));
@@ -1834,9 +1993,11 @@ function StaffView({ staff, fridayCycleWeeks, fridayTemplateRotation, violations
                     {(s.percent ?? 100)}% av {(s.fullTimeHours ?? 37.5)}h
                   </td>
                   <td className="px-4 py-3 text-right text-stone-700 tabular-nums">{minToHM(targetMin)}</td>
-                  <td className={`px-4 py-3 text-right tabular-nums ${off ? (diff > 0 ? 'text-orange-600' : 'text-amber-700') : 'text-stone-700'}`}>{minToHM(wm)}</td>
+                  <td className={`px-4 py-3 text-right tabular-nums ${off ? (diff > 0 ? 'text-orange-600' : 'text-amber-700') : 'text-stone-700'}`}>
+                    {hasGeneratedWeek ? minToHM(wm) : '—'}
+                  </td>
                   <td className={`px-4 py-3 text-right tabular-nums text-xs ${off ? (diff > 0 ? 'text-orange-600' : 'text-amber-700') : 'text-stone-400'}`}>
-                    {off ? `${diff > 0 ? '+' : ''}${minToHM(Math.abs(diff))}` : '✓'}
+                    {hasGeneratedWeek ? (off ? `${diff > 0 ? '+' : ''}${minToHM(Math.abs(diff))}` : '✓') : 'Ej genererat'}
                   </td>
                   <td className="px-4 py-3">
                     <div className="flex flex-wrap gap-1">
@@ -2015,7 +2176,7 @@ function RulesView({ blocks, setBlocks, departments }) {
 // -------- Settings View (departments etc.) --------
 
 function SettingsView({ departments, setDepartments, staff, setStaff, coverageBlocks, setCoverageBlocks,
-                        fridayTemplateRotation, setFridayTemplateRotation, fridayCycleWeeks, setFridayCycleWeeks, onLoadExample, onClearAll }) {
+                        passBank, setPassBank, fridayTemplateRotation, setFridayTemplateRotation, fridayCycleWeeks, setFridayCycleWeeks, onLoadExample, onClearAll }) {
   const updateDept = (id, patch) => setDepartments(departments.map(d => d.id === id ? { ...d, ...patch } : d));
   const removeDept = (id) => {
     const usedBy = staff.filter(s => s.deptId === id);
@@ -2033,6 +2194,32 @@ function SettingsView({ departments, setDepartments, staff, setStaff, coverageBl
     const usedColors = departments.map(d => d.color);
     const nextColor = DEPT_COLORS.find(c => !usedColors.includes(c)) || DEPT_COLORS[departments.length % DEPT_COLORS.length];
     setDepartments([...departments, { id: newId, name: 'Ny avdelning', color: nextColor }]);
+  };
+  const updatePass = (id, patch) => setPassBank(normalizePassBank(passBank.map(pass => pass.id === id ? { ...pass, ...patch } : pass)));
+  const removePass = (id) => {
+    if (passBank.length <= 1) {
+      alert('Passbanken behöver minst ett pass.');
+      return;
+    }
+    setPassBank(normalizePassBank(passBank.filter(pass => pass.id !== id)));
+    setStaff(prev => prev.map(person => ({
+      ...person,
+      allowedPassIds: (person.allowedPassIds || []).filter(passId => passId !== id),
+    })));
+  };
+  const addPass = () => {
+    const sorted = normalizePassBank(passBank);
+    const base = sorted[sorted.length - 1] || initialPassBank[0];
+    const start = clamp((base?.start || 480) + 30, 330, 1020);
+    const end = clamp((base?.end || 960) + 30, start + 60, 1080);
+    setPassBank([...sorted, normalizePass({
+      id: `pass-${Math.random().toString(36).slice(2, 8)}`,
+      name: `Nytt pass ${sorted.length + 1}`,
+      start,
+      end,
+      days: WEEKDAY_KEYS,
+      deptId: '',
+    })]);
   };
 
   const counts = Object.fromEntries(departments.map(d => [d.id, staff.filter(s => s.deptId === d.id).length]));
@@ -2054,7 +2241,7 @@ function SettingsView({ departments, setDepartments, staff, setStaff, coverageBl
   return (
     <div className="space-y-4">
       <TabIntro>
-        Övergripande inställningar för fritidshemmet. Här ändrar du avdelningar, fredagsrullens cykellängd och hanterar din data (ladda exempel eller töm allt).
+        Övergripande inställningar för fritidshemmet. Här ändrar du avdelningar, passbanken som generatorn får använda, fredagsrullens cykellängd och hanterar din data.
       </TabIntro>
       {/* Avdelningar */}
       <div className="bg-white rounded-2xl ring-1 ring-stone-200 p-5">
@@ -2110,6 +2297,82 @@ function SettingsView({ departments, setDepartments, staff, setStaff, coverageBl
             </div>
           </div>
         )}
+      </div>
+
+      <div className="bg-white rounded-2xl ring-1 ring-stone-200 p-5">
+        <div className="flex items-start justify-between mb-4 gap-4 flex-wrap">
+          <div>
+            <h2 className="display-font text-xl text-stone-800">Passbank</h2>
+            <p className="text-sm text-stone-500 mt-0.5 max-w-2xl">
+              Här lägger du in de riktiga pass som generatorn får använda på vardagar. Personalen kan sedan få alla pass eller bara ett urval av dem.
+            </p>
+          </div>
+          <button onClick={addPass}
+            className="px-4 py-2 rounded-lg text-sm bg-stone-100 text-stone-700 hover:bg-stone-200 transition flex items-center gap-1.5">
+            <Plus size={14} />Lägg till pass
+          </button>
+        </div>
+
+        <div className="space-y-2">
+          <div className="grid grid-cols-12 gap-2 text-[10px] uppercase tracking-wider text-stone-500 px-2 pb-1">
+            <div className="col-span-3">Namn</div>
+            <div className="col-span-2">Start</div>
+            <div className="col-span-2">Slut</div>
+            <div className="col-span-3">Dagar</div>
+            <div className="col-span-1">Avd.</div>
+            <div className="col-span-1"></div>
+          </div>
+          {normalizePassBank(passBank).map(pass => (
+            <div key={pass.id} className="grid grid-cols-12 gap-2 items-center py-2 px-2 rounded-lg hover:bg-stone-50">
+              <div className="col-span-3">
+                <input className="rules-input w-full" value={pass.name}
+                  onChange={e => updatePass(pass.id, { name: e.target.value })} placeholder="Passnamn" />
+              </div>
+              <div className="col-span-2">
+                <input type="time" className="rules-input w-full" value={minToTime(pass.start)}
+                  onChange={e => updatePass(pass.id, { start: timeToMin(e.target.value) || pass.start })} />
+              </div>
+              <div className="col-span-2">
+                <input type="time" className="rules-input w-full" value={minToTime(pass.end)}
+                  onChange={e => updatePass(pass.id, { end: timeToMin(e.target.value) || pass.end })} />
+              </div>
+              <div className="col-span-3 flex flex-wrap gap-1">
+                {DAYS.map(day => {
+                  const active = pass.days.includes(day.key);
+                  return (
+                    <button key={day.key} type="button" onClick={() => updatePass(pass.id, {
+                      days: active ? pass.days.filter(key => key !== day.key) : [...pass.days, day.key],
+                    })}
+                      className={`px-2 py-1 rounded text-[10px] transition ${active ? 'bg-stone-800 text-white' : 'bg-stone-100 text-stone-600 hover:bg-stone-200'}`}>
+                      {day.short}
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="col-span-1">
+                <select className="rules-input w-full" value={pass.deptId || ''}
+                  onChange={e => updatePass(pass.id, { deptId: e.target.value })}>
+                  <option value="">Alla</option>
+                  {departments.map(dept => <option key={dept.id} value={dept.id}>{dept.name}</option>)}
+                </select>
+              </div>
+              <div className="col-span-1 flex justify-end">
+                <button onClick={() => removePass(pass.id)} className="text-stone-400 hover:text-red-600 p-1">
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div className="mt-4 rounded-xl bg-stone-50 ring-1 ring-stone-200 p-4">
+          <p className="text-xs uppercase tracking-wider text-stone-500 mb-2">Så används passbanken</p>
+          <div className="space-y-1 text-sm text-stone-600">
+            <p>Generatorn väljer i första hand bland dessa pass i stället för att hitta på fria tider.</p>
+            <p>Pass kan göras avdelningsspecifika eller gälla alla avdelningar.</p>
+            <p>Fredag styrs fortfarande separat av fast fredag eller fredagsrull längre ner i personalens formulär.</p>
+          </div>
+        </div>
       </div>
 
       {/* Fredagsrullen */}
@@ -2217,6 +2480,7 @@ function SettingsView({ departments, setDepartments, staff, setStaff, coverageBl
             <div className="flex-1 min-w-[200px]">
               <p className="text-sm text-stone-800" style={{ fontWeight: 500 }}>Ladda exempeldata</p>
               <p className="text-xs text-stone-500 mt-0.5">Öppnar flera påhittade testscenarier med olika storlek, avdelningar och bemanningskrav. Veckopass för mån–tor är inte färdigifyllda.</p>
+              <p className="text-[10px] text-stone-400 mt-1">Varje scenario laddar också en passbank som generatorn använder.</p>
             </div>
             <button onClick={onLoadExample}
               className="px-4 py-2 rounded-lg text-sm bg-stone-100 text-stone-700 hover:bg-stone-200 transition whitespace-nowrap">
@@ -2247,17 +2511,20 @@ function SettingsView({ departments, setDepartments, staff, setStaff, coverageBl
 
 // -------- Edit Modal --------
 
-function StaffEditModal({ staff, departments, fridayCycleWeeks, fridayTemplateRotation, onSave, onClose, onRemove }) {
+function StaffEditModal({ staff, departments, passBank, fridayCycleWeeks, fridayTemplateRotation, onSave, onClose, onRemove }) {
   const [form, setForm] = useState(() => {
     return normalizePerson(JSON.parse(JSON.stringify(staff)), fridayCycleWeeks);
   });
   const wm = weeklyMinutes(form, fridayCycleWeeks, fridayTemplateRotation);
   const targetMin = getTargetMin(form);
   const diff = wm - targetMin;
-  const off = Math.abs(diff) > 5;
+  const off = hasWeekdaySchedule(form) && Math.abs(diff) > 5;
   const dept = getDept(form.deptId, departments);
   const effectiveFridayRotation = buildEffectiveFridayRotation(form, fridayCycleWeeks, fridayTemplateRotation);
   const fixedFridayOff = !form.hasFridayRotation && !form.fridayShift;
+  const normalizedPassBank = normalizePassBank(passBank);
+  const effectiveAllowedPassIds = getAllowedPassIdsForPerson(form, normalizedPassBank);
+  const usingAllPasses = (form.allowedPassIds || []).length === 0;
 
   // Uppdatera en enskild fredagsvecka i rullen
   const updateFridayWeek = (weekIdx, idx, val) => {
@@ -2329,7 +2596,30 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, fridayTemplateRo
     document.getElementById('staff-edit-friday-section')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
   const autofillWeekSchedule = () => {
-    setForm(preparePersonForUse(form, fridayCycleWeeks, fridayTemplateRotation));
+    setForm(preparePersonForUse(form, fridayCycleWeeks, fridayTemplateRotation, normalizedPassBank));
+  };
+  const toggleAllowedPass = (passId) => {
+    const current = normalizeAllowedPassIds(form.allowedPassIds);
+    const allIds = normalizedPassBank.map(pass => pass.id);
+    let next;
+    if (current.length === 0) {
+      next = allIds.filter(id => id !== passId);
+    } else if (current.includes(passId)) {
+      if (current.length === 1) return;
+      next = current.filter(id => id !== passId);
+    } else {
+      next = [...current, passId];
+    }
+    if (next.length === allIds.length) next = [];
+    setForm({ ...form, allowedPassIds: next });
+  };
+  const selectAllPasses = () => setForm({ ...form, allowedPassIds: [] });
+  const selectSuggestedPasses = () => {
+    const suggestion = normalizedPassBank
+      .filter(pass => (!form.onlyAfternoons || pass.start >= 720) && (!pass.deptId || pass.deptId === form.deptId))
+      .filter(pass => WEEKDAY_KEYS.some(dayKey => pass.days.includes(dayKey) && isShiftLegal(form, dayKey, passToShift(pass))))
+      .map(pass => pass.id);
+    setForm({ ...form, allowedPassIds: suggestion.length === normalizedPassBank.length ? [] : suggestion });
   };
 
   const updateShift = (day, idx, val) => {
@@ -2398,92 +2688,72 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, fridayTemplateRo
             </div>
           </Section>
 
-          {/* Pass per dag */}
-          <Section title="Utgångspass vecka">
+          <Section title="Regler och pass">
             <p className="text-xs text-stone-500 mb-3">
-              De här tiderna är appens startläge för måndag till fredag. Om du lämnar dagar tomma fyller appen i rimliga utgångspass utifrån personens regler när du sparar eller genererar.
+              Det här är kärnan i generatorn: vilka pass personen får ta och vilka tider som måste respekteras.
             </p>
-            <div className="flex justify-end mb-3">
-              <button type="button" onClick={autofillWeekSchedule}
-                className="text-[11px] px-3 py-1.5 rounded-lg bg-stone-100 text-stone-700 hover:bg-stone-200 transition">
-                Fyll utifrån regler
-              </button>
-            </div>
-            <div className="space-y-2">
-              {DAYS.map(d => {
-                const isOff = (form.daysOff || []).includes(d.key);
-                return (
-                  <div key={d.key} className={`flex items-center gap-3 flex-wrap py-1 rounded ${isOff ? 'opacity-40' : ''}`}>
-                    <span className="text-sm text-stone-700 w-20">{d.label}</span>
-                    <input type="time" className="input w-32" value={form.sched[d.key]?.[0] || ''} disabled={isOff} onChange={e => updateShift(d.key, 0, e.target.value)} />
-                    <span className="text-stone-400">–</span>
-                    <input type="time" className="input w-32" value={form.sched[d.key]?.[1] || ''} disabled={isOff} onChange={e => updateShift(d.key, 1, e.target.value)} />
-                    {form.sched[d.key]?.[0] && form.sched[d.key]?.[1] && !isOff && (
-                      <span className="text-xs text-stone-500 ml-1">{minToHM(dayMinutes(form.sched[d.key]))}</span>
-                    )}
-                    <button type="button" onClick={() => toggleDayOff(d.key)}
-                      className={`ml-auto text-[10px] px-2 py-0.5 rounded ${isOff ? 'bg-stone-700 text-white' : 'bg-stone-100 text-stone-600 hover:bg-stone-200'}`}>
-                      {isOff ? 'Ledig' : 'Markera som ledig'}
-                    </button>
-                  </div>
-                );
-              })}
-              <div className={`flex items-center gap-3 flex-wrap py-1 rounded ${fixedFridayOff ? 'opacity-60' : ''}`}>
-                <span className="text-sm text-stone-700 w-20">Fredag</span>
-                {!form.hasFridayRotation ? (
-                  <>
-                    <input type="time" className="input w-32" value={form.fridayShift?.[0] || ''} disabled={fixedFridayOff}
-                      onChange={e => setForm({ ...form, fridayShift: [e.target.value, form.fridayShift?.[1] || ''] })} />
-                    <span className="text-stone-400">–</span>
-                    <input type="time" className="input w-32" value={form.fridayShift?.[1] || ''} disabled={fixedFridayOff}
-                      onChange={e => setForm({ ...form, fridayShift: [form.fridayShift?.[0] || '', e.target.value] })} />
-                    {!fixedFridayOff && form.fridayShift?.[0] && form.fridayShift?.[1] && (
-                      <span className="text-xs text-stone-500 ml-1">{minToHM(dayMinutes(form.fridayShift))}</span>
-                    )}
-                    <button type="button" onClick={() => setFixedFridayOff(!fixedFridayOff)}
-                      className={`ml-auto text-[10px] px-2 py-0.5 rounded ${fixedFridayOff ? 'bg-stone-700 text-white' : 'bg-stone-100 text-stone-600 hover:bg-stone-200'}`}>
-                      {fixedFridayOff ? 'Ledig' : 'Markera som ledig'}
-                    </button>
-                  </>
-                ) : (
-                  <>
-                    <div className="flex-1 min-w-[260px] rounded-lg bg-stone-50 px-3 py-2 ring-1 ring-stone-200">
-                      <p className="text-xs text-stone-700" style={{ fontWeight: 500 }}>
-                        {form.fridayUseTemplate ? 'Central mall' : 'Egen rull'}
-                      </p>
-                      <p className="text-[11px] text-stone-500 mt-0.5">
-                        {form.fridayUseTemplate
-                          ? `Startar på mallens vecka ${form.fridayTemplateStartWeek || 1}. Du kan lägga undantag längre ner.`
-                          : `Egna fredagstider för ${fridayCycleWeeks} veckor redigeras längre ner.`}
-                      </p>
-                    </div>
-                    <button type="button" onClick={scrollToFridaySection}
-                      className="ml-auto text-[10px] px-2 py-0.5 rounded bg-stone-100 text-stone-600 hover:bg-stone-200">
-                      Gå till fredagar
-                    </button>
-                  </>
-                )}
+            <div className="rounded-xl bg-stone-50 ring-1 ring-stone-200 p-4">
+              <div className="flex items-start justify-between gap-3 flex-wrap">
+                <div>
+                  <p className="text-xs uppercase tracking-wider text-stone-500">Tillåtna pass</p>
+                  <p className="text-sm text-stone-600 mt-1">
+                    Välj om personen får alla pass i banken eller bara vissa specifika. Generatorn håller sig till det här urvalet på vardagar.
+                  </p>
+                </div>
+                <div className="flex gap-2 flex-wrap">
+                  <button type="button" onClick={selectAllPasses}
+                    className={`text-[11px] px-3 py-1.5 rounded-lg transition ${usingAllPasses ? 'bg-stone-800 text-white' : 'bg-white text-stone-700 ring-1 ring-stone-200 hover:bg-stone-50'}`}>
+                    Alla pass
+                  </button>
+                  <button type="button" onClick={selectSuggestedPasses}
+                    className="text-[11px] px-3 py-1.5 rounded-lg bg-stone-100 text-stone-700 hover:bg-stone-200 transition">
+                    Föreslå urval
+                  </button>
+                </div>
               </div>
+              <div className="mt-3 grid sm:grid-cols-2 gap-2">
+                {normalizedPassBank.map(pass => {
+                  const selected = effectiveAllowedPassIds.includes(pass.id);
+                  const deptLabel = pass.deptId ? getDept(pass.deptId, departments).name : 'alla avdelningar';
+                  return (
+                    <button key={pass.id} type="button" onClick={() => toggleAllowedPass(pass.id)}
+                      className={`text-left rounded-xl p-3 transition ring-1 ${selected ? 'bg-stone-800 text-white ring-stone-800' : 'bg-white text-stone-700 ring-stone-200 hover:bg-stone-50'}`}>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-sm" style={{ fontWeight: 500 }}>{pass.name}</span>
+                        <span className={`text-[10px] px-1.5 py-0.5 rounded ${selected ? 'bg-white/15 text-stone-100' : 'bg-stone-100 text-stone-500'}`}>
+                          {selected ? 'Valt' : 'Ej valt'}
+                        </span>
+                      </div>
+                      <p className={`text-xs mt-1 ${selected ? 'text-stone-300' : 'text-stone-500'}`}>
+                        {minToTime(pass.start)}–{minToTime(pass.end)} · {minToHM(passDuration(pass))}
+                      </p>
+                      <p className={`text-[11px] mt-1 ${selected ? 'text-stone-300' : 'text-stone-500'}`}>
+                        {pass.days.map(dayKey => getDayMeta(dayKey).short).join(', ')} · {deptLabel}
+                      </p>
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-[10px] text-stone-400 mt-3">
+                Tomt urval betyder att personen kan ta alla pass som finns i passbanken.
+              </p>
             </div>
-          </Section>
 
-          {/* Begränsningar */}
-          <Section title="Begränsningar för automatisk pussling">
-            <p className="text-xs text-stone-500 mb-3">Det här är de viktigaste uppgifterna för generatorn. Dessa villkor respekteras när appen pusslar fram förslag.</p>
-            <div className="space-y-2.5">
+            <div className="mt-4 space-y-2.5">
               <Toggle checked={form.fixedTimes} onChange={v => setForm({ ...form, fixedTimes: v })}
                 label="Fast tid varje vecka" hint="Generatorn rör inte denna persons pass alls"
-                tip="Använd för personer som av kollektivavtal eller verksamhetsskäl har exakt samma tider varje vecka och inte ska kunna flyttas runt av appens automatiska schemagenerator. Du kan fortfarande redigera deras tider manuellt." />
+                tip="Använd för personer som inte ska flyttas runt av generatorn. Då behålls de tider som du själv lagt in under manuell veckoredigering." />
               <Toggle checked={form.onlyAfternoons} onChange={v => setForm({ ...form, onlyAfternoons: v })}
                 label="Endast eftermiddag" hint="Får aldrig börja före kl 12:00"
-                tip="Markera för personer som bara jobbar efter lunch — t.ex. lärare som har full undervisning förmiddag och bara fritidstid efter skolans slut." />
+                tip="Bra för personer som bara arbetar i fritidsdelen efter skolans slut." />
             </div>
+
             <div className="mt-4 space-y-4">
               <div>
                 <p className="text-xs text-stone-600 mb-2" style={{ fontWeight: 500 }}>Starttid</p>
                 <div className="grid grid-cols-2 gap-4">
                   <Field label="Tidigast tillåten"
-                    tip="Personen får inte börja jobba före denna tid. Använd för t.ex. personer som inte kan ta tidiga öppningar pga. förskolelämning av egna barn.">
+                    tip="Personen får inte börja jobba före denna tid. Använd för t.ex. personer som inte kan ta tidiga öppningar.">
                     <div className="flex items-center gap-2">
                       <input type="time" className="input flex-1" value={form.earliestStart != null ? minToTime(form.earliestStart) : ''}
                         onChange={e => setForm({ ...form, earliestStart: e.target.value ? timeToMin(e.target.value) : null })} />
@@ -2492,7 +2762,7 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, fridayTemplateRo
                     <p className="text-[10px] text-stone-400 mt-1">Får inte börja före denna tid</p>
                   </Field>
                   <Field label="Måste börja senast"
-                    tip="Personen måste vara på plats senast denna tid — t.ex. för att hen har lektion 08:40 och måste ha hunnit förbereda först.">
+                    tip="Personen måste vara på plats senast denna tid — t.ex. inför undervisning eller andra fasta åtaganden.">
                     <div className="flex items-center gap-2">
                       <input type="time" className="input flex-1" value={form.latestStart != null ? minToTime(form.latestStart) : ''}
                         onChange={e => setForm({ ...form, latestStart: e.target.value ? timeToMin(e.target.value) : null })} />
@@ -2506,7 +2776,7 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, fridayTemplateRo
                 <p className="text-xs text-stone-600 mb-2" style={{ fontWeight: 500 }}>Sluttid</p>
                 <div className="grid grid-cols-2 gap-4">
                   <Field label="Måste jobba minst till"
-                    tip="Personen måste vara kvar minst till denna tid — t.ex. för att hens lektion slutar 14:00 och hen inte kan gå hem före dess.">
+                    tip="Personen måste vara kvar minst till denna tid — t.ex. för att undervisning eller annan uppgift pågår till dess.">
                     <div className="flex items-center gap-2">
                       <input type="time" className="input flex-1" value={form.earliestEnd != null ? minToTime(form.earliestEnd) : ''}
                         onChange={e => setForm({ ...form, earliestEnd: e.target.value ? timeToMin(e.target.value) : null })} />
@@ -2515,7 +2785,7 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, fridayTemplateRo
                     <p className="text-[10px] text-stone-400 mt-1">t.ex. 14:00 om lektion slutar då</p>
                   </Field>
                   <Field label="Senast tillåten"
-                    tip="Personen får inte sluta efter denna tid — t.ex. för att hen ska hämta egna barn på dagis innan en viss tid.">
+                    tip="Personen får inte sluta efter denna tid — t.ex. på grund av hämtning eller andra begränsningar.">
                     <div className="flex items-center gap-2">
                       <input type="time" className="input flex-1" value={form.latestEnd != null ? minToTime(form.latestEnd) : ''}
                         onChange={e => setForm({ ...form, latestEnd: e.target.value ? timeToMin(e.target.value) : null })} />
@@ -2528,20 +2798,26 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, fridayTemplateRo
             </div>
           </Section>
 
-          {/* Dagspecifika undantag */}
-          <Section title="Dagsundantag">
-            <p className="text-xs text-stone-500 mb-3">
-              Undantag som åsidosätter de generella reglerna ovan på en specifik dag — t.ex. "måste börja senast 08:00 på onsdagar".
-            </p>
-            <DayOverridesEditor form={form} setForm={setForm} />
-          </Section>
-
-          {/* Varannan vecka (jämn/udda) */}
-          <Section title="Varannan vecka">
-            <p className="text-xs text-stone-500 mb-3">
-              Olika regler för jämna och udda kalenderveckor — t.ex. "kan inte öppna udda veckor" om man har barnen då.
-            </p>
-            <ParityOverridesEditor form={form} setForm={setForm} />
+          <Section title="Avancerade undantag">
+            <details className="rounded-xl bg-stone-50 ring-1 ring-stone-200 p-4">
+              <summary className="cursor-pointer text-sm text-stone-700" style={{ fontWeight: 500 }}>
+                Öppna dagsundantag och varannan vecka
+              </summary>
+              <div className="mt-4 space-y-5">
+                <div>
+                  <p className="text-xs text-stone-500 mb-3">
+                    Dagsundantag åsidosätter de generella reglerna på en specifik dag — t.ex. "måste börja senast 08:00 på onsdagar".
+                  </p>
+                  <DayOverridesEditor form={form} setForm={setForm} />
+                </div>
+                <div className="pt-4 border-t border-stone-200">
+                  <p className="text-xs text-stone-500 mb-3">
+                    Varannan vecka används när reglerna skiljer mellan jämna och udda kalenderveckor.
+                  </p>
+                  <ParityOverridesEditor form={form} setForm={setForm} />
+                </div>
+              </div>
+            </details>
           </Section>
 
           {/* Fredag */}
@@ -2665,6 +2941,79 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, fridayTemplateRo
                 <button onClick={() => setForm({ ...form, fridayShift: null })} className="text-xs text-stone-500 hover:text-stone-800">×</button>
               </div>
             )}
+          </Section>
+
+          <Section title="Manuell veckoredigering">
+            <details className="rounded-xl bg-stone-50 ring-1 ring-stone-200 p-4">
+              <summary className="cursor-pointer text-sm text-stone-700" style={{ fontWeight: 500 }}>
+                Öppna aktuella vardagspass
+              </summary>
+              <p className="text-xs text-stone-500 mt-3 mb-3">
+                Använd det här när du vill finjustera enskilda dagar efter att schemaförslag har tagits fram. Om tider saknas kan appen först fylla dem från passbank och regler.
+              </p>
+              <div className="flex justify-end mb-3">
+                <button type="button" onClick={autofillWeekSchedule}
+                  className="text-[11px] px-3 py-1.5 rounded-lg bg-stone-100 text-stone-700 hover:bg-stone-200 transition">
+                  Fyll från passbank och regler
+                </button>
+              </div>
+              <div className="space-y-2">
+                {DAYS.map(d => {
+                  const isOff = (form.daysOff || []).includes(d.key);
+                  return (
+                    <div key={d.key} className={`flex items-center gap-3 flex-wrap py-1 rounded ${isOff ? 'opacity-40' : ''}`}>
+                      <span className="text-sm text-stone-700 w-20">{d.label}</span>
+                      <input type="time" className="input w-32" value={form.sched[d.key]?.[0] || ''} disabled={isOff} onChange={e => updateShift(d.key, 0, e.target.value)} />
+                      <span className="text-stone-400">–</span>
+                      <input type="time" className="input w-32" value={form.sched[d.key]?.[1] || ''} disabled={isOff} onChange={e => updateShift(d.key, 1, e.target.value)} />
+                      {form.sched[d.key]?.[0] && form.sched[d.key]?.[1] && !isOff && (
+                        <span className="text-xs text-stone-500 ml-1">{minToHM(dayMinutes(form.sched[d.key]))}</span>
+                      )}
+                      <button type="button" onClick={() => toggleDayOff(d.key)}
+                        className={`ml-auto text-[10px] px-2 py-0.5 rounded ${isOff ? 'bg-stone-700 text-white' : 'bg-stone-100 text-stone-600 hover:bg-stone-200'}`}>
+                        {isOff ? 'Ledig' : 'Markera som ledig'}
+                      </button>
+                    </div>
+                  );
+                })}
+                <div className={`flex items-center gap-3 flex-wrap py-1 rounded ${fixedFridayOff ? 'opacity-60' : ''}`}>
+                  <span className="text-sm text-stone-700 w-20">Fredag</span>
+                  {!form.hasFridayRotation ? (
+                    <>
+                      <input type="time" className="input w-32" value={form.fridayShift?.[0] || ''} disabled={fixedFridayOff}
+                        onChange={e => setForm({ ...form, fridayShift: [e.target.value, form.fridayShift?.[1] || ''] })} />
+                      <span className="text-stone-400">–</span>
+                      <input type="time" className="input w-32" value={form.fridayShift?.[1] || ''} disabled={fixedFridayOff}
+                        onChange={e => setForm({ ...form, fridayShift: [form.fridayShift?.[0] || '', e.target.value] })} />
+                      {!fixedFridayOff && form.fridayShift?.[0] && form.fridayShift?.[1] && (
+                        <span className="text-xs text-stone-500 ml-1">{minToHM(dayMinutes(form.fridayShift))}</span>
+                      )}
+                      <button type="button" onClick={() => setFixedFridayOff(!fixedFridayOff)}
+                        className={`ml-auto text-[10px] px-2 py-0.5 rounded ${fixedFridayOff ? 'bg-stone-700 text-white' : 'bg-stone-100 text-stone-600 hover:bg-stone-200'}`}>
+                        {fixedFridayOff ? 'Ledig' : 'Markera som ledig'}
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <div className="flex-1 min-w-[260px] rounded-lg bg-white px-3 py-2 ring-1 ring-stone-200">
+                        <p className="text-xs text-stone-700" style={{ fontWeight: 500 }}>
+                          {form.fridayUseTemplate ? 'Central mall' : 'Egen rull'}
+                        </p>
+                        <p className="text-[11px] text-stone-500 mt-0.5">
+                          {form.fridayUseTemplate
+                            ? `Startar på mallens vecka ${form.fridayTemplateStartWeek || 1}.`
+                            : `Egna fredagstider för ${fridayCycleWeeks} veckor redigeras i fredagsdelen ovan.`}
+                        </p>
+                      </div>
+                      <button type="button" onClick={scrollToFridaySection}
+                        className="ml-auto text-[10px] px-2 py-0.5 rounded bg-stone-100 text-stone-600 hover:bg-stone-200">
+                        Gå till fredagar
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+            </details>
           </Section>
 
           {/* Veckosumma */}
@@ -2940,7 +3289,7 @@ function ExampleDataModal({ scenarios, onSelect, onClose }) {
         <div className="sticky top-0 bg-white border-b border-stone-200 px-6 py-4 flex items-center justify-between z-10">
           <div>
             <h2 className="display-font text-2xl text-stone-800">Välj exempeldata</h2>
-            <p className="text-xs text-stone-500 mt-0.5">Alla scenarier använder påhittade namn. Veckopass för mån–tor är inte färdigifyllda, utan generatorn utgår från parametrarna.</p>
+            <p className="text-xs text-stone-500 mt-0.5">Alla scenarier använder påhittade namn. Veckopass för mån–tor är inte färdigifyllda, utan generatorn utgår från parametrar och respektive scenarios passbank.</p>
           </div>
           <button onClick={onClose} className="text-stone-400 hover:text-stone-700"><X size={20} /></button>
         </div>
@@ -2950,6 +3299,7 @@ function ExampleDataModal({ scenarios, onSelect, onClose }) {
             const rotating = scenario.staff.filter(person => person.hasFridayRotation).length;
             const deptBlocks = scenario.coverageBlocks.filter(block => block.scopeType === COVERAGE_DEPARTMENT).length;
             const sharedBlocks = scenario.coverageBlocks.filter(block => block.scopeType !== COVERAGE_DEPARTMENT).length;
+            const passCount = (scenario.passBank || []).length;
             return (
               <button key={scenario.id} onClick={() => onSelect(scenario)}
                 className="text-left bg-stone-50 ring-1 ring-stone-200 rounded-2xl p-5 hover:bg-stone-100 transition">
@@ -2962,6 +3312,9 @@ function ExampleDataModal({ scenarios, onSelect, onClose }) {
                   </div>
                   <div className="bg-white rounded-lg px-3 py-2 ring-1 ring-stone-200">
                     <span style={{ fontWeight: 500 }}>{scenario.departments.length}</span> avdelningar
+                  </div>
+                  <div className="bg-white rounded-lg px-3 py-2 ring-1 ring-stone-200">
+                    <span style={{ fontWeight: 500 }}>{passCount}</span> pass
                   </div>
                   <div className="bg-white rounded-lg px-3 py-2 ring-1 ring-stone-200">
                     <span style={{ fontWeight: 500 }}>{sharedBlocks}</span> gemensamma block
@@ -3038,7 +3391,7 @@ function TourBubble({ step, onNext, onClose }) {
     },
     {
       title: 'Steg 2 av 4 · Personal',
-      desc: 'Lägg till en kollega i taget. Klicka "Lägg till personal" eller redigera en befintlig. Tjänstgöring i procent, avdelning, fredagsrutin och villkor som "måste börja senast 08:40 för lektion" är viktigast. Veckopassen kan användas som utgångsläge.',
+      desc: 'Lägg till en kollega i taget. Börja med avdelning, tjänstgöring, tillåtna pass och villkor som "måste börja senast 08:40 för lektion". Manuell veckoredigering används mest för finjustering efteråt.',
     },
     {
       title: 'Steg 3 av 4 · Bemanningskrav',
