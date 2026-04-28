@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="sv">
 <head>
 <meta charset="UTF-8" />
@@ -128,8 +128,25 @@ function getTargetMin(person) {
 // Räkna ut en persons fredagspass för en given vecka i cykeln (1-indexerad).
 // Modell: varje person har sin EGNA lista av fredagspass (en per vecka i cykeln).
 // Det är samma struktur som i den ursprungliga Excel-filen — varje person har sin rad.
-function getFridayShift(person, week, cycleWeeks) {
+function getTemplateFridayShift(fridayTemplateRotation, week, startWeek = 1, cycleWeeks = 8) {
+  if (!Array.isArray(fridayTemplateRotation) || fridayTemplateRotation.length === 0) return null;
+  const len = fridayTemplateRotation.length;
+  const idx = (((week - 1) + ((startWeek || 1) - 1)) % len + len) % len;
+  return fridayTemplateRotation[idx] || null;
+}
+
+function hasFridayTemplateOverride(person, week) {
+  return Object.prototype.hasOwnProperty.call(person.fridayTemplateOverrides || {}, String(week));
+}
+
+function getFridayShift(person, week, cycleWeeks, fridayTemplateRotation = []) {
   if (!person.hasFridayRotation && person.fridayShift) return person.fridayShift;
+  if (person.hasFridayRotation && person.fridayUseTemplate) {
+    if (hasFridayTemplateOverride(person, week)) {
+      return (person.fridayTemplateOverrides || {})[String(week)] || null;
+    }
+    return getTemplateFridayShift(fridayTemplateRotation, week, person.fridayTemplateStartWeek || 1, cycleWeeks);
+  }
   if (person.hasFridayRotation && Array.isArray(person.fridayRotation) && person.fridayRotation.length > 0) {
     const len = person.fridayRotation.length;
     const idx = (((week - 1) % len) + len) % len;
@@ -139,12 +156,13 @@ function getFridayShift(person, week, cycleWeeks) {
 }
 
 // Snittlig fredagstid över cykeln (för veckotim-räkning)
-function avgFridayMinutes(person, cycleWeeks) {
+function avgFridayMinutes(person, cycleWeeks, fridayTemplateRotation = []) {
   if (!person.hasFridayRotation && person.fridayShift) return dayMinutes(person.fridayShift);
-  if (!person.hasFridayRotation || !Array.isArray(person.fridayRotation) || person.fridayRotation.length === 0) return 0;
+  if (!person.hasFridayRotation) return 0;
+  if (!person.fridayUseTemplate && (!Array.isArray(person.fridayRotation) || person.fridayRotation.length === 0)) return 0;
   let sum = 0;
   for (let w = 1; w <= cycleWeeks; w++) {
-    const sh = getFridayShift(person, w, cycleWeeks);
+    const sh = getFridayShift(person, w, cycleWeeks, fridayTemplateRotation);
     if (sh) sum += dayMinutes(sh);
   }
   return sum / cycleWeeks;
@@ -156,6 +174,10 @@ function resizeRotation(rotation, length) {
   const out = new Array(length).fill(null);
   for (let i = 0; i < Math.min(cur.length, length); i++) out[i] = cur[i];
   return out;
+}
+
+function buildEffectiveFridayRotation(person, cycleWeeks, fridayTemplateRotation = []) {
+  return Array.from({ length: cycleWeeks }, (_, idx) => getFridayShift(person, idx + 1, cycleWeeks, fridayTemplateRotation));
 }
 
 const DAYS = [
@@ -179,6 +201,7 @@ const DEFAULTS = {
   // Format: { even: { earliestStart: 480, ... }, odd: { ... } }
   parityOverrides: {},
   daysOff: [], hasFridayRotation: true, fridayShift: null, fridayRotation: null,
+  fridayUseTemplate: false, fridayTemplateStartWeek: 1, fridayTemplateOverrides: {},
 };
 
 // Hjälpfunktion: bygger en personalpost med default-värden + det man skickar in
@@ -208,6 +231,8 @@ const _FRIDAY_BASE = [
 function exampleRotation(offset) {
   return _FRIDAY_BASE.map((_, i) => _FRIDAY_BASE[(i + offset) % _FRIDAY_BASE.length]);
 }
+
+const initialFridayTemplateRotation = new Array(8).fill(null);
 
 const EXAMPLE_STAFF = [
   P({ id: 1, name: 'Christina', deptId: 'd1', percent: 82, role: '',
@@ -254,24 +279,83 @@ const EXAMPLE_STAFF = [
 
 // Bemanningskrav som redigerbara block. Varje block: starttid–sluttid → minst N personer.
 // Tider är i minuter från midnatt (t.ex. 360 = 06:00).
+const COVERAGE_SHARED = 'shared';
+const COVERAGE_DEPARTMENT = 'department';
+
 const initialCoverageBlocks = [
-  { id: 1, start: 350, end: 480, min: 2, label: 'Morgonfritids' },     // 05:50–08:00
-  { id: 2, start: 480, end: 780, min: 1, label: 'Skoldag' },            // 08:00–13:00
-  { id: 3, start: 780, end: 990, min: 4, label: 'Eftermiddagsfritids' },// 13:00–16:30
-  { id: 4, start: 990, end: 1065, min: 2, label: 'Sen eftermiddag' },   // 16:30–17:45
+  { id: 1, start: 350, end: 480, min: 2, label: 'Morgonfritids', scopeType: COVERAGE_SHARED, deptId: null },     // 05:50–08:00
+  { id: 2, start: 480, end: 780, min: 1, label: 'Skoldag', scopeType: COVERAGE_SHARED, deptId: null },            // 08:00–13:00
+  { id: 3, start: 780, end: 990, min: 4, label: 'Eftermiddagsfritids', scopeType: COVERAGE_SHARED, deptId: null },// 13:00–16:30
+  { id: 4, start: 990, end: 1065, min: 2, label: 'Sen eftermiddag', scopeType: COVERAGE_SHARED, deptId: null },   // 16:30–17:45
 ];
 
+function normalizeCoverageBlock(block, fallbackDeptId = '') {
+  const scopeType = block?.scopeType === COVERAGE_DEPARTMENT ? COVERAGE_DEPARTMENT : COVERAGE_SHARED;
+  return {
+    id: block?.id ?? Math.random(),
+    start: block?.start ?? 480,
+    end: block?.end ?? 540,
+    min: block?.min ?? 0,
+    label: block?.label || 'Nytt block',
+    scopeType,
+    deptId: scopeType === COVERAGE_DEPARTMENT ? (block?.deptId || fallbackDeptId || '') : null,
+  };
+}
+
+function normalizeCoverageBlocks(blocks, departments = []) {
+  const fallbackDeptId = departments[0]?.id || '';
+  return (Array.isArray(blocks) ? blocks : []).map(block => normalizeCoverageBlock(block, fallbackDeptId));
+}
+
+function blockMatchesScope(block, scopeType, deptId = null) {
+  if (scopeType === COVERAGE_DEPARTMENT) {
+    return block.scopeType === COVERAGE_DEPARTMENT && block.deptId === deptId;
+  }
+  return block.scopeType !== COVERAGE_DEPARTMENT;
+}
+
 // Konvertera block till 15-min slots som resten av koden använder
-function blocksToSlots(blocks) {
+function blocksToSlots(blocks, scopeType = COVERAGE_SHARED, deptId = null) {
   const arr = [];
   for (let m = 330; m < 1080; m += 15) {
     let min = 0;
     for (const b of blocks) {
+      if (!blockMatchesScope(b, scopeType, deptId)) continue;
       if (m >= b.start && m < b.end) { min = b.min; break; }
     }
     arr.push({ start: m, min });
   }
   return arr;
+}
+
+function buildCoverageScopes(blocks, departments) {
+  const normalized = normalizeCoverageBlocks(blocks, departments);
+  const sharedBlocks = normalized.filter(b => b.scopeType === COVERAGE_SHARED);
+  const scopes = [];
+
+  if (sharedBlocks.length > 0 || normalized.length === 0) {
+    scopes.push({
+      key: COVERAGE_SHARED,
+      label: 'Gemensam bemanning',
+      scopeType: COVERAGE_SHARED,
+      deptId: null,
+      color: '#475569',
+      slots: blocksToSlots(normalized, COVERAGE_SHARED),
+    });
+  }
+
+  departments.forEach(dept => {
+    scopes.push({
+      key: dept.id,
+      label: dept.name,
+      scopeType: COVERAGE_DEPARTMENT,
+      deptId: dept.id,
+      color: dept.color,
+      slots: blocksToSlots(normalized, COVERAGE_DEPARTMENT, dept.id),
+    });
+  });
+
+  return scopes;
 }
 
 // ==================== HELPERS ====================
@@ -280,19 +364,24 @@ function timeToMin(t) { if (!t) return null; const [h, m] = t.split(':').map(Num
 function minToTime(m) { const h = Math.floor(m / 60); const mm = m % 60; return `${String(h).padStart(2, '0')}:${String(mm).padStart(2, '0')}`; }
 function minToHM(min) { const h = Math.floor(Math.abs(min) / 60); const m = Math.abs(min) % 60; const sign = min < 0 ? '-' : ''; return `${sign}${h} h ${m} min`; }
 function dayMinutes(sched) { return timeToMin(sched[1]) - timeToMin(sched[0]); }
-function weeklyMinutes(staff, cycleWeeks = 8) {
+function weeklyMinutes(staff, cycleWeeks = 8, fridayTemplateRotation = []) {
   let total = 0;
   for (const d of DAYS) if (staff.sched?.[d.key]) total += dayMinutes(staff.sched[d.key]);
-  total += avgFridayMinutes(staff, cycleWeeks);
+  total += avgFridayMinutes(staff, cycleWeeks, fridayTemplateRotation);
   return Math.round(total);
 }
 
 // ==================== SCHEDULE GENERATOR (Simulated Annealing) ====================
 
-function computeSlots(staff, dayKey, coverage) {
-  return coverage.map(slot => {
+function personMatchesCoverageScope(person, scope) {
+  return scope.scopeType !== COVERAGE_DEPARTMENT || person.deptId === scope.deptId;
+}
+
+function computeSlots(staff, dayKey, coverageSlots, scope = { scopeType: COVERAGE_SHARED, deptId: null }) {
+  return coverageSlots.map(slot => {
     let count = 0;
     for (const p of staff) {
+      if (!personMatchesCoverageScope(p, scope)) continue;
       const sh = p.sched[dayKey];
       if (!sh) continue;
       const start = timeToMin(sh[0]);
@@ -303,19 +392,21 @@ function computeSlots(staff, dayKey, coverage) {
   });
 }
 
-function scheduleScore(staff, coverage, cycleWeeks, weights = { gap: 30, hours: 2, over: 1 }) {
+function scheduleScore(staff, coverageScopes, cycleWeeks, fridayTemplateRotation, weights = { gap: 30, hours: 2, over: 1 }) {
   let score = 0;
   // Hour target
   for (const p of staff) {
-    const wm = weeklyMinutes(p, cycleWeeks);
+    const wm = weeklyMinutes(p, cycleWeeks, fridayTemplateRotation);
     score -= Math.abs(wm - getTargetMin(p)) * weights.hours;
   }
   // Coverage (mån-tor)
   for (const d of DAYS) {
-    const slots = computeSlots(staff, d.key, coverage);
-    for (const s of slots) {
-      if (s.count < s.min) score -= (s.min - s.count) ** 2 * weights.gap;
-      if (s.count > s.min + 2) score -= (s.count - s.min - 2) * weights.over;
+    for (const scope of coverageScopes) {
+      const slots = computeSlots(staff, d.key, scope.slots, scope);
+      for (const s of slots) {
+        if (s.count < s.min) score -= (s.min - s.count) ** 2 * weights.gap;
+        if (s.count > s.min + 2) score -= (s.count - s.min - 2) * weights.over;
+      }
     }
   }
   return score;
@@ -373,9 +464,9 @@ function attemptMutation(staff) {
   );
 }
 
-function runSearch(initialStaff, coverage, cycleWeeks, weights, iterations = 2500) {
+function runSearch(initialStaff, coverageScopes, cycleWeeks, fridayTemplateRotation, weights, iterations = 2500) {
   let current = initialStaff.map(p => ({ ...p, sched: { ...p.sched } }));
-  let currentScore = scheduleScore(current, coverage, cycleWeeks, weights);
+  let currentScore = scheduleScore(current, coverageScopes, cycleWeeks, fridayTemplateRotation, weights);
   let best = current;
   let bestScore = currentScore;
   let temp = 80;
@@ -384,7 +475,7 @@ function runSearch(initialStaff, coverage, cycleWeeks, weights, iterations = 250
   for (let i = 0; i < iterations; i++) {
     const cand = attemptMutation(current);
     if (!cand) continue;
-    const cs = scheduleScore(cand, coverage, cycleWeeks, weights);
+    const cs = scheduleScore(cand, coverageScopes, cycleWeeks, fridayTemplateRotation, weights);
     const delta = cs - currentScore;
     if (delta >= 0 || Math.random() < Math.exp(delta / temp)) {
       current = cand;
@@ -396,30 +487,32 @@ function runSearch(initialStaff, coverage, cycleWeeks, weights, iterations = 250
   return best;
 }
 
-function summarizeSchedule(staff, coverage, cycleWeeks) {
+function summarizeSchedule(staff, coverageScopes, cycleWeeks, fridayTemplateRotation = []) {
   let totalGaps = 0, totalGapMinutes = 0;
   for (const d of DAYS) {
-    const slots = computeSlots(staff, d.key, coverage);
-    for (const s of slots) if (s.count < s.min) { totalGaps++; totalGapMinutes += 15 * (s.min - s.count); }
+    for (const scope of coverageScopes) {
+      const slots = computeSlots(staff, d.key, scope.slots, scope);
+      for (const s of slots) if (s.count < s.min) { totalGaps++; totalGapMinutes += 15 * (s.min - s.count); }
+    }
   }
   let totalHourDev = 0, peopleOff = 0;
   for (const p of staff) {
-    const dev = weeklyMinutes(p, cycleWeeks) - getTargetMin(p);
+    const dev = weeklyMinutes(p, cycleWeeks, fridayTemplateRotation) - getTargetMin(p);
     totalHourDev += Math.abs(dev);
     if (Math.abs(dev) > 5) peopleOff++;
   }
   return { totalGaps, totalGapMinutes, totalHourDev, peopleOff };
 }
 
-function generateAlternatives(initialStaff, coverage, cycleWeeks) {
+function generateAlternatives(initialStaff, coverageScopes, cycleWeeks, fridayTemplateRotation) {
   const variants = [
     { label: 'Bemannings­fokus', desc: 'Prioriterar att alla pass är täckta', weights: { gap: 50, hours: 1, over: 1 } },
     { label: 'Tim­fokus',        desc: 'Prioriterar exakta veckotimmar',     weights: { gap: 15, hours: 5, over: 1 } },
     { label: 'Balanserat',       desc: 'Väger båda målen lika',                weights: { gap: 30, hours: 2, over: 1 } },
   ];
   return variants.map(v => {
-    const result = runSearch(initialStaff, coverage, cycleWeeks, v.weights, 2500);
-    return { ...v, staff: result, summary: summarizeSchedule(result, coverage, cycleWeeks) };
+    const result = runSearch(initialStaff, coverageScopes, cycleWeeks, fridayTemplateRotation, v.weights, 2500);
+    return { ...v, staff: result, summary: summarizeSchedule(result, coverageScopes, cycleWeeks, fridayTemplateRotation) };
   });
 }
 
@@ -437,8 +530,16 @@ function FritidsSchemaApp() {
   const [departments, setDepartments] = useState(initialDepartments);
   const [coverageBlocks, setCoverageBlocks] = useState(initialCoverageBlocks);
   const [fridayCycleWeeks, setFridayCycleWeeksRaw] = useState(8);
+  const [fridayTemplateRotation, setFridayTemplateRotation] = useState(initialFridayTemplateRotation);
   const [currentFridayWeek, setCurrentFridayWeek] = useState(1);
-  const coverage = useMemo(() => blocksToSlots(coverageBlocks), [coverageBlocks]);
+  const normalizedCoverageBlocks = useMemo(
+    () => normalizeCoverageBlocks(coverageBlocks, departments),
+    [coverageBlocks, departments]
+  );
+  const coverageScopes = useMemo(
+    () => buildCoverageScopes(normalizedCoverageBlocks, departments),
+    [normalizedCoverageBlocks, departments]
+  );
   const [activeDay, setActiveDay] = useState('mon');
   const [view, setView] = useState('schedule');
   const [editingId, setEditingId] = useState(null);
@@ -463,7 +564,12 @@ function FritidsSchemaApp() {
       fridayRotation: s.hasFridayRotation
         ? resizeRotation(s.fridayRotation, clamped)
         : s.fridayRotation,
+      fridayTemplateStartWeek: Math.min(Math.max(1, s.fridayTemplateStartWeek || 1), clamped),
+      fridayTemplateOverrides: Object.fromEntries(
+        Object.entries(s.fridayTemplateOverrides || {}).filter(([week]) => parseInt(week, 10) <= clamped)
+      ),
     })));
+    setFridayTemplateRotation(prev => resizeRotation(prev, clamped));
     setCurrentFridayWeek(w => Math.min(Math.max(1, w), clamped));
   };
 
@@ -484,9 +590,11 @@ function FritidsSchemaApp() {
           setStaff(data.staff);
           if (data.staff.length > 0) nextId = Math.max(...data.staff.map(p => p.id), 99) + 1;
         }
-        if (data.departments) setDepartments(data.departments);
-        if (data.coverageBlocks) setCoverageBlocks(data.coverageBlocks);
+        const loadedDepartments = data.departments || initialDepartments;
+        if (data.departments) setDepartments(loadedDepartments);
+        if (data.coverageBlocks) setCoverageBlocks(normalizeCoverageBlocks(data.coverageBlocks, loadedDepartments));
         if (data.fridayCycleWeeks) setFridayCycleWeeksRaw(data.fridayCycleWeeks);
+        setFridayTemplateRotation(resizeRotation(data.fridayTemplateRotation, data.fridayCycleWeeks || 8));
         if (data.savedFileName) setSavedFileName(data.savedFileName);
       }
     } catch {}
@@ -532,17 +640,17 @@ function FritidsSchemaApp() {
     if (!loaded) return;
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({
-        staff, departments, coverageBlocks, fridayCycleWeeks, savedFileName,
+        staff, departments, coverageBlocks: normalizedCoverageBlocks, fridayCycleWeeks, fridayTemplateRotation, savedFileName,
       }));
     } catch {}
     setDirty(true);
-  }, [staff, departments, coverageBlocks, fridayCycleWeeks, loaded]);
+  }, [staff, departments, normalizedCoverageBlocks, fridayCycleWeeks, fridayTemplateRotation, loaded]);
 
   // Hjälp: bygg datapaketet att skriva till fil
   const buildSaveData = () => ({
-    version: 1,
+    version: 2,
     exportedAt: new Date().toISOString(),
-    staff, departments, coverageBlocks, fridayCycleWeeks,
+    staff, departments, coverageBlocks: normalizedCoverageBlocks, fridayCycleWeeks, fridayTemplateRotation,
   });
 
   // Skriv data till en redan öppnad fil-handle
@@ -636,10 +744,12 @@ function FritidsSchemaApp() {
         if (staff.length > 0 && !confirm('Detta ersätter all nuvarande data. Fortsätt?')) {
           resolve(false); return;
         }
+        const loadedDepartments = data.departments || [];
         setStaff(data.staff || []);
-        setDepartments(data.departments || []);
-        setCoverageBlocks(data.coverageBlocks || initialCoverageBlocks);
+        setDepartments(loadedDepartments);
+        setCoverageBlocks(normalizeCoverageBlocks(data.coverageBlocks || initialCoverageBlocks, loadedDepartments));
         setFridayCycleWeeksRaw(data.fridayCycleWeeks || 8);
+        setFridayTemplateRotation(resizeRotation(data.fridayTemplateRotation, data.fridayCycleWeeks || 8));
         if (data.staff && data.staff.length > 0) nextId = Math.max(...data.staff.map(p => p.id), 99) + 1;
         setSavedFileName(file.name);
         setTimeout(() => setDirty(false), 50);
@@ -673,7 +783,9 @@ function FritidsSchemaApp() {
     if (staff.length > 0 && !confirm('Detta ersätter den personal och avdelningar som finns nu. Fortsätt?')) return;
     setStaff(EXAMPLE_STAFF);
     setDepartments(EXAMPLE_DEPARTMENTS);
+    setCoverageBlocks(normalizeCoverageBlocks(initialCoverageBlocks, EXAMPLE_DEPARTMENTS));
     setFridayCycleWeeksRaw(8);
+    setFridayTemplateRotation(resizeRotation(_FRIDAY_BASE, 8));
     nextId = Math.max(...EXAMPLE_STAFF.map(p => p.id)) + 1;
   };
   const clearAll = () => {
@@ -687,7 +799,7 @@ function FritidsSchemaApp() {
       present = staff
         .filter(s => !(s.daysOff || []).includes('fri'))
         .map(s => {
-          const sh = getFridayShift(s, currentFridayWeek, fridayCycleWeeks);
+          const sh = getFridayShift(s, currentFridayWeek, fridayCycleWeeks, fridayTemplateRotation);
           if (!sh) return null;
           return { ...s, _friShift: sh, startMin: timeToMin(sh[0]), endMin: timeToMin(sh[1]) };
         })
@@ -698,17 +810,40 @@ function FritidsSchemaApp() {
         .map(s => ({ ...s, startMin: timeToMin(s.sched[activeDay][0]), endMin: timeToMin(s.sched[activeDay][1]) }))
         .sort((a, b) => a.startMin - b.startMin);
     }
-    const slots = coverage.map(slot => {
-      const count = present.filter(p => p.startMin <= slot.start && p.endMin > slot.start).length;
-      return { ...slot, count, gap: count < slot.min };
+    const coverageViews = coverageScopes.map(scope => {
+      const scopePresent = scope.scopeType === COVERAGE_DEPARTMENT
+        ? present.filter(p => p.deptId === scope.deptId)
+        : present;
+      const slots = scope.slots.map(slot => {
+        const count = scopePresent.filter(p => p.startMin <= slot.start && p.endMin > slot.start).length;
+        return { ...slot, count, gap: count < slot.min };
+      });
+      const gaps = slots.filter(s => s.gap);
+      return {
+        ...scope,
+        present: scopePresent,
+        slots,
+        gaps,
+        gapMinutes: gaps.reduce((sum, s) => sum + 15 * (s.min - s.count), 0),
+      };
     });
-    return { present, slots, gaps: slots.filter(s => s.gap) };
-  }, [staff, activeDay, coverage, currentFridayWeek, fridayCycleWeeks]);
+    const primaryCoverage = coverageViews.find(v => v.key === COVERAGE_SHARED)
+      || coverageViews.find(v => v.slots.some(s => s.min > 0))
+      || coverageViews[0]
+      || null;
+    return {
+      present,
+      coverageViews,
+      totalGaps: coverageViews.reduce((sum, v) => sum + v.gaps.length, 0),
+      totalGapMinutes: coverageViews.reduce((sum, v) => sum + v.gapMinutes, 0),
+      primaryCoverageKey: primaryCoverage?.key || COVERAGE_SHARED,
+    };
+  }, [staff, activeDay, coverageScopes, currentFridayWeek, fridayCycleWeeks]);
 
   const violations = useMemo(() => {
     const v = [];
     for (const s of staff) {
-      const wm = weeklyMinutes(s, fridayCycleWeeks);
+      const wm = weeklyMinutes(s, fridayCycleWeeks, fridayTemplateRotation);
       const dev = wm - getTargetMin(s);
       if (Math.abs(dev) > 5) {
         v.push({ id: s.id, name: s.name, severity: Math.abs(dev) > 60 ? 'high' : 'med',
@@ -761,7 +896,7 @@ function FritidsSchemaApp() {
       }
     }
     return v;
-  }, [staff, fridayCycleWeeks]);
+  }, [staff, fridayCycleWeeks, fridayTemplateRotation]);
 
   const updateStaff = (updated) => setStaff(prev => prev.map(s => s.id === updated.id ? updated : s));
   const removeStaff = (id) => setStaff(prev => prev.filter(s => s.id !== id));
@@ -784,7 +919,7 @@ function FritidsSchemaApp() {
     setGenerating(true);
     setAlternatives(null);
     await new Promise(r => setTimeout(r, 50));
-    const alts = generateAlternatives(staff, coverage, fridayCycleWeeks);
+    const alts = generateAlternatives(staff, coverageScopes, fridayCycleWeeks, fridayTemplateRotation);
     setAlternatives(alts);
     setGenerating(false);
   };
@@ -876,9 +1011,9 @@ function FritidsSchemaApp() {
 
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
           <StatCard label="Personal" value={staff.length} sub="aktiva" />
-          <StatCard label="Veckotimmar tot." value={minToHM(staff.reduce((a, s) => a + weeklyMinutes(s), 0))} />
-          <StatCard label="Täckningsgap" value={dayData.gaps.length} sub={`på ${activeDay === 'fri' ? 'fredag' : DAYS.find(d => d.key === activeDay).label.toLowerCase()}`}
-            highlight={dayData.gaps.length > 0 ? 'warn' : 'ok'} />
+          <StatCard label="Veckotimmar tot." value={minToHM(staff.reduce((a, s) => a + weeklyMinutes(s, fridayCycleWeeks, fridayTemplateRotation), 0))} />
+          <StatCard label="Täckningsgap" value={dayData.totalGaps} sub={`på ${activeDay === 'fri' ? 'fredag' : DAYS.find(d => d.key === activeDay).label.toLowerCase()}`}
+            highlight={dayData.totalGaps > 0 ? 'warn' : 'ok'} />
           <StatCard label="Regelbrott" value={violations.length}
             highlight={violations.length > 0 ? 'warn' : 'ok'} sub={violations.length > 0 ? 'se Personal-fliken' : 'allt ok'} />
         </div>
@@ -891,11 +1026,12 @@ function FritidsSchemaApp() {
             setCurrentFridayWeek={setCurrentFridayWeek}
             hasFridaySetup={staff.some(s => (s.hasFridayRotation && Array.isArray(s.fridayRotation) && s.fridayRotation.some(x => x)) || (!s.hasFridayRotation && s.fridayShift))} />
         )}
-        {view === 'staff' && <StaffView staff={staff} violations={violations} onEdit={setEditingId} onAdd={addStaff}
+        {view === 'staff' && <StaffView staff={staff} fridayCycleWeeks={fridayCycleWeeks} fridayTemplateRotation={fridayTemplateRotation} violations={violations} onEdit={setEditingId} onAdd={addStaff}
           onLoadExample={loadExample} departments={departments} />}
-        {view === 'rules' && <RulesView blocks={coverageBlocks} setBlocks={setCoverageBlocks} />}
+        {view === 'rules' && <RulesView blocks={normalizedCoverageBlocks} setBlocks={setCoverageBlocks} departments={departments} />}
         {view === 'settings' && <SettingsView departments={departments} setDepartments={setDepartments}
-          staff={staff} setStaff={setStaff}
+          staff={staff} setStaff={setStaff} coverageBlocks={normalizedCoverageBlocks} setCoverageBlocks={setCoverageBlocks}
+          fridayTemplateRotation={fridayTemplateRotation} setFridayTemplateRotation={setFridayTemplateRotation}
           fridayCycleWeeks={fridayCycleWeeks} setFridayCycleWeeks={setFridayCycleWeeks}
           onLoadExample={loadExample} onClearAll={clearAll} />}
 
@@ -909,6 +1045,7 @@ function FritidsSchemaApp() {
         <StaffEditModal staff={staff.find(s => s.id === editingId)}
           departments={departments}
           fridayCycleWeeks={fridayCycleWeeks}
+          fridayTemplateRotation={fridayTemplateRotation}
           onSave={(updated) => { updateStaff(updated); setEditingId(null); }}
           onClose={() => setEditingId(null)}
           onRemove={(id) => { removeStaff(id); setEditingId(null); }} />
@@ -927,7 +1064,7 @@ function FritidsSchemaApp() {
       )}
 
       {alternatives && (
-        <AlternativesModal alternatives={alternatives} currentStaff={staff} coverage={coverage}
+        <AlternativesModal alternatives={alternatives} currentStaff={staff} coverageScopes={coverageScopes} fridayCycleWeeks={fridayCycleWeeks} fridayTemplateRotation={fridayTemplateRotation}
           departments={departments}
           onApply={applyAlternative} onClose={() => setAlternatives(null)} />
       )}
@@ -990,10 +1127,25 @@ function StatCard({ label, value, sub, highlight }) {
 
 function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, onGoToStaff, onLoadExample, departments,
                         fridayCycleWeeks, currentFridayWeek, setCurrentFridayWeek, hasFridaySetup }) {
+  const [coverageFocus, setCoverageFocus] = useState(dayData.primaryCoverageKey || COVERAGE_SHARED);
   const ticks = []; for (let m = 360; m <= TIMELINE_END; m += 60) ticks.push(m);
-  const maxCount = Math.max(...dayData.slots.map(s => s.count), 5);
   const isFriday = activeDay === 'fri';
   const dayLabel = isFriday ? 'Fredag' : DAYS.find(d => d.key === activeDay).label;
+  const visibleCoverageViews = dayData.coverageViews;
+
+  useEffect(() => {
+    const available = visibleCoverageViews.map(v => v.key);
+    if (!available.includes(coverageFocus)) {
+      setCoverageFocus(dayData.primaryCoverageKey || available[0] || COVERAGE_SHARED);
+    }
+  }, [coverageFocus, dayData.primaryCoverageKey, visibleCoverageViews]);
+
+  const focusedCoverage = visibleCoverageViews.find(v => v.key === coverageFocus)
+    || visibleCoverageViews[0]
+    || dayData.coverageViews[0]
+    || null;
+  const visiblePresent = focusedCoverage?.present || dayData.present;
+  const maxCount = Math.max(...((focusedCoverage?.slots || []).map(s => Math.max(s.count, s.min))), 5);
 
   if (staffCount === 0) {
     return (
@@ -1017,7 +1169,7 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
   return (
     <div className="space-y-4">
       <TabIntro>
-        Här ser du schemat per dag och hur bemanningen ser ut över tiden. Klicka på en person för att redigera deras pass. Tryck "Generera schemaförslag" högst upp för att låta appen pussla fram alternativ.
+        Här ser du schemat per dag och hur bemanningen ser ut över tiden. Växla mellan gemensam bemanning och avdelningar för att se om varje del av fritids har rätt täckning.
       </TabIntro>
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="flex gap-2 flex-wrap">
@@ -1055,9 +1207,38 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
         </div>
       )}
 
+      {visibleCoverageViews.length > 0 && (
+        <div className="grid md:grid-cols-2 xl:grid-cols-4 gap-3">
+          {visibleCoverageViews.map(view => {
+            const selected = focusedCoverage?.key === view.key;
+            return (
+              <button key={view.key} onClick={() => setCoverageFocus(view.key)}
+                className={`text-left rounded-xl p-4 transition ring-1 ${selected ? 'bg-stone-800 text-white ring-stone-800 shadow-lg' : 'bg-white text-stone-800 ring-stone-200 hover:bg-stone-50'}`}>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-sm" style={{ fontWeight: 500 }}>{view.label}</span>
+                  <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: view.color }} />
+                </div>
+                <p className={`text-xs mt-2 ${selected ? 'text-stone-300' : 'text-stone-500'}`}>
+                  {view.slots.some(s => s.min > 0)
+                    ? `${view.gaps.length} gap � ${view.gapMinutes} min underskott`
+                    : 'Inga krav satta än'}
+                </p>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       <div className="bg-white rounded-2xl ring-1 ring-stone-200 p-5">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="display-font text-xl text-stone-800">{dayLabel}{isFriday && hasFridaySetup ? ` · vecka ${currentFridayWeek}` : ''}</h2>
+        <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
+          <div>
+            <h2 className="display-font text-xl text-stone-800">{dayLabel}{isFriday && hasFridaySetup ? ` · vecka ${currentFridayWeek}` : ''}</h2>
+            {focusedCoverage && (
+              <p className="text-xs text-stone-500 mt-1">
+                Visar bemanning för <span style={{ fontWeight: 500 }}>{focusedCoverage.label.toLowerCase()}</span>
+              </p>
+            )}
+          </div>
           <div className="flex gap-3 text-xs flex-wrap">
             {departments.map(d => (
               <span key={d.id} className="flex items-center gap-1.5">
@@ -1077,10 +1258,12 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
         </div>
 
         <div className="space-y-1.5">
-          {dayData.present.length === 0 && (
-            <p className="text-sm text-stone-400 italic py-4 text-center">Ingen personal arbetar denna {isFriday ? 'fredag' : 'dag'}</p>
+          {visiblePresent.length === 0 && (
+            <p className="text-sm text-stone-400 italic py-4 text-center">
+              {focusedCoverage?.scopeType === COVERAGE_DEPARTMENT ? 'Ingen personal från denna avdelning arbetar just nu' : `Ingen personal arbetar denna ${isFriday ? 'fredag' : 'dag'}`}
+            </p>
           )}
-          {dayData.present.map(p => {
+          {visiblePresent.map(p => {
             const dept = getDept(p.deptId, departments);
             const soft = softColor(dept.color);
             const shiftLabel = isFriday
@@ -1108,47 +1291,49 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
           })}
         </div>
 
-        <div className="mt-6 pt-4 border-t border-stone-100">
-          <div className="flex items-center justify-between mb-2">
-            <p className="text-xs uppercase tracking-wider text-stone-500">Antal personal per 15 min</p>
-            {dayData.gaps.length > 0 ? (
-              <span className="text-xs text-orange-600 flex items-center gap-1">
-                <AlertCircle size={12} />{dayData.gaps.length} gap mot bemanningskrav
-              </span>
-            ) : (
-              <span className="text-xs text-emerald-600 flex items-center gap-1">
-                <CheckCircle2 size={12} />Täcker alla krav
-              </span>
-            )}
+        {focusedCoverage && (
+          <div className="mt-6 pt-4 border-t border-stone-100">
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-xs uppercase tracking-wider text-stone-500">Antal personal per 15 min</p>
+              {focusedCoverage.gaps.length > 0 ? (
+                <span className="text-xs text-orange-600 flex items-center gap-1">
+                  <AlertCircle size={12} />{focusedCoverage.gaps.length} gap mot bemanningskrav
+                </span>
+              ) : (
+                <span className="text-xs text-emerald-600 flex items-center gap-1">
+                  <CheckCircle2 size={12} />Täcker alla krav
+                </span>
+              )}
+            </div>
+            <div className="ml-32 relative h-16 bg-stone-50 rounded-md overflow-hidden">
+              {focusedCoverage.slots.map(s => {
+                const w = 100 / focusedCoverage.slots.length;
+                const left = ((s.start - TIMELINE_START) / TIMELINE_RANGE) * 100;
+                const h = (s.count / maxCount) * 100;
+                return <div key={s.start} className="absolute bottom-0" style={{ left: `${left}%`, width: `${w}%`, height: `${h}%`,
+                  backgroundColor: s.gap ? '#F59E0B' : focusedCoverage.color, opacity: s.gap ? 0.85 : 0.55 }} />;
+              })}
+              {focusedCoverage.slots.map(s => {
+                const left = ((s.start - TIMELINE_START) / TIMELINE_RANGE) * 100;
+                const w = 100 / focusedCoverage.slots.length;
+                const h = (s.min / maxCount) * 100;
+                return <div key={`m${s.start}`} className="absolute" style={{ left: `${left}%`, width: `${w}%`,
+                  bottom: `${h}%`, height: '1px', backgroundColor: '#dc2626', opacity: 0.6 }} />;
+              })}
+            </div>
+            <div className="ml-32 mt-1 flex items-center gap-4 text-[10px] text-stone-500">
+              <span className="flex items-center gap-1"><span className="w-2 h-2" style={{ backgroundColor: focusedCoverage.color, opacity: 0.55 }} />Faktisk</span>
+              <span className="flex items-center gap-1"><span className="w-2 h-2" style={{ backgroundColor: '#F59E0B', opacity: 0.85 }} />Under min</span>
+              <span className="flex items-center gap-1"><span className="w-3 h-px" style={{ backgroundColor: '#dc2626' }} />Krav</span>
+            </div>
           </div>
-          <div className="ml-32 relative h-16 bg-stone-50 rounded-md overflow-hidden">
-            {dayData.slots.map(s => {
-              const w = 100 / dayData.slots.length;
-              const left = ((s.start - TIMELINE_START) / TIMELINE_RANGE) * 100;
-              const h = (s.count / maxCount) * 100;
-              return <div key={s.start} className="absolute bottom-0" style={{ left: `${left}%`, width: `${w}%`, height: `${h}%`,
-                backgroundColor: s.gap ? '#F59E0B' : '#475569', opacity: s.gap ? 0.85 : 0.55 }} />;
-            })}
-            {dayData.slots.map(s => {
-              const left = ((s.start - TIMELINE_START) / TIMELINE_RANGE) * 100;
-              const w = 100 / dayData.slots.length;
-              const h = (s.min / maxCount) * 100;
-              return <div key={`m${s.start}`} className="absolute" style={{ left: `${left}%`, width: `${w}%`,
-                bottom: `${h}%`, height: '1px', backgroundColor: '#dc2626', opacity: 0.6 }} />;
-            })}
-          </div>
-          <div className="ml-32 mt-1 flex items-center gap-4 text-[10px] text-stone-500">
-            <span className="flex items-center gap-1"><span className="w-2 h-2" style={{ backgroundColor: '#475569', opacity: 0.55 }} />Faktisk</span>
-            <span className="flex items-center gap-1"><span className="w-2 h-2" style={{ backgroundColor: '#F59E0B', opacity: 0.85 }} />Under min</span>
-            <span className="flex items-center gap-1"><span className="w-3 h-px" style={{ backgroundColor: '#dc2626' }} />Krav</span>
-          </div>
-        </div>
+        )}
       </div>
     </div>
   );
 }
 
-function StaffView({ staff, violations, onEdit, onAdd, onLoadExample, departments }) {
+function StaffView({ staff, fridayCycleWeeks, fridayTemplateRotation, violations, onEdit, onAdd, onLoadExample, departments }) {
   if (staff.length === 0) {
     return (
       <div className="bg-white rounded-2xl ring-1 ring-stone-200 p-12 text-center">
@@ -1192,7 +1377,7 @@ function StaffView({ staff, violations, onEdit, onAdd, onLoadExample, department
           </thead>
           <tbody>
             {staff.map(s => {
-              const wm = weeklyMinutes(s);
+              const wm = weeklyMinutes(s, fridayCycleWeeks, fridayTemplateRotation);
               const targetMin = getTargetMin(s);
               const diff = wm - targetMin;
               const off = Math.abs(diff) > 5;
@@ -1209,6 +1394,7 @@ function StaffView({ staff, violations, onEdit, onAdd, onLoadExample, department
               const parityKeys = Object.keys(s.parityOverrides || {}).filter(k => s.parityOverrides[k] && Object.values(s.parityOverrides[k]).some(v => v != null));
               if (parityKeys.length > 0) tags.push(`Varannan: ${parityKeys.map(k => k === 'even' ? 'jämn' : 'udda').join(', ')}`);
               if ((s.daysOff || []).length > 0) tags.push(`Ledig ${s.daysOff.map(d => DAYS.find(x => x.key === d).short).join(', ')}`);
+              if (s.hasFridayRotation && s.fridayUseTemplate) tags.push(`Fredagsmall: start v${s.fridayTemplateStartWeek || 1}`);
               if (!s.hasFridayRotation && s.fridayShift) tags.push('Fast fredag');
               return (
                 <tr key={s.id} className="border-b border-stone-100 last:border-0 hover:bg-stone-50/50">
@@ -1272,65 +1458,100 @@ function StaffView({ staff, violations, onEdit, onAdd, onLoadExample, department
   );
 }
 
-function RulesView({ blocks, setBlocks }) {
+function RulesView({ blocks, setBlocks, departments }) {
   const updateBlock = (id, patch) => setBlocks(blocks.map(b => b.id === id ? { ...b, ...patch } : b));
   const removeBlock = (id) => setBlocks(blocks.filter(b => b.id !== id));
-  const addBlock = () => {
+  const addBlock = (scopeType = COVERAGE_SHARED) => {
     const newId = Math.max(0, ...blocks.map(b => b.id)) + 1;
     const lastEnd = blocks.length > 0 ? Math.max(...blocks.map(b => b.end)) : 480;
-    setBlocks([...blocks, { id: newId, start: lastEnd, end: lastEnd + 60, min: 1, label: 'Nytt block' }]);
+    setBlocks([...blocks, {
+      id: newId,
+      start: lastEnd,
+      end: lastEnd + 60,
+      min: 1,
+      label: 'Nytt block',
+      scopeType,
+      deptId: scopeType === COVERAGE_DEPARTMENT ? (departments[0]?.id || '') : null,
+    }]);
   };
 
-  // Sortera kronologiskt för visning
   const sorted = [...blocks].sort((a, b) => a.start - b.start);
-
-  // Visualisera täckning över hela dagen
-  const slots = blocksToSlots(blocks);
-  const maxMin = Math.max(...slots.map(s => s.min), 1);
+  const scopeViews = buildCoverageScopes(blocks, departments);
+  const scopeOptions = [
+    { value: COVERAGE_SHARED, label: 'Gemensam bemanning' },
+    ...departments.map(d => ({ value: `dept:${d.id}`, label: d.name })),
+  ];
 
   return (
     <div className="space-y-4">
       <TabIntro>
-        Här definierar du hur många personer som behöver vara på plats vid olika tider — t.ex. fler vid morgonöppning och eftermiddag, färre under lunchen. Appen flaggar i Vecka-vyn om kraven inte täcks och försöker uppfylla dem när den genererar förslag.
+        Här definierar du hur många personer som behöver vara på plats vid olika tider. Block kan gälla hela fritids tillsammans eller en viss avdelning, vilket gör att ni kan ha sammanslagen morgon men olika eftermiddagsstarter.
       </TabIntro>
       <div className="bg-white rounded-2xl ring-1 ring-stone-200 p-5">
-        <div className="flex items-start justify-between mb-4">
+        <div className="flex items-start justify-between mb-4 gap-4 flex-wrap">
           <div>
             <h2 className="display-font text-xl text-stone-800">Bemanningskrav</h2>
-            <p className="text-sm text-stone-500 mt-0.5">Definiera tidsblock och minsta antal personal i varje. Justera inför nytt läsår.</p>
+            <p className="text-sm text-stone-500 mt-0.5">Definiera gemensamma block och avdelningsblock. Olika avdelningar kan starta olika tider.</p>
+          </div>
+          <div className="flex gap-2 flex-wrap">
+            <button onClick={() => addBlock(COVERAGE_SHARED)}
+              className="text-sm text-stone-700 hover:text-stone-900 flex items-center gap-1.5 px-3 py-2 rounded-lg bg-stone-100 hover:bg-stone-200">
+              <Plus size={14} />Gemensamt block
+            </button>
+            <button onClick={() => addBlock(COVERAGE_DEPARTMENT)} disabled={departments.length === 0}
+              className="text-sm text-stone-700 hover:text-stone-900 flex items-center gap-1.5 px-3 py-2 rounded-lg bg-stone-100 hover:bg-stone-200 disabled:opacity-50">
+              <Plus size={14} />Avdelningsblock
+            </button>
           </div>
         </div>
 
-        {/* Visuell översikt */}
-        <div className="mb-5">
-          <p className="text-[10px] uppercase tracking-wider text-stone-500 mb-1.5">Visualisering</p>
-          <div className="relative h-12 bg-stone-50 rounded-md overflow-hidden ring-1 ring-stone-100">
-            {slots.map(s => {
-              const left = ((s.start - TIMELINE_START) / TIMELINE_RANGE) * 100;
-              const w = 100 / slots.length;
-              const h = (s.min / maxMin) * 100;
-              return <div key={s.start} className="absolute bottom-0"
-                style={{ left: `${left}%`, width: `${w}%`, height: `${h}%`, backgroundColor: '#475569', opacity: 0.55 }} />;
-            })}
-            {[6, 8, 10, 12, 14, 16, 18].map(h => (
-              <div key={h} className="absolute top-0 bottom-0 border-l border-stone-300 text-[9px] text-stone-400 pl-1"
-                style={{ left: `${pctFromMin(h*60)}%` }}>{h}</div>
-            ))}
-          </div>
+        <div className="grid md:grid-cols-2 xl:grid-cols-4 gap-3 mb-5">
+          {scopeViews.map(view => {
+            const maxMin = Math.max(...view.slots.map(s => s.min), 1);
+            return (
+              <div key={view.key} className="rounded-xl ring-1 ring-stone-200 bg-stone-50/70 p-3">
+                <div className="flex items-center justify-between gap-3 mb-2">
+                  <span className="text-sm text-stone-800" style={{ fontWeight: 500 }}>{view.label}</span>
+                  <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: view.color }} />
+                </div>
+                <div className="relative h-12 bg-white rounded-md overflow-hidden ring-1 ring-stone-100">
+                  {view.slots.map(s => {
+                    const left = ((s.start - TIMELINE_START) / TIMELINE_RANGE) * 100;
+                    const w = 100 / view.slots.length;
+                    const h = (s.min / maxMin) * 100;
+                    return <div key={s.start} className="absolute bottom-0"
+                      style={{ left: `${left}%`, width: `${w}%`, height: `${h}%`, backgroundColor: view.color, opacity: 0.55 }} />;
+                  })}
+                </div>
+                <p className="text-[10px] text-stone-500 mt-2">
+                  {view.slots.some(s => s.min > 0) ? 'Minimikrav över dagen' : 'Inga block satta än'}
+                </p>
+              </div>
+            );
+          })}
         </div>
 
-        {/* Redigerbar lista */}
         <div className="space-y-2">
           <div className="grid grid-cols-12 gap-2 text-[10px] uppercase tracking-wider text-stone-500 px-2 pb-1">
             <div className="col-span-3">Namn på block</div>
+            <div className="col-span-3">Gäller för</div>
             <div className="col-span-3">Tid</div>
-            <div className="col-span-4">Minsta personal</div>
-            <div className="col-span-2"></div>
+            <div className="col-span-2">Minsta personal</div>
+            <div className="col-span-1"></div>
           </div>
           {sorted.map(b => (
             <div key={b.id} className="grid grid-cols-12 gap-2 items-center py-2 px-2 rounded-lg hover:bg-stone-50">
               <input className="rules-input col-span-3" value={b.label}
                 onChange={e => updateBlock(b.id, { label: e.target.value })} placeholder="ex. Morgonfritids" />
+              <select className="rules-input col-span-3"
+                value={b.scopeType === COVERAGE_DEPARTMENT ? `dept:${b.deptId}` : COVERAGE_SHARED}
+                onChange={e => {
+                  const next = e.target.value;
+                  if (next === COVERAGE_SHARED) updateBlock(b.id, { scopeType: COVERAGE_SHARED, deptId: null });
+                  else updateBlock(b.id, { scopeType: COVERAGE_DEPARTMENT, deptId: next.replace('dept:', '') });
+                }}>
+                {scopeOptions.map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+              </select>
               <div className="col-span-3 flex items-center gap-1">
                 <input type="time" className="rules-input flex-1"
                   value={minToTime(b.start)} onChange={e => updateBlock(b.id, { start: timeToMin(e.target.value) })} />
@@ -1338,15 +1559,14 @@ function RulesView({ blocks, setBlocks }) {
                 <input type="time" className="rules-input flex-1"
                   value={minToTime(b.end)} onChange={e => updateBlock(b.id, { end: timeToMin(e.target.value) })} />
               </div>
-              <div className="col-span-4 flex items-center gap-2">
+              <div className="col-span-2 flex items-center gap-2">
                 <button type="button" onClick={() => updateBlock(b.id, { min: Math.max(0, b.min - 1) })}
                   className="w-7 h-7 rounded bg-stone-100 hover:bg-stone-200 text-stone-700">−</button>
                 <span className="display-font text-lg text-stone-800 w-8 text-center tabular-nums">{b.min}</span>
                 <button type="button" onClick={() => updateBlock(b.id, { min: b.min + 1 })}
                   className="w-7 h-7 rounded bg-stone-100 hover:bg-stone-200 text-stone-700">+</button>
-                <span className="text-xs text-stone-500 ml-1">personer</span>
               </div>
-              <div className="col-span-2 flex justify-end">
+              <div className="col-span-1 flex justify-end">
                 <button onClick={() => removeBlock(b.id)} className="text-stone-400 hover:text-red-600 p-1">
                   <Trash2 size={14} />
                 </button>
@@ -1355,14 +1575,8 @@ function RulesView({ blocks, setBlocks }) {
           ))}
         </div>
 
-        <button onClick={addBlock}
-          className="mt-3 text-sm text-stone-700 hover:text-stone-900 flex items-center gap-1.5 px-3 py-2 rounded-lg hover:bg-stone-100">
-          <Plus size={14} />Lägg till block
-        </button>
-
         <div className="mt-5 pt-4 border-t border-stone-100 text-xs text-stone-500">
-          <p>💡 Tips: ändringar här påverkar både täckningsberäkningen i Vecka-vyn och vad generatorn försöker uppfylla.
-          Om block överlappar används det första (i tidsordning).</p>
+          <p>Tips: skapa ett gemensamt block för t.ex. 06:00–08:00 och lägg sedan avdelningsblock med olika starttider, t.ex. 13:15 för F–2 och 14:15 för åk 3–5. Om block överlappar inom samma vy används det första i tidsordning.</p>
         </div>
       </div>
 
@@ -1376,13 +1590,17 @@ function RulesView({ blocks, setBlocks }) {
 
 // -------- Settings View (departments etc.) --------
 
-function SettingsView({ departments, setDepartments, staff, setStaff,
-                        fridayCycleWeeks, setFridayCycleWeeks, onLoadExample, onClearAll }) {
+function SettingsView({ departments, setDepartments, staff, setStaff, coverageBlocks, setCoverageBlocks,
+                        fridayTemplateRotation, setFridayTemplateRotation, fridayCycleWeeks, setFridayCycleWeeks, onLoadExample, onClearAll }) {
   const updateDept = (id, patch) => setDepartments(departments.map(d => d.id === id ? { ...d, ...patch } : d));
   const removeDept = (id) => {
     const usedBy = staff.filter(s => s.deptId === id);
     if (usedBy.length > 0) {
       if (!confirm(`${usedBy.length} person(er) tillhör denna avdelning: ${usedBy.map(s => s.name).join(', ')}. De kommer behöva bytas till en annan avdelning manuellt. Fortsätt?`)) return;
+    }
+    const coverageForDept = coverageBlocks.filter(b => b.scopeType === COVERAGE_DEPARTMENT && b.deptId === id).length;
+    if (coverageForDept > 0) {
+      setCoverageBlocks(coverageBlocks.filter(b => !(b.scopeType === COVERAGE_DEPARTMENT && b.deptId === id)));
     }
     setDepartments(departments.filter(d => d.id !== id));
   };
@@ -1396,6 +1614,18 @@ function SettingsView({ departments, setDepartments, staff, setStaff,
   const counts = Object.fromEntries(departments.map(d => [d.id, staff.filter(s => s.deptId === d.id).length]));
   const orphaned = staff.filter(s => !departments.find(d => d.id === s.deptId));
   const rotators = staff.filter(s => s.hasFridayRotation);
+  const updateTemplateWeek = (weekIdx, idx, val) => {
+    const next = resizeRotation(fridayTemplateRotation, fridayCycleWeeks);
+    const cur = next[weekIdx] || ['',''];
+    next[weekIdx] = idx === 0 ? [val, cur[1]] : [cur[0], val];
+    if (!next[weekIdx][0] && !next[weekIdx][1]) next[weekIdx] = null;
+    setFridayTemplateRotation(next);
+  };
+  const setTemplateWeekOff = (weekIdx, off) => {
+    const next = resizeRotation(fridayTemplateRotation, fridayCycleWeeks);
+    next[weekIdx] = off ? null : ['07:00','15:30'];
+    setFridayTemplateRotation(next);
+  };
 
   return (
     <div className="space-y-4">
@@ -1464,7 +1694,7 @@ function SettingsView({ departments, setDepartments, staff, setStaff,
           <div>
             <h2 className="display-font text-xl text-stone-800">Fredagsrullen</h2>
             <p className="text-sm text-stone-500 mt-0.5 max-w-md">
-              Cykellängd är hur många veckor rullen är. Varje person fyller i sina egna fredagstider — en rad per vecka — när du redigerar dem i Personal-fliken.
+              Definiera gärna en central mall här först. Sedan kan varje person välja vilken vecka i mallen som ska vara deras vecka 1, och vid behov lägga egna undantag.
             </p>
           </div>
           <div className="flex items-center gap-2 bg-stone-50 rounded-lg px-3 py-2">
@@ -1474,6 +1704,42 @@ function SettingsView({ departments, setDepartments, staff, setStaff,
               onChange={e => setFridayCycleWeeks(Math.max(1, Math.min(20, parseInt(e.target.value) || 1)))} />
             <span className="text-xs text-stone-600">veckor</span>
           </div>
+        </div>
+
+        <div className="mb-5">
+          <p className="text-xs uppercase tracking-wider text-stone-500 mb-2">Central fredagsmall</p>
+          <div className="space-y-1.5">
+            {Array.from({ length: fridayCycleWeeks }).map((_, w) => {
+              const sh = fridayTemplateRotation[w];
+              const isOff = sh == null;
+              return (
+                <div key={w} className="flex items-center gap-2 flex-wrap rounded-lg bg-stone-50 px-3 py-2">
+                  <span className="display-font text-sm text-stone-700 w-12 tabular-nums text-center">
+                    v{w + 1}
+                  </span>
+                  <input type="time" className="rules-input w-28" disabled={isOff}
+                    value={sh ? sh[0] : ''}
+                    onChange={e => updateTemplateWeek(w, 0, e.target.value)} />
+                  <span className="text-stone-400 text-xs">–</span>
+                  <input type="time" className="rules-input w-28" disabled={isOff}
+                    value={sh ? sh[1] : ''}
+                    onChange={e => updateTemplateWeek(w, 1, e.target.value)} />
+                  {!isOff && (
+                    <span className="text-[10px] text-stone-500 tabular-nums ml-1">
+                      {minToHM(dayMinutes(sh))}
+                    </span>
+                  )}
+                  <button type="button" onClick={() => setTemplateWeekOff(w, !isOff)}
+                    className={`ml-auto text-[10px] px-2 py-0.5 rounded ${isOff ? 'bg-stone-700 text-white' : 'bg-stone-100 text-stone-600 hover:bg-stone-200'}`}>
+                    {isOff ? 'Ledig' : 'Markera som ledig'}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+          <p className="text-[10px] text-stone-400 mt-2">
+            Mallen används av personal som väljer "Central mall" i sin fredagsrull. De kan sedan ange startvecka och göra egna undantag.
+          </p>
         </div>
 
         {rotators.length === 0 ? (
@@ -1496,9 +1762,12 @@ function SettingsView({ departments, setDepartments, staff, setStaff,
                 <tbody>
                   {rotators.map(p => (
                     <tr key={p.id} className="border-t border-stone-100">
-                      <td className="px-2 py-1.5 sticky left-0 bg-white text-stone-800" style={{ fontWeight: 500 }}>{p.name}</td>
+                      <td className="px-2 py-1.5 sticky left-0 bg-white text-stone-800">
+                        <div style={{ fontWeight: 500 }}>{p.name}</div>
+                        {p.fridayUseTemplate && <div className="text-[10px] text-stone-400">mall · start v{p.fridayTemplateStartWeek || 1}</div>}
+                      </td>
                       {Array.from({ length: fridayCycleWeeks }).map((_, w) => {
-                        const sh = getFridayShift(p, w + 1, fridayCycleWeeks);
+                        const sh = getFridayShift(p, w + 1, fridayCycleWeeks, fridayTemplateRotation);
                         return (
                           <td key={w} className="px-2 py-1.5 text-center text-stone-600 tabular-nums">
                             {sh ? `${sh[0]}–${sh[1]}` : <span className="text-stone-300">—</span>}
@@ -1554,20 +1823,24 @@ function SettingsView({ departments, setDepartments, staff, setStaff,
 
 // -------- Edit Modal --------
 
-function StaffEditModal({ staff, departments, fridayCycleWeeks, onSave, onClose, onRemove }) {
+function StaffEditModal({ staff, departments, fridayCycleWeeks, fridayTemplateRotation, onSave, onClose, onRemove }) {
   const [form, setForm] = useState(() => {
-    const cp = JSON.parse(JSON.stringify(staff));
+    const cp = { ...P({}), ...JSON.parse(JSON.stringify(staff)) };
     // Säkerställ att rotationen har rätt längd när modalen öppnas
     if (cp.hasFridayRotation) {
       cp.fridayRotation = resizeRotation(cp.fridayRotation, fridayCycleWeeks);
     }
+    cp.fridayTemplateStartWeek = Math.min(Math.max(1, cp.fridayTemplateStartWeek || 1), fridayCycleWeeks);
+    cp.fridayTemplateOverrides = cp.fridayTemplateOverrides || {};
     return cp;
   });
-  const wm = weeklyMinutes(form, fridayCycleWeeks);
+  const wm = weeklyMinutes(form, fridayCycleWeeks, fridayTemplateRotation);
   const targetMin = getTargetMin(form);
   const diff = wm - targetMin;
   const off = Math.abs(diff) > 5;
   const dept = getDept(form.deptId, departments);
+  const effectiveFridayRotation = buildEffectiveFridayRotation(form, fridayCycleWeeks, fridayTemplateRotation);
+  const fixedFridayOff = !form.hasFridayRotation && !form.fridayShift;
 
   // Uppdatera en enskild fredagsvecka i rullen
   const updateFridayWeek = (weekIdx, idx, val) => {
@@ -1581,6 +1854,62 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, onSave, onClose,
     const next = resizeRotation(form.fridayRotation, fridayCycleWeeks);
     next[weekIdx] = off ? null : ['07:00','15:30'];
     setForm({ ...form, fridayRotation: next });
+  };
+  const updateFridayTemplateOverride = (weekIdx, idx, val) => {
+    const week = String(weekIdx + 1);
+    const nextOverrides = { ...(form.fridayTemplateOverrides || {}) };
+    const base = getTemplateFridayShift(fridayTemplateRotation, weekIdx + 1, form.fridayTemplateStartWeek || 1, fridayCycleWeeks);
+    const cur = hasFridayTemplateOverride(form, weekIdx + 1)
+      ? (nextOverrides[week] || ['',''])
+      : (base || ['','']);
+    const next = idx === 0 ? [val, cur[1] || ''] : [cur[0] || '', val];
+    nextOverrides[week] = (!next[0] && !next[1]) ? null : next;
+    setForm({ ...form, fridayTemplateOverrides: nextOverrides });
+  };
+  const resetFridayTemplateOverride = (weekIdx) => {
+    const week = String(weekIdx + 1);
+    const nextOverrides = { ...(form.fridayTemplateOverrides || {}) };
+    delete nextOverrides[week];
+    setForm({ ...form, fridayTemplateOverrides: nextOverrides });
+  };
+  const setTemplateWeekOff = (weekIdx, off) => {
+    const week = String(weekIdx + 1);
+    const nextOverrides = { ...(form.fridayTemplateOverrides || {}) };
+    if (!off) {
+      delete nextOverrides[week];
+    } else {
+      nextOverrides[week] = null;
+    }
+    setForm({ ...form, fridayTemplateOverrides: nextOverrides });
+  };
+  const enableFridayTemplateWeek = (weekIdx) => {
+    const week = String(weekIdx + 1);
+    const nextOverrides = { ...(form.fridayTemplateOverrides || {}) };
+    const base = getTemplateFridayShift(fridayTemplateRotation, weekIdx + 1, form.fridayTemplateStartWeek || 1, fridayCycleWeeks);
+    nextOverrides[week] = base || ['07:00','15:30'];
+    setForm({ ...form, fridayTemplateOverrides: nextOverrides });
+  };
+  const switchToManualFridayRotation = () => {
+    setForm({
+      ...form,
+      fridayUseTemplate: false,
+      fridayRotation: effectiveFridayRotation,
+      fridayTemplateOverrides: form.fridayTemplateOverrides || {},
+    });
+  };
+  const switchToTemplateFridayRotation = () => {
+    setForm({
+      ...form,
+      fridayUseTemplate: true,
+      fridayTemplateStartWeek: Math.min(Math.max(1, form.fridayTemplateStartWeek || 1), fridayCycleWeeks),
+      fridayTemplateOverrides: form.fridayTemplateOverrides || {},
+    });
+  };
+  const setFixedFridayOff = (off) => {
+    setForm({ ...form, fridayShift: off ? null : (form.fridayShift || ['07:45','15:45']) });
+  };
+  const scrollToFridaySection = () => {
+    document.getElementById('staff-edit-friday-section')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
 
   const updateShift = (day, idx, val) => {
@@ -1650,7 +1979,7 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, onSave, onClose,
           </Section>
 
           {/* Pass per dag */}
-          <Section title="Pass mån–tor">
+          <Section title="Pass vecka">
             <div className="space-y-2">
               {DAYS.map(d => {
                 const isOff = (form.daysOff || []).includes(d.key);
@@ -1670,6 +1999,42 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, onSave, onClose,
                   </div>
                 );
               })}
+              <div className={`flex items-center gap-3 flex-wrap py-1 rounded ${fixedFridayOff ? 'opacity-60' : ''}`}>
+                <span className="text-sm text-stone-700 w-20">Fredag</span>
+                {!form.hasFridayRotation ? (
+                  <>
+                    <input type="time" className="input w-32" value={form.fridayShift?.[0] || ''} disabled={fixedFridayOff}
+                      onChange={e => setForm({ ...form, fridayShift: [e.target.value, form.fridayShift?.[1] || ''] })} />
+                    <span className="text-stone-400">–</span>
+                    <input type="time" className="input w-32" value={form.fridayShift?.[1] || ''} disabled={fixedFridayOff}
+                      onChange={e => setForm({ ...form, fridayShift: [form.fridayShift?.[0] || '', e.target.value] })} />
+                    {!fixedFridayOff && form.fridayShift?.[0] && form.fridayShift?.[1] && (
+                      <span className="text-xs text-stone-500 ml-1">{minToHM(dayMinutes(form.fridayShift))}</span>
+                    )}
+                    <button type="button" onClick={() => setFixedFridayOff(!fixedFridayOff)}
+                      className={`ml-auto text-[10px] px-2 py-0.5 rounded ${fixedFridayOff ? 'bg-stone-700 text-white' : 'bg-stone-100 text-stone-600 hover:bg-stone-200'}`}>
+                      {fixedFridayOff ? 'Ledig' : 'Markera som ledig'}
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <div className="flex-1 min-w-[260px] rounded-lg bg-stone-50 px-3 py-2 ring-1 ring-stone-200">
+                      <p className="text-xs text-stone-700" style={{ fontWeight: 500 }}>
+                        {form.fridayUseTemplate ? 'Central mall' : 'Egen rull'}
+                      </p>
+                      <p className="text-[11px] text-stone-500 mt-0.5">
+                        {form.fridayUseTemplate
+                          ? `Startar på mallens vecka ${form.fridayTemplateStartWeek || 1}. Du kan lägga undantag längre ner.`
+                          : `Egna fredagstider för ${fridayCycleWeeks} veckor redigeras längre ner.`}
+                      </p>
+                    </div>
+                    <button type="button" onClick={scrollToFridaySection}
+                      className="ml-auto text-[10px] px-2 py-0.5 rounded bg-stone-100 text-stone-600 hover:bg-stone-200">
+                      Gå till fredagar
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
           </Section>
 
@@ -1752,6 +2117,7 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, onSave, onClose,
 
           {/* Fredag */}
           <Section title="Fredagar">
+            <div id="staff-edit-friday-section" />
             <Toggle checked={form.hasFridayRotation}
               onChange={v => setForm({
                 ...form,
@@ -1764,13 +2130,46 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, onSave, onClose,
 
             {form.hasFridayRotation && (
               <div className="mt-3 ml-6">
+                <div className="flex gap-2 flex-wrap mb-3">
+                  <button type="button" onClick={switchToTemplateFridayRotation}
+                    className={`px-3 py-1.5 rounded-full text-xs transition ${form.fridayUseTemplate ? 'bg-stone-800 text-white' : 'bg-stone-100 text-stone-700 hover:bg-stone-200'}`}>
+                    Central mall
+                  </button>
+                  <button type="button" onClick={switchToManualFridayRotation}
+                    className={`px-3 py-1.5 rounded-full text-xs transition ${!form.fridayUseTemplate ? 'bg-stone-800 text-white' : 'bg-stone-100 text-stone-700 hover:bg-stone-200'}`}>
+                    Egen rull
+                  </button>
+                </div>
+
+                {form.fridayUseTemplate && (
+                  <div className="mb-4 rounded-lg bg-stone-50 ring-1 ring-stone-200 p-3">
+                    <div className="flex items-center gap-3 flex-wrap">
+                      <span className="text-xs text-stone-600">Min vecka 1 ska använda mallens vecka</span>
+                      <select className="input w-28"
+                        value={form.fridayTemplateStartWeek || 1}
+                        onChange={e => setForm({ ...form, fridayTemplateStartWeek: Math.min(Math.max(1, parseInt(e.target.value) || 1), fridayCycleWeeks) })}>
+                        {Array.from({ length: fridayCycleWeeks }).map((_, w) => (
+                          <option key={w} value={w + 1}>v{w + 1}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <p className="text-[10px] text-stone-500 mt-2">
+                      Exempel: om du väljer mallens vecka 3 blir din egen vecka 1 samma pass som mallens vecka 3.
+                    </p>
+                  </div>
+                )}
+
                 <p className="text-[10px] uppercase tracking-wider text-stone-500 mb-2">
-                  Fredagstider per vecka i cykeln
+                  {form.fridayUseTemplate ? 'Resultat per vecka i cykeln' : 'Fredagstider per vecka i cykeln'}
                 </p>
                 <div className="space-y-1.5">
                   {Array.from({ length: fridayCycleWeeks }).map((_, w) => {
-                    const sh = (form.fridayRotation || [])[w];
+                    const sh = form.fridayUseTemplate ? effectiveFridayRotation[w] : (form.fridayRotation || [])[w];
                     const isOff = sh == null;
+                    const hasOverride = form.fridayUseTemplate && hasFridayTemplateOverride(form, w + 1);
+                    const baseTemplateShift = form.fridayUseTemplate
+                      ? getTemplateFridayShift(fridayTemplateRotation, w + 1, form.fridayTemplateStartWeek || 1, fridayCycleWeeks)
+                      : null;
                     return (
                       <div key={w} className="flex items-center gap-2 flex-wrap">
                         <span className="display-font text-sm text-stone-700 w-10 tabular-nums text-center">
@@ -1778,20 +2177,46 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, onSave, onClose,
                         </span>
                         <input type="time" className="input w-28" disabled={isOff}
                           value={sh ? sh[0] : ''}
-                          onChange={e => updateFridayWeek(w, 0, e.target.value)} />
+                          onChange={e => form.fridayUseTemplate ? updateFridayTemplateOverride(w, 0, e.target.value) : updateFridayWeek(w, 0, e.target.value)} />
                         <span className="text-stone-400 text-xs">–</span>
                         <input type="time" className="input w-28" disabled={isOff}
                           value={sh ? sh[1] : ''}
-                          onChange={e => updateFridayWeek(w, 1, e.target.value)} />
+                          onChange={e => form.fridayUseTemplate ? updateFridayTemplateOverride(w, 1, e.target.value) : updateFridayWeek(w, 1, e.target.value)} />
                         {!isOff && (
                           <span className="text-[10px] text-stone-500 tabular-nums ml-1">
                             {minToHM(dayMinutes(sh))}
                           </span>
                         )}
-                        <button type="button" onClick={() => setWeekOff(w, !isOff)}
-                          className={`ml-auto text-[10px] px-2 py-0.5 rounded ${isOff ? 'bg-stone-700 text-white' : 'bg-stone-100 text-stone-600 hover:bg-stone-200'}`}>
-                          {isOff ? 'Ledig' : 'Markera som ledig'}
-                        </button>
+                        {form.fridayUseTemplate ? (
+                          <div className="ml-auto flex gap-2 flex-wrap justify-end">
+                            {isOff ? (
+                              <button type="button" onClick={() => enableFridayTemplateWeek(w)}
+                                className="text-[10px] px-2 py-0.5 rounded bg-stone-700 text-white">
+                                Lägg in tid
+                              </button>
+                            ) : (
+                              <button type="button" onClick={() => setTemplateWeekOff(w, true)}
+                                className="text-[10px] px-2 py-0.5 rounded bg-stone-100 text-stone-600 hover:bg-stone-200">
+                                Markera som ledig
+                              </button>
+                            )}
+                            {hasOverride ? (
+                              <button type="button" onClick={() => resetFridayTemplateOverride(w)}
+                                className="text-[10px] px-2 py-0.5 rounded bg-amber-50 text-amber-700 hover:bg-amber-100">
+                                Återgå till mall
+                              </button>
+                            ) : (
+                              <span className="text-[10px] text-stone-400">
+                                Mall {baseTemplateShift ? `${baseTemplateShift[0]}–${baseTemplateShift[1]}` : 'ledig'}
+                              </span>
+                            )}
+                          </div>
+                        ) : (
+                          <button type="button" onClick={() => setWeekOff(w, !isOff)}
+                            className={`ml-auto text-[10px] px-2 py-0.5 rounded ${isOff ? 'bg-stone-700 text-white' : 'bg-stone-100 text-stone-600 hover:bg-stone-200'}`}>
+                            {isOff ? 'Ledig' : 'Markera som ledig'}
+                          </button>
+                        )}
                       </div>
                     );
                   })}
@@ -2173,9 +2598,9 @@ function TourBubble({ step, onNext, onClose }) {
 
 // -------- Alternatives Modal --------
 
-function AlternativesModal({ alternatives, currentStaff, coverage, departments, onApply, onClose }) {
+function AlternativesModal({ alternatives, currentStaff, coverageScopes, fridayCycleWeeks, fridayTemplateRotation, departments, onApply, onClose }) {
   const [previewIdx, setPreviewIdx] = useState(0);
-  const currentSummary = summarizeSchedule(currentStaff, coverage);
+  const currentSummary = summarizeSchedule(currentStaff, coverageScopes, fridayCycleWeeks, fridayTemplateRotation);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: 'rgba(28, 25, 23, 0.5)' }} onClick={onClose}>
@@ -2236,7 +2661,7 @@ function AlternativesModal({ alternatives, currentStaff, coverage, departments, 
           </div>
 
           {/* Preview of selected */}
-          <PreviewSchedule staff={alternatives[previewIdx].staff} originalStaff={currentStaff} coverage={coverage} departments={departments} />
+          <PreviewSchedule staff={alternatives[previewIdx].staff} originalStaff={currentStaff} coverageScopes={coverageScopes} departments={departments} />
 
           <div className="flex justify-end gap-2 mt-6">
             <button onClick={onClose} className="px-4 py-2 text-sm rounded-lg text-stone-600 hover:bg-stone-100 transition">Avbryt</button>
@@ -2251,7 +2676,7 @@ function AlternativesModal({ alternatives, currentStaff, coverage, departments, 
   );
 }
 
-function PreviewSchedule({ staff, originalStaff, coverage, departments }) {
+function PreviewSchedule({ staff, originalStaff, coverageScopes, departments }) {
   const origMap = Object.fromEntries(originalStaff.map(p => [p.id, p]));
   return (
     <div className="space-y-4">
@@ -2260,8 +2685,10 @@ function PreviewSchedule({ staff, originalStaff, coverage, departments }) {
         const present = staff.filter(s => s.sched[d.key] && !(s.daysOff || []).includes(d.key))
           .map(s => ({ ...s, startMin: timeToMin(s.sched[d.key][0]), endMin: timeToMin(s.sched[d.key][1]) }))
           .sort((a, b) => a.startMin - b.startMin);
-        const slots = computeSlots(staff, d.key, coverage);
-        const gaps = slots.filter(s => s.count < s.min).length;
+        const gaps = coverageScopes.reduce((sum, scope) => {
+          const slots = computeSlots(staff, d.key, scope.slots, scope);
+          return sum + slots.filter(s => s.count < s.min).length;
+        }, 0);
         return (
           <div key={d.key} className="bg-white ring-1 ring-stone-200 rounded-lg p-3">
             <div className="flex items-center justify-between mb-2">
@@ -2309,3 +2736,5 @@ ReactDOM.createRoot(rootEl).render(React.createElement(FritidsSchemaApp));
 </script>
 </body>
 </html>
+
+
