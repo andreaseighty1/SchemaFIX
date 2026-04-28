@@ -186,6 +186,8 @@ const DAYS = [
   { key: 'wed', label: 'Onsdag', short: 'ons' },
   { key: 'thu', label: 'Torsdag', short: 'tor' },
 ];
+const ALL_DAY_KEYS = [...DAYS.map(d => d.key), 'fri'];
+const CONSTRAINT_KEYS = ['earliestStart', 'latestStart', 'earliestEnd', 'latestEnd'];
 
 // Standardvärden för alla parametrar — gör koden nedan mer läsbar
 const DEFAULTS = {
@@ -364,6 +366,179 @@ function timeToMin(t) { if (!t) return null; const [h, m] = t.split(':').map(Num
 function minToTime(m) { const h = Math.floor(m / 60); const mm = m % 60; return `${String(h).padStart(2, '0')}:${String(mm).padStart(2, '0')}`; }
 function minToHM(min) { const h = Math.floor(Math.abs(min) / 60); const m = Math.abs(min) % 60; const sign = min < 0 ? '-' : ''; return `${sign}${h} h ${m} min`; }
 function dayMinutes(sched) { return timeToMin(sched[1]) - timeToMin(sched[0]); }
+function clamp(value, min, max) { return Math.min(Math.max(value, min), max); }
+function roundToQuarter(min) { return Math.round(min / 15) * 15; }
+function asNumber(value, fallback = null) {
+  const num = typeof value === 'number' ? value : (typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN);
+  return Number.isFinite(num) ? num : fallback;
+}
+function isTimeString(value) {
+  return typeof value === 'string' && /^\d{2}:\d{2}$/.test(value) && Number.isFinite(timeToMin(value));
+}
+function normalizeShift(shift) {
+  if (!Array.isArray(shift) || shift.length < 2) return null;
+  const start = isTimeString(shift[0]) ? shift[0] : '';
+  const end = isTimeString(shift[1]) ? shift[1] : '';
+  return start && end ? [start, end] : null;
+}
+function normalizeWeekSched(sched) {
+  const next = {};
+  DAYS.forEach(d => {
+    const sh = normalizeShift(sched?.[d.key]);
+    if (sh) next[d.key] = sh;
+  });
+  return next;
+}
+function normalizeConstraintSet(set) {
+  const next = {};
+  CONSTRAINT_KEYS.forEach(key => {
+    const value = asNumber(set?.[key], null);
+    if (value != null) next[key] = value;
+  });
+  return next;
+}
+function normalizeDayOverrides(dayOverrides) {
+  const next = {};
+  DAYS.forEach(d => {
+    const clean = normalizeConstraintSet(dayOverrides?.[d.key]);
+    if (Object.keys(clean).length > 0) next[d.key] = clean;
+  });
+  return next;
+}
+function normalizeParityOverrides(parityOverrides) {
+  const next = {};
+  ['even', 'odd'].forEach(key => {
+    const clean = normalizeConstraintSet(parityOverrides?.[key]);
+    if (Object.keys(clean).length > 0) next[key] = clean;
+  });
+  return next;
+}
+function normalizeFridayTemplateOverrides(overrides, cycleWeeks = 8) {
+  const next = {};
+  Object.entries(overrides || {}).forEach(([weekKey, shift]) => {
+    const week = parseInt(weekKey, 10);
+    if (!Number.isFinite(week) || week < 1 || week > cycleWeeks) return;
+    if (shift === null) {
+      next[String(week)] = null;
+      return;
+    }
+    const cleanShift = normalizeShift(shift);
+    if (cleanShift) next[String(week)] = cleanShift;
+  });
+  return next;
+}
+function getStrictConstraints(person, dayKey) {
+  const evals = ['even', 'odd'].map(parity => ({
+    earliestStart: getConstraint(person, dayKey, 'earliestStart', parity),
+    latestStart:   getConstraint(person, dayKey, 'latestStart',   parity),
+    earliestEnd:   getConstraint(person, dayKey, 'earliestEnd',   parity),
+    latestEnd:     getConstraint(person, dayKey, 'latestEnd',     parity),
+  }));
+  return {
+    earliestStart: Math.max(...evals.map(e => e.earliestStart ?? -Infinity)),
+    latestStart:   Math.min(...evals.map(e => e.latestStart   ?? Infinity)),
+    earliestEnd:   Math.max(...evals.map(e => e.earliestEnd   ?? -Infinity)),
+    latestEnd:     Math.min(...evals.map(e => e.latestEnd     ?? Infinity)),
+  };
+}
+function normalizePerson(person, cycleWeeks = 8) {
+  const merged = { ...P({}), ...(person || {}) };
+  const hasFridayRotation = merged.hasFridayRotation !== false;
+  return {
+    ...merged,
+    name: merged.name || '',
+    role: merged.role || '',
+    deptId: merged.deptId || '',
+    fullTimeHours: asNumber(merged.fullTimeHours, DEFAULTS.fullTimeHours),
+    percent: asNumber(merged.percent, DEFAULTS.percent),
+    fixedTimes: !!merged.fixedTimes,
+    onlyAfternoons: !!merged.onlyAfternoons,
+    earliestStart: asNumber(merged.earliestStart, null),
+    latestStart: asNumber(merged.latestStart, null),
+    earliestEnd: asNumber(merged.earliestEnd, null),
+    latestEnd: asNumber(merged.latestEnd, null),
+    sched: normalizeWeekSched(merged.sched),
+    dayOverrides: normalizeDayOverrides(merged.dayOverrides),
+    parityOverrides: normalizeParityOverrides(merged.parityOverrides),
+    daysOff: Array.from(new Set((Array.isArray(merged.daysOff) ? merged.daysOff : []).filter(day => ALL_DAY_KEYS.includes(day)))),
+    hasFridayRotation,
+    fridayShift: hasFridayRotation ? null : normalizeShift(merged.fridayShift),
+    fridayRotation: hasFridayRotation ? resizeRotation((Array.isArray(merged.fridayRotation) ? merged.fridayRotation : []).map(normalizeShift), cycleWeeks) : null,
+    fridayUseTemplate: hasFridayRotation ? !!merged.fridayUseTemplate : false,
+    fridayTemplateStartWeek: clamp(asNumber(merged.fridayTemplateStartWeek, 1), 1, cycleWeeks),
+    fridayTemplateOverrides: hasFridayRotation ? normalizeFridayTemplateOverrides(merged.fridayTemplateOverrides, cycleWeeks) : {},
+  };
+}
+function normalizeStaffList(staff, cycleWeeks = 8) {
+  return (Array.isArray(staff) ? staff : []).map(person => normalizePerson(person, cycleWeeks));
+}
+function getSuggestedDayMinutes(person, cycleWeeks, fridayTemplateRotation = []) {
+  const explicitDayMinutes = DAYS
+    .map(d => normalizeShift(person.sched?.[d.key]))
+    .filter(Boolean)
+    .map(dayMinutes)
+    .filter(Number.isFinite);
+  if (explicitDayMinutes.length > 0) {
+    const avg = explicitDayMinutes.reduce((sum, min) => sum + min, 0) / explicitDayMinutes.length;
+    return clamp(roundToQuarter(avg), 60, 600);
+  }
+  const workingDays = DAYS.filter(d => !(person.daysOff || []).includes(d.key)).length || DAYS.length;
+  const fridayMinutes = avgFridayMinutes(person, cycleWeeks, fridayTemplateRotation);
+  const remaining = Math.max(workingDays * 60, getTargetMin(person) - fridayMinutes);
+  return clamp(roundToQuarter(remaining / workingDays), 60, 600);
+}
+function buildSuggestedShift(person, dayKey, cycleWeeks, fridayTemplateRotation = []) {
+  if ((person.daysOff || []).includes(dayKey)) return null;
+  const desiredMinutes = getSuggestedDayMinutes(person, cycleWeeks, fridayTemplateRotation);
+  const preferredStart = person.onlyAfternoons ? 13 * 60 : 8 * 60;
+  const durationOffsets = [0, 15, -15, 30, -30, 45, -45, 60, -60, 90, -90, 120, -120];
+  let best = null;
+
+  for (let start = 330; start <= 1020; start += 15) {
+    for (const offset of durationOffsets) {
+      const length = clamp(roundToQuarter(desiredMinutes + offset), 60, 750);
+      const end = start + length;
+      if (end > 1080) continue;
+      const candidate = [minToTime(start), minToTime(end)];
+      if (!isShiftLegal(person, dayKey, candidate)) continue;
+      const score = Math.abs(start - preferredStart) + Math.abs(length - desiredMinutes) * 2;
+      if (!best || score < best.score) {
+        best = { score, shift: candidate };
+      }
+    }
+  }
+
+  if (best) return best.shift;
+
+  const strict = getStrictConstraints(person, dayKey);
+  const fallbackStart = clamp(
+    person.onlyAfternoons ? 12 * 60 : 8 * 60,
+    Number.isFinite(strict.earliestStart) ? strict.earliestStart : 330,
+    Number.isFinite(strict.latestStart) ? strict.latestStart : 1020
+  );
+  const fallbackEnd = clamp(
+    fallbackStart + desiredMinutes,
+    Number.isFinite(strict.earliestEnd) ? strict.earliestEnd : fallbackStart + 60,
+    Number.isFinite(strict.latestEnd) ? strict.latestEnd : 1080
+  );
+  const fallback = fallbackEnd - fallbackStart >= 60 ? [minToTime(fallbackStart), minToTime(fallbackEnd)] : null;
+  return fallback && isShiftLegal(person, dayKey, fallback) ? fallback : null;
+}
+function preparePersonForUse(person, cycleWeeks = 8, fridayTemplateRotation = []) {
+  const normalized = normalizePerson(person, cycleWeeks);
+  const sched = { ...normalized.sched };
+  DAYS.forEach(d => {
+    if ((normalized.daysOff || []).includes(d.key)) return;
+    if (!normalizeShift(sched[d.key])) {
+      const autoShift = buildSuggestedShift(normalized, d.key, cycleWeeks, fridayTemplateRotation);
+      if (autoShift) sched[d.key] = autoShift;
+    }
+  });
+  return { ...normalized, sched };
+}
+function prepareStaffForUse(staff, cycleWeeks = 8, fridayTemplateRotation = []) {
+  return normalizeStaffList(staff, cycleWeeks).map(person => preparePersonForUse(person, cycleWeeks, fridayTemplateRotation));
+}
 function weeklyMinutes(staff, cycleWeeks = 8, fridayTemplateRotation = []) {
   let total = 0;
   for (const d of DAYS) if (staff.sched?.[d.key]) total += dayMinutes(staff.sched[d.key]);
@@ -419,20 +594,7 @@ function isShiftLegal(person, dayKey, newShift) {
   if (end - start < 60) return false;
   if (start < 330 || end > 1080) return false;
   if (person.onlyAfternoons && start < 720) return false;
-  // Eftersom det ordinarie schemat ska gälla varje vecka måste det respektera
-  // STRÄNGASTE av jämn/udda + dagsundantag. Vi tar max för "earliest"-fält och min för "latest"-fält.
-  const evals = ['even', 'odd'].map(p => ({
-    earliestStart: getConstraint(person, dayKey, 'earliestStart', p),
-    latestStart:   getConstraint(person, dayKey, 'latestStart',   p),
-    earliestEnd:   getConstraint(person, dayKey, 'earliestEnd',   p),
-    latestEnd:     getConstraint(person, dayKey, 'latestEnd',     p),
-  }));
-  const strict = {
-    earliestStart: Math.max(...evals.map(e => e.earliestStart ?? -Infinity)),
-    latestStart:   Math.min(...evals.map(e => e.latestStart   ?? Infinity)),
-    earliestEnd:   Math.max(...evals.map(e => e.earliestEnd   ?? -Infinity)),
-    latestEnd:     Math.min(...evals.map(e => e.latestEnd     ?? Infinity)),
-  };
+  const strict = getStrictConstraints(person, dayKey);
   if (Number.isFinite(strict.earliestStart) && start < strict.earliestStart) return false;
   if (Number.isFinite(strict.latestStart)   && start > strict.latestStart)   return false;
   if (Number.isFinite(strict.earliestEnd)   && end   < strict.earliestEnd)   return false;
@@ -464,7 +626,18 @@ function attemptMutation(staff) {
   );
 }
 
-function runSearch(initialStaff, coverageScopes, cycleWeeks, fridayTemplateRotation, weights, iterations = 2500) {
+function yieldToBrowser() {
+  return new Promise(resolve => {
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => resolve());
+      return;
+    }
+    setTimeout(resolve, 0);
+  });
+}
+
+async function runSearchAsync(initialStaff, coverageScopes, cycleWeeks, fridayTemplateRotation, weights, iterations = 2500, options = {}) {
+  const { chunkSize = 100, onProgress } = options;
   let current = initialStaff.map(p => ({ ...p, sched: { ...p.sched } }));
   let currentScore = scheduleScore(current, coverageScopes, cycleWeeks, fridayTemplateRotation, weights);
   let best = current;
@@ -472,17 +645,22 @@ function runSearch(initialStaff, coverageScopes, cycleWeeks, fridayTemplateRotat
   let temp = 80;
   const coolRate = 0.9985;
 
-  for (let i = 0; i < iterations; i++) {
-    const cand = attemptMutation(current);
-    if (!cand) continue;
-    const cs = scheduleScore(cand, coverageScopes, cycleWeeks, fridayTemplateRotation, weights);
-    const delta = cs - currentScore;
-    if (delta >= 0 || Math.random() < Math.exp(delta / temp)) {
-      current = cand;
-      currentScore = cs;
-      if (cs > bestScore) { best = cand; bestScore = cs; }
+  for (let chunkStart = 0; chunkStart < iterations; chunkStart += chunkSize) {
+    const chunkEnd = Math.min(iterations, chunkStart + chunkSize);
+    for (let i = chunkStart; i < chunkEnd; i++) {
+      const cand = attemptMutation(current);
+      if (!cand) continue;
+      const cs = scheduleScore(cand, coverageScopes, cycleWeeks, fridayTemplateRotation, weights);
+      const delta = cs - currentScore;
+      if (delta >= 0 || Math.random() < Math.exp(delta / temp)) {
+        current = cand;
+        currentScore = cs;
+        if (cs > bestScore) { best = cand; bestScore = cs; }
+      }
+      temp *= coolRate;
     }
-    temp *= coolRate;
+    if (onProgress) onProgress(chunkEnd / iterations);
+    if (chunkEnd < iterations) await yieldToBrowser();
   }
   return best;
 }
@@ -504,16 +682,43 @@ function summarizeSchedule(staff, coverageScopes, cycleWeeks, fridayTemplateRota
   return { totalGaps, totalGapMinutes, totalHourDev, peopleOff };
 }
 
-function generateAlternatives(initialStaff, coverageScopes, cycleWeeks, fridayTemplateRotation) {
+async function generateAlternativesAsync(initialStaff, coverageScopes, cycleWeeks, fridayTemplateRotation, onProgress) {
   const variants = [
     { label: 'Bemannings­fokus', desc: 'Prioriterar att alla pass är täckta', weights: { gap: 50, hours: 1, over: 1 } },
     { label: 'Tim­fokus',        desc: 'Prioriterar exakta veckotimmar',     weights: { gap: 15, hours: 5, over: 1 } },
     { label: 'Balanserat',       desc: 'Väger båda målen lika',                weights: { gap: 30, hours: 2, over: 1 } },
   ];
-  return variants.map(v => {
-    const result = runSearch(initialStaff, coverageScopes, cycleWeeks, fridayTemplateRotation, v.weights, 2500);
-    return { ...v, staff: result, summary: summarizeSchedule(result, coverageScopes, cycleWeeks, fridayTemplateRotation) };
-  });
+  const results = [];
+  for (let i = 0; i < variants.length; i++) {
+    const v = variants[i];
+    const result = await runSearchAsync(
+      initialStaff,
+      coverageScopes,
+      cycleWeeks,
+      fridayTemplateRotation,
+      v.weights,
+      2500,
+      {
+        chunkSize: 100,
+        onProgress: (variantProgress) => {
+          if (!onProgress) return;
+          const overall = ((i + variantProgress) / variants.length) * 100;
+          onProgress({
+            percent: Math.max(3, Math.min(100, Math.round(overall))),
+            label: `${v.label} · ${Math.round(variantProgress * 100)} %`,
+            detail: `Tar fram alternativ ${i + 1} av ${variants.length}`,
+          });
+        },
+      }
+    );
+    results.push({
+      ...v,
+      staff: result,
+      summary: summarizeSchedule(result, coverageScopes, cycleWeeks, fridayTemplateRotation),
+    });
+    if (i < variants.length - 1) await yieldToBrowser();
+  }
+  return results;
 }
 
 // ==================== UI ====================
@@ -544,6 +749,7 @@ function FritidsSchemaApp() {
   const [view, setView] = useState('schedule');
   const [editingId, setEditingId] = useState(null);
   const [generating, setGenerating] = useState(false);
+  const [generationProgress, setGenerationProgress] = useState({ percent: 0, label: '', detail: '' });
   const [alternatives, setAlternatives] = useState(null);
   const [loaded, setLoaded] = useState(false);
   const [dirty, setDirty] = useState(false);
@@ -587,8 +793,9 @@ function FritidsSchemaApp() {
         foundData = true;
         const data = JSON.parse(raw);
         if (data.staff) {
-          setStaff(data.staff);
-          if (data.staff.length > 0) nextId = Math.max(...data.staff.map(p => p.id), 99) + 1;
+          const normalizedStaff = prepareStaffForUse(data.staff, data.fridayCycleWeeks || 8, data.fridayTemplateRotation || []);
+          setStaff(normalizedStaff);
+          if (normalizedStaff.length > 0) nextId = Math.max(...normalizedStaff.map(p => p.id), 99) + 1;
         }
         const loadedDepartments = data.departments || initialDepartments;
         if (data.departments) setDepartments(loadedDepartments);
@@ -640,7 +847,8 @@ function FritidsSchemaApp() {
     if (!loaded) return;
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({
-        staff, departments, coverageBlocks: normalizedCoverageBlocks, fridayCycleWeeks, fridayTemplateRotation, savedFileName,
+        staff: prepareStaffForUse(staff, fridayCycleWeeks, fridayTemplateRotation),
+        departments, coverageBlocks: normalizedCoverageBlocks, fridayCycleWeeks, fridayTemplateRotation, savedFileName,
       }));
     } catch {}
     setDirty(true);
@@ -650,7 +858,8 @@ function FritidsSchemaApp() {
   const buildSaveData = () => ({
     version: 2,
     exportedAt: new Date().toISOString(),
-    staff, departments, coverageBlocks: normalizedCoverageBlocks, fridayCycleWeeks, fridayTemplateRotation,
+    staff: prepareStaffForUse(staff, fridayCycleWeeks, fridayTemplateRotation),
+    departments, coverageBlocks: normalizedCoverageBlocks, fridayCycleWeeks, fridayTemplateRotation,
   });
 
   // Skriv data till en redan öppnad fil-handle
@@ -745,12 +954,13 @@ function FritidsSchemaApp() {
           resolve(false); return;
         }
         const loadedDepartments = data.departments || [];
-        setStaff(data.staff || []);
+        const preparedStaff = prepareStaffForUse(data.staff || [], data.fridayCycleWeeks || 8, data.fridayTemplateRotation || []);
+        setStaff(preparedStaff);
         setDepartments(loadedDepartments);
         setCoverageBlocks(normalizeCoverageBlocks(data.coverageBlocks || initialCoverageBlocks, loadedDepartments));
         setFridayCycleWeeksRaw(data.fridayCycleWeeks || 8);
         setFridayTemplateRotation(resizeRotation(data.fridayTemplateRotation, data.fridayCycleWeeks || 8));
-        if (data.staff && data.staff.length > 0) nextId = Math.max(...data.staff.map(p => p.id), 99) + 1;
+        if (preparedStaff.length > 0) nextId = Math.max(...preparedStaff.map(p => p.id), 99) + 1;
         setSavedFileName(file.name);
         setTimeout(() => setDirty(false), 50);
         resolve(true);
@@ -781,7 +991,7 @@ function FritidsSchemaApp() {
 
   const loadExample = () => {
     if (staff.length > 0 && !confirm('Detta ersätter den personal och avdelningar som finns nu. Fortsätt?')) return;
-    setStaff(EXAMPLE_STAFF);
+    setStaff(prepareStaffForUse(EXAMPLE_STAFF, 8, _FRIDAY_BASE));
     setDepartments(EXAMPLE_DEPARTMENTS);
     setCoverageBlocks(normalizeCoverageBlocks(initialCoverageBlocks, EXAMPLE_DEPARTMENTS));
     setFridayCycleWeeksRaw(8);
@@ -898,7 +1108,10 @@ function FritidsSchemaApp() {
     return v;
   }, [staff, fridayCycleWeeks, fridayTemplateRotation]);
 
-  const updateStaff = (updated) => setStaff(prev => prev.map(s => s.id === updated.id ? updated : s));
+  const updateStaff = (updated) => {
+    const prepared = preparePersonForUse(updated, fridayCycleWeeks, fridayTemplateRotation);
+    setStaff(prev => prev.map(s => s.id === updated.id ? prepared : s));
+  };
   const removeStaff = (id) => setStaff(prev => prev.filter(s => s.id !== id));
   const addStaff = () => {
     if (departments.length === 0) {
@@ -906,22 +1119,35 @@ function FritidsSchemaApp() {
       setView('settings');
       return;
     }
-    const newPerson = P({
+    const newPerson = normalizePerson(P({
       id: nextId++, name: 'Ny anställd', deptId: departments[0].id, role: '',
-      sched: { mon:['08:00','15:45'], tue:['08:00','15:45'], wed:['08:00','15:45'], thu:['08:00','15:45'] },
+      sched: {},
       fridayRotation: new Array(fridayCycleWeeks).fill(null),
-    });
+    }), fridayCycleWeeks);
     setStaff([...staff, newPerson]);
     setEditingId(newPerson.id);
   };
 
   const handleGenerate = async () => {
+    const preparedStaff = prepareStaffForUse(staff, fridayCycleWeeks, fridayTemplateRotation);
+    setStaff(preparedStaff);
     setGenerating(true);
     setAlternatives(null);
-    await new Promise(r => setTimeout(r, 50));
-    const alts = generateAlternatives(staff, coverageScopes, fridayCycleWeeks, fridayTemplateRotation);
-    setAlternatives(alts);
-    setGenerating(false);
+    setGenerationProgress({ percent: 3, label: 'Förbereder...', detail: 'Samlar regler och bemanningskrav' });
+    await yieldToBrowser();
+    try {
+      const alts = await generateAlternativesAsync(
+        preparedStaff,
+        coverageScopes,
+        fridayCycleWeeks,
+        fridayTemplateRotation,
+        setGenerationProgress
+      );
+      setGenerationProgress({ percent: 100, label: 'Klart', detail: 'Schemaförslagen är färdiga' });
+      setAlternatives(alts);
+    } finally {
+      setGenerating(false);
+    }
   };
 
   const applyAlternative = (alt) => {
@@ -1055,10 +1281,15 @@ function FritidsSchemaApp() {
         <div className="fixed inset-0 z-40 flex items-center justify-center" style={{ backgroundColor: 'rgba(28, 25, 23, 0.4)' }}>
           <div className="bg-white rounded-2xl p-8 shadow-2xl text-center max-w-sm">
             <div className="display-font text-2xl text-stone-800 mb-2">Pusslar...</div>
-            <p className="text-sm text-stone-600">Testar tusentals justeringar för att hitta tre olika alternativ åt er.</p>
-            <div className="mt-4 h-1 bg-stone-200 rounded-full overflow-hidden">
-              <div className="h-full bg-stone-800 animate-pulse" style={{ width: '40%' }} />
+            <p className="text-sm text-stone-600">{generationProgress.detail || 'Testar tusentals justeringar för att hitta tre olika alternativ åt er.'}</p>
+            <div className="mt-4 h-2 bg-stone-200 rounded-full overflow-hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={generationProgress.percent}>
+              <div className="h-full bg-stone-800 transition-all duration-200" style={{ width: `${generationProgress.percent}%` }} />
             </div>
+            <div className="mt-3 flex items-center justify-between text-xs text-stone-500">
+              <span>{generationProgress.label || 'Räknar...'}</span>
+              <span>{generationProgress.percent}%</span>
+            </div>
+            <p className="text-[11px] text-stone-400 mt-2">Appen jobbar i små steg för att sidan ska fortsätta kännas levande.</p>
           </div>
         </div>
       )}
@@ -1220,7 +1451,7 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
                 </div>
                 <p className={`text-xs mt-2 ${selected ? 'text-stone-300' : 'text-stone-500'}`}>
                   {view.slots.some(s => s.min > 0)
-                    ? `${view.gaps.length} gap � ${view.gapMinutes} min underskott`
+                    ? `${view.gaps.length} gap · ${view.gapMinutes} min underskott`
                     : 'Inga krav satta än'}
                 </p>
               </button>
@@ -1825,14 +2056,7 @@ function SettingsView({ departments, setDepartments, staff, setStaff, coverageBl
 
 function StaffEditModal({ staff, departments, fridayCycleWeeks, fridayTemplateRotation, onSave, onClose, onRemove }) {
   const [form, setForm] = useState(() => {
-    const cp = { ...P({}), ...JSON.parse(JSON.stringify(staff)) };
-    // Säkerställ att rotationen har rätt längd när modalen öppnas
-    if (cp.hasFridayRotation) {
-      cp.fridayRotation = resizeRotation(cp.fridayRotation, fridayCycleWeeks);
-    }
-    cp.fridayTemplateStartWeek = Math.min(Math.max(1, cp.fridayTemplateStartWeek || 1), fridayCycleWeeks);
-    cp.fridayTemplateOverrides = cp.fridayTemplateOverrides || {};
-    return cp;
+    return normalizePerson(JSON.parse(JSON.stringify(staff)), fridayCycleWeeks);
   });
   const wm = weeklyMinutes(form, fridayCycleWeeks, fridayTemplateRotation);
   const targetMin = getTargetMin(form);
@@ -1911,6 +2135,9 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, fridayTemplateRo
   const scrollToFridaySection = () => {
     document.getElementById('staff-edit-friday-section')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
+  const autofillWeekSchedule = () => {
+    setForm(preparePersonForUse(form, fridayCycleWeeks, fridayTemplateRotation));
+  };
 
   const updateShift = (day, idx, val) => {
     const newSched = { ...form.sched };
@@ -1979,7 +2206,16 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, fridayTemplateRo
           </Section>
 
           {/* Pass per dag */}
-          <Section title="Pass vecka">
+          <Section title="Utgångspass vecka">
+            <p className="text-xs text-stone-500 mb-3">
+              De här tiderna är appens startläge för måndag till fredag. Om du lämnar dagar tomma fyller appen i rimliga utgångspass utifrån personens regler när du sparar eller genererar.
+            </p>
+            <div className="flex justify-end mb-3">
+              <button type="button" onClick={autofillWeekSchedule}
+                className="text-[11px] px-3 py-1.5 rounded-lg bg-stone-100 text-stone-700 hover:bg-stone-200 transition">
+                Fyll utifrån regler
+              </button>
+            </div>
             <div className="space-y-2">
               {DAYS.map(d => {
                 const isOff = (form.daysOff || []).includes(d.key);
@@ -2040,7 +2276,7 @@ function StaffEditModal({ staff, departments, fridayCycleWeeks, fridayTemplateRo
 
           {/* Begränsningar */}
           <Section title="Begränsningar för automatisk pussling">
-            <p className="text-xs text-stone-500 mb-3">Dessa villkor respekteras när appen genererar förslag.</p>
+            <p className="text-xs text-stone-500 mb-3">Det här är de viktigaste uppgifterna för generatorn. Dessa villkor respekteras när appen pusslar fram förslag.</p>
             <div className="space-y-2.5">
               <Toggle checked={form.fixedTimes} onChange={v => setForm({ ...form, fixedTimes: v })}
                 label="Fast tid varje vecka" hint="Generatorn rör inte denna persons pass alls"
