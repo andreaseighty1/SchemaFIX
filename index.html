@@ -539,7 +539,7 @@ function normalizeCoverageBlock(block, fallbackDeptId = '') {
     end: block?.end ?? 540,
     min,
     max,
-    label: block?.label || 'Nytt block',
+    label: typeof block?.label === 'string' ? block.label : 'Nytt block',
     scopeType,
     deptId: scopeType === COVERAGE_DEPARTMENT ? (block?.deptId || fallbackDeptId || '') : null,
   };
@@ -1856,7 +1856,7 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
   return (
     <div className="space-y-4">
       <TabIntro>
-        Här ser du schemat per dag och hur bemanningen ser ut över tiden. Växla mellan gemensam bemanning och avdelningar för att se om varje del av fritids har rätt täckning. Om något inte går ihop visas en tydlig bristlista här.
+        Här ser du schemat per dag och hur bemanningen ser ut över tiden. Generatorn försöker matcha passbanken, bemanningsblocken och personalens regler. Växla mellan gemensam bemanning och avdelningar för att se om varje del av fritids har rätt täckning. Om något inte går ihop visas tydliga brist- och övermaxlistor här.
       </TabIntro>
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="flex gap-2 flex-wrap">
@@ -2241,7 +2241,7 @@ function RulesView({ blocks, setBlocks, departments }) {
   return (
     <div className="space-y-4">
       <TabIntro>
-        Här definierar du hur många personer som behöver vara på plats vid olika tider. Varje block har nu både min och max, så du kan säga "exakt 1 på öppning" i stället för bara "minst 1".
+        Här definierar du hur många personer som behöver vara på plats vid olika tider. Varje block har både min och max, så du kan säga "exakt 1 på öppning" i stället för bara "minst 1". Tänk i delar av dagen: tidig öppning, morgonfritids, skoltid om något måste täckas, och sedan avdelningsblock när olika fritidsgrupper startar.
       </TabIntro>
       <div className="bg-white rounded-2xl ring-1 ring-stone-200 p-5">
         <div className="flex items-start justify-between mb-4 gap-4 flex-wrap">
@@ -2274,6 +2274,9 @@ function RulesView({ blocks, setBlocks, departments }) {
               </button>
             ))}
           </div>
+          <p className="text-[11px] text-stone-500 mt-3">
+            Exempel: om bara en ska öppna först kan du ha `05:50–06:30` med `min 1 / max 1`, och sedan ett nytt morgonblock från `06:30` där fler behövs.
+          </p>
         </div>
 
         <div className="grid md:grid-cols-2 xl:grid-cols-4 gap-3 mb-5">
@@ -2347,7 +2350,7 @@ function RulesView({ blocks, setBlocks, departments }) {
         </div>
 
         <div className="mt-5 pt-4 border-t border-stone-100 text-xs text-stone-500">
-          <p>Tips: om du vill ha exakt en öppnare mellan 05:50 och 06:30 sätter du både min och max till 1 i det blocket. Om block överlappar inom samma vy används det första i tidsordning.</p>
+          <p>Tips: använd gemensamma block när alla avdelningar är sammanslagna, och avdelningsblock när fritids startar olika tider. Om du inte har något särskilt som måste täckas under skoltid kan du låta den perioden vara utan bemanningskrav. Om block överlappar inom samma vy används det första i tidsordning.</p>
         </div>
       </div>
 
@@ -2555,6 +2558,7 @@ function SettingsView({ departments, setDepartments, staff, setStaff, coverageBl
           <p className="text-xs uppercase tracking-wider text-stone-500 mb-2">Så används passbanken</p>
           <div className="space-y-1 text-sm text-stone-600">
             <p>Generatorn väljer i första hand bland dessa pass i stället för att hitta på fria tider.</p>
+            <p>Bemanningsblocken avgör när de här passen faktiskt behövs, så passbank och bemanning måste fungera tillsammans.</p>
             <p>Pass kan göras avdelningsspecifika eller gälla alla avdelningar.</p>
             <p>Fredag styrs fortfarande separat av fast fredag eller fredagsrull längre ner i personalens formulär.</p>
           </div>
@@ -3306,6 +3310,7 @@ function TimeTextInput({ valueMinutes, onCommit, className = '', disabled = fals
       disabled={disabled}
       placeholder={placeholder}
       onChange={e => setDraft(e.target.value)}
+      onFocus={(e) => e.target.select()}
       onBlur={commitDraft}
       onKeyDown={(e) => {
         if (e.key === 'Enter') {
@@ -3588,8 +3593,8 @@ function WelcomeModal({ onClose, onStartTour }) {
   const STEPS = [
     { num: '1', title: 'Lägg till avdelningar', desc: 'Vad heter era avdelningar? Färgkoda dem så ni ser dem tydligt.' },
     { num: '2', title: 'Lägg till pass och personal', desc: 'Börja gärna med passbanken. Fyll sedan i avdelning, tjänstgöring, tillåtna pass, fredagsrutin och villkor för varje person.' },
-    { num: '3', title: 'Justera bemanningskrav', desc: 'Lägg gemensamma block och avdelningsblock så appen vet hur bemanningen ska se ut över dagen.' },
-    { num: '4', title: 'Generera schemaförslag', desc: 'Tryck på knappen — appen pusslar fram tre olika alternativ baserat på passbanken, bemanningskrav, fredagsupplägg och allas villkor.' },
+    { num: '3', title: 'Justera bemanningskrav', desc: 'Lägg gemensamma block och avdelningsblock så appen vet hur bemanningen ska se ut över dagen. Använd min/max om du vill styra t.ex. exakt en öppnare.' },
+    { num: '4', title: 'Generera schemaförslag', desc: 'Tryck på knappen — appen pusslar fram tre olika alternativ baserat på passbanken, bemanningskrav, fredagsupplägg och allas villkor. Vecka-vyn visar sedan var något saknas eller blir för mycket.' },
   ];
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: 'rgba(28, 25, 23, 0.5)' }}>
@@ -3639,11 +3644,11 @@ function TourBubble({ step, onNext, onClose }) {
     },
     {
       title: 'Steg 3 av 4 · Bemanningskrav',
-      desc: 'Hur många personer behöver vara på plats vid olika tider? Här definierar du tidsblock med minsta antal personal, antingen gemensamt eller per avdelning. Appen flaggar när det inte stämmer.',
+      desc: 'Hur många personer behöver vara på plats vid olika tider? Här definierar du tidsblock med min och max, antingen gemensamt eller per avdelning. Använd gemensamma block när alla är sammanslagna och avdelningsblock när fritids startar olika tider.',
     },
     {
       title: 'Steg 4 av 4 · Vecka & Generera',
-      desc: 'Här ser du schemat per dag och täckning över tiden. Tryck på "Generera schemaförslag" högst upp för att låta appen pussla fram tre alternativ baserat på passbanken, avdelningsbemanning, fredagar och allas villkor. Om något inte går ihop visas bristlistor direkt här.',
+      desc: 'Här ser du schemat per dag och täckning över tiden. Tryck på "Generera schemaförslag" högst upp för att låta appen pussla fram tre alternativ baserat på passbanken, avdelningsbemanning, fredagar och allas villkor. Om något inte går ihop visas både bristlistor och perioder över max direkt här.',
     },
   ];
   const cur = STEPS[step];
