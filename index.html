@@ -928,6 +928,80 @@ function scheduleScore(staff, coverageScopes, cycleWeeks, fridayTemplateRotation
   return score;
 }
 
+function summarizeCoverageHealth(staff, coverageScopes, cycleWeeks, fridayTemplateRotation = []) {
+  let totalGaps = 0;
+  let totalGapMinutes = 0;
+  let totalOver = 0;
+  let totalOverMinutes = 0;
+
+  for (const d of DAYS) {
+    for (const scope of coverageScopes) {
+      const slots = computeSlots(staff, d.key, scope.slots, scope);
+      for (const s of slots) {
+        if (s.count < s.min) {
+          totalGaps++;
+          totalGapMinutes += 15 * (s.min - s.count);
+        }
+        if (s.count > s.max) {
+          totalOver++;
+          totalOverMinutes += 15 * (s.count - s.max);
+        }
+      }
+    }
+  }
+
+  if (cycleWeeks > 0) {
+    for (let week = 1; week <= cycleWeeks; week++) {
+      for (const scope of coverageScopes) {
+        const slots = computeSlots(staff, 'fri', scope.slots, scope, { fridayWeek: week, cycleWeeks, fridayTemplateRotation });
+        for (const s of slots) {
+          if (s.count < s.min) {
+            totalGaps++;
+            totalGapMinutes += 15 * (s.min - s.count);
+          }
+          if (s.count > s.max) {
+            totalOver++;
+            totalOverMinutes += 15 * (s.count - s.max);
+          }
+        }
+      }
+    }
+  }
+
+  return { totalGaps, totalGapMinutes, totalOver, totalOverMinutes };
+}
+
+function summarizeDayCoverageHealth(staff, dayKey, coverageScopes) {
+  let totalGaps = 0;
+  let totalGapMinutes = 0;
+  let totalOver = 0;
+  let totalOverMinutes = 0;
+
+  for (const scope of coverageScopes) {
+    const slots = computeSlots(staff, dayKey, scope.slots, scope);
+    for (const s of slots) {
+      if (s.count < s.min) {
+        totalGaps++;
+        totalGapMinutes += 15 * (s.min - s.count);
+      }
+      if (s.count > s.max) {
+        totalOver++;
+        totalOverMinutes += 15 * (s.count - s.max);
+      }
+    }
+  }
+
+  return { totalGaps, totalGapMinutes, totalOver, totalOverMinutes };
+}
+
+function compareCoverageHealth(a, b) {
+  if ((a?.totalOver || 0) !== (b?.totalOver || 0)) return (a?.totalOver || 0) - (b?.totalOver || 0);
+  if ((a?.totalOverMinutes || 0) !== (b?.totalOverMinutes || 0)) return (a?.totalOverMinutes || 0) - (b?.totalOverMinutes || 0);
+  if ((a?.totalGaps || 0) !== (b?.totalGaps || 0)) return (a?.totalGaps || 0) - (b?.totalGaps || 0);
+  if ((a?.totalGapMinutes || 0) !== (b?.totalGapMinutes || 0)) return (a?.totalGapMinutes || 0) - (b?.totalGapMinutes || 0);
+  return 0;
+}
+
 function isShiftLegal(person, dayKey, newShift) {
   const start = timeToMin(newShift[0]);
   const end = timeToMin(newShift[1]);
@@ -944,7 +1018,7 @@ function isShiftLegal(person, dayKey, newShift) {
   return true;
 }
 
-function attemptMutation(staff, passBank = [], cycleWeeks = 8, fridayTemplateRotation = []) {
+function attemptMutation(staff, passBank = [], cycleWeeks = 8, fridayTemplateRotation = [], coverageScopes = []) {
   const mutables = staff.filter(p => !p.fixedTimes);
   if (mutables.length === 0) return null;
   const p = mutables[Math.floor(Math.random() * mutables.length)];
@@ -959,18 +1033,35 @@ function attemptMutation(staff, passBank = [], cycleWeeks = 8, fridayTemplateRot
     .filter(shift => !current || shift[0] !== current[0] || shift[1] !== current[1]);
   if (possibleShifts.length === 0) return null;
   const preferred = buildSuggestedShift(p, d.key, cycleWeeks, fridayTemplateRotation, passBank);
-  const sorted = possibleShifts.sort((a, b) => {
-    if (!preferred) return 0;
-    const scoreA = Math.abs(timeToMin(a[0]) - timeToMin(preferred[0])) + Math.abs(dayMinutes(a) - dayMinutes(preferred));
-    const scoreB = Math.abs(timeToMin(b[0]) - timeToMin(preferred[0])) + Math.abs(dayMinutes(b) - dayMinutes(preferred));
-    return scoreA - scoreB;
+  const variants = possibleShifts.map(shift => {
+    const candidate = staff.map(person => person.id === p.id
+      ? { ...person, sched: { ...person.sched, [d.key]: shift } }
+      : person
+    );
+    const preferenceScore = preferred
+      ? Math.abs(timeToMin(shift[0]) - timeToMin(preferred[0])) + Math.abs(dayMinutes(shift) - dayMinutes(preferred))
+      : 0;
+    return {
+      shift,
+      candidate,
+      preferenceScore,
+      dayHealth: coverageScopes.length > 0 ? summarizeDayCoverageHealth(candidate, d.key, coverageScopes) : null,
+    };
   });
-  const newShift = Math.random() < 0.7 ? sorted[0] : sorted[Math.floor(Math.random() * sorted.length)];
+  variants.sort((a, b) => {
+    const healthDiff = compareCoverageHealth(a.dayHealth, b.dayHealth);
+    if (healthDiff !== 0) return healthDiff;
+    return a.preferenceScore - b.preferenceScore;
+  });
 
-  return staff.map(person => person.id === p.id
-    ? { ...person, sched: { ...person.sched, [d.key]: newShift } }
-    : person
-  );
+  const bestHealth = variants[0]?.dayHealth || null;
+  const bestVariants = variants.filter(variant => compareCoverageHealth(variant.dayHealth, bestHealth) === 0);
+  const selectedPool = bestVariants.length > 0 ? bestVariants : variants;
+  const chosen = Math.random() < 0.8
+    ? selectedPool[0]
+    : selectedPool[Math.floor(Math.random() * selectedPool.length)];
+
+  return chosen?.candidate || null;
 }
 
 function yieldToBrowser() {
@@ -987,22 +1078,34 @@ async function runSearchAsync(initialStaff, coverageScopes, cycleWeeks, fridayTe
   const { chunkSize = 100, onProgress } = options;
   let current = initialStaff.map(p => ({ ...p, sched: { ...p.sched } }));
   let currentScore = scheduleScore(current, coverageScopes, cycleWeeks, fridayTemplateRotation, weights);
+  let currentHealth = summarizeCoverageHealth(current, coverageScopes, cycleWeeks, fridayTemplateRotation);
   let best = current;
   let bestScore = currentScore;
+  let bestHealth = currentHealth;
   let temp = 80;
   const coolRate = 0.9985;
 
   for (let chunkStart = 0; chunkStart < iterations; chunkStart += chunkSize) {
     const chunkEnd = Math.min(iterations, chunkStart + chunkSize);
     for (let i = chunkStart; i < chunkEnd; i++) {
-      const cand = attemptMutation(current, passBank, cycleWeeks, fridayTemplateRotation);
+      const cand = attemptMutation(current, passBank, cycleWeeks, fridayTemplateRotation, coverageScopes);
       if (!cand) continue;
       const cs = scheduleScore(cand, coverageScopes, cycleWeeks, fridayTemplateRotation, weights);
+      const candHealth = summarizeCoverageHealth(cand, coverageScopes, cycleWeeks, fridayTemplateRotation);
+      const healthDelta = compareCoverageHealth(candHealth, currentHealth);
       const delta = cs - currentScore;
-      if (delta >= 0 || Math.random() < Math.exp(delta / temp)) {
+      const acceptCandidate = healthDelta < 0
+        || (healthDelta === 0 && (delta >= 0 || Math.random() < Math.exp(delta / temp)));
+      if (acceptCandidate) {
         current = cand;
         currentScore = cs;
-        if (cs > bestScore) { best = cand; bestScore = cs; }
+        currentHealth = candHealth;
+        const bestHealthDelta = compareCoverageHealth(candHealth, bestHealth);
+        if (bestHealthDelta < 0 || (bestHealthDelta === 0 && cs > bestScore)) {
+          best = cand;
+          bestScore = cs;
+          bestHealth = candHealth;
+        }
       }
       temp *= coolRate;
     }
