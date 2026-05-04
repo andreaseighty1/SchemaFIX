@@ -78,7 +78,7 @@
 <script type="text/babel" data-presets="react">
 // Plocka ut ikon-komponenterna så att resten av koden kan använda dem direkt
 const { AlertCircle, Clock, Users, Calendar, CheckCircle2, ChevronRight, Edit3, Sparkles, X, Plus, Trash2, Wand2, Settings, Download, Upload, Circle, HelpCircle, ArrowRight } = window.__icons;
-const { useState, useMemo, useEffect } = React;
+const { useState, useMemo, useEffect, useRef } = React;
 
 
 
@@ -316,7 +316,7 @@ function normalizePass(pass, fallbackDays = WEEKDAY_KEYS) {
   const safeEnd = clamp(roundToQuarter(end), safeStart + 60, 1080);
   return {
     id: pass?.id || `pass-${Math.random().toString(36).slice(2, 8)}`,
-    name: pass?.name || `${minToTime(safeStart)}–${minToTime(safeEnd)}`,
+    name: typeof pass?.name === 'string' ? pass.name : `${minToTime(safeStart)}–${minToTime(safeEnd)}`,
     start: safeStart,
     end: safeEnd,
     days,
@@ -603,6 +603,31 @@ function timeToMin(t) { if (!t) return null; const [h, m] = t.split(':').map(Num
 function minToTime(m) { const h = Math.floor(m / 60); const mm = m % 60; return `${String(h).padStart(2, '0')}:${String(mm).padStart(2, '0')}`; }
 function minToHM(min) { const h = Math.floor(Math.abs(min) / 60); const m = Math.abs(min) % 60; const sign = min < 0 ? '-' : ''; return `${sign}${h} h ${m} min`; }
 function dayMinutes(sched) { return timeToMin(sched[1]) - timeToMin(sched[0]); }
+function parseFlexibleTimeInput(value) {
+  const raw = String(value ?? '').trim().replace(/[.,]/g, ':');
+  if (!raw) return null;
+  if (/^\d{1,2}:\d{2}$/.test(raw)) {
+    const [h, m] = raw.split(':').map(Number);
+    if (!Number.isFinite(h) || !Number.isFinite(m) || h < 0 || h > 23 || m < 0 || m > 59) return null;
+    return roundToQuarter(h * 60 + m);
+  }
+  if (/^\d{1,4}$/.test(raw)) {
+    let h = 0;
+    let m = 0;
+    if (raw.length <= 2) {
+      h = Number(raw);
+    } else if (raw.length === 3) {
+      h = Number(raw.slice(0, 1));
+      m = Number(raw.slice(1));
+    } else {
+      h = Number(raw.slice(0, 2));
+      m = Number(raw.slice(2));
+    }
+    if (!Number.isFinite(h) || !Number.isFinite(m) || h < 0 || h > 23 || m < 0 || m > 59) return null;
+    return roundToQuarter(h * 60 + m);
+  }
+  return null;
+}
 function clamp(value, min, max) { return Math.min(Math.max(value, min), max); }
 function roundToQuarter(min) { return Math.round(min / 15) * 15; }
 function asNumber(value, fallback = null) {
@@ -1010,6 +1035,35 @@ function summarizeSchedule(staff, coverageScopes, cycleWeeks, fridayTemplateRota
     if (Math.abs(dev) > 5) peopleOff++;
   }
   return { totalGaps, totalGapMinutes, totalHourDev, peopleOff };
+}
+
+function summarizeGapSegments(slots = []) {
+  const segments = [];
+  let current = null;
+  for (const slot of slots) {
+    const shortfall = Math.max(0, (slot.min || 0) - (slot.count || 0));
+    if (shortfall > 0) {
+      if (!current) {
+        current = {
+          start: slot.start,
+          end: slot.start + 15,
+          slotCount: 1,
+          totalShortfallMinutes: shortfall * 15,
+          maxShortfall: shortfall,
+        };
+      } else {
+        current.end = slot.start + 15;
+        current.slotCount += 1;
+        current.totalShortfallMinutes += shortfall * 15;
+        current.maxShortfall = Math.max(current.maxShortfall, shortfall);
+      }
+    } else if (current) {
+      segments.push(current);
+      current = null;
+    }
+  }
+  if (current) segments.push(current);
+  return segments;
 }
 
 async function generateAlternativesAsync(initialStaff, coverageScopes, cycleWeeks, fridayTemplateRotation, passBank, onProgress) {
@@ -1726,6 +1780,19 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
     || null;
   const visiblePresent = focusedCoverage?.present || dayData.present;
   const maxCount = Math.max(...((focusedCoverage?.slots || []).map(s => Math.max(s.count, s.min))), 5);
+  const gapAlerts = visibleCoverageViews
+    .filter(view => view.gaps.length > 0)
+    .flatMap(view => summarizeGapSegments(view.slots).map((segment, idx) => ({
+      id: `${view.key}-${idx}`,
+      label: view.label,
+      scopeType: view.scopeType,
+      start: segment.start,
+      end: segment.end,
+      maxShortfall: segment.maxShortfall,
+      totalShortfallMinutes: segment.totalShortfallMinutes,
+      slotCount: segment.slotCount,
+    })))
+    .sort((a, b) => b.totalShortfallMinutes - a.totalShortfallMinutes || a.start - b.start);
 
   if (staffCount === 0) {
     return (
@@ -1749,7 +1816,7 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
   return (
     <div className="space-y-4">
       <TabIntro>
-        Här ser du schemat per dag och hur bemanningen ser ut över tiden. Växla mellan gemensam bemanning och avdelningar för att se om varje del av fritids har rätt täckning.
+        Här ser du schemat per dag och hur bemanningen ser ut över tiden. Växla mellan gemensam bemanning och avdelningar för att se om varje del av fritids har rätt täckning. Om något inte går ihop visas en tydlig bristlista här.
       </TabIntro>
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="flex gap-2 flex-wrap">
@@ -1783,6 +1850,33 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
           <div className="text-sm text-stone-700">
             <p style={{ fontWeight: 500 }}>Ingen fredagsrutin ifylld än</p>
             <p className="text-xs text-stone-600 mt-1">Klicka på en person i Personal-fliken och fyll i deras fredagstider.</p>
+          </div>
+        </div>
+      )}
+
+      {gapAlerts.length > 0 && (
+        <div className="bg-orange-50 ring-1 ring-orange-200 rounded-xl p-4">
+          <div className="flex items-center gap-2 mb-3">
+            <AlertCircle size={15} className="text-orange-600" />
+            <p className="text-sm text-stone-800" style={{ fontWeight: 500 }}>
+              Bemanningsbrister {isFriday && hasFridaySetup ? `på fredag vecka ${currentFridayWeek}` : `på ${dayLabel.toLowerCase()}`}
+            </p>
+          </div>
+          <div className="space-y-1.5">
+            {gapAlerts.slice(0, 6).map(alert => (
+              <div key={alert.id} className="text-sm text-stone-700 flex items-start gap-2">
+                <ChevronRight size={14} className="text-orange-600 mt-0.5 flex-shrink-0" />
+                <span>
+                  <span style={{ fontWeight: 500 }}>{alert.label}:</span> under krav {minToTime(alert.start)}–{minToTime(alert.end)}
+                  {` · som mest ${alert.maxShortfall} ${alert.maxShortfall === 1 ? 'person' : 'personer'} kort`}
+                </span>
+              </div>
+            ))}
+            {gapAlerts.length > 6 && (
+              <p className="text-xs text-stone-500 pt-1">
+                Visar de 6 största bristerna. Växla mellan korten ovan för att se varje avdelning mer i detalj.
+              </p>
+            )}
           </div>
         </div>
       )}
@@ -2325,16 +2419,16 @@ function SettingsView({ departments, setDepartments, staff, setStaff, coverageBl
           {normalizePassBank(passBank).map(pass => (
             <div key={pass.id} className="grid grid-cols-12 gap-2 items-center py-2 px-2 rounded-lg hover:bg-stone-50">
               <div className="col-span-3">
-                <input className="rules-input w-full" value={pass.name}
+                <input className="rules-input w-full" autoComplete="off" spellCheck="false" value={pass.name}
                   onChange={e => updatePass(pass.id, { name: e.target.value })} placeholder="Passnamn" />
               </div>
               <div className="col-span-2">
-                <input type="time" className="rules-input w-full" value={minToTime(pass.start)}
-                  onChange={e => updatePass(pass.id, { start: timeToMin(e.target.value) || pass.start })} />
+                <TimeTextInput className="rules-input w-full" valueMinutes={pass.start}
+                  onCommit={(minutes) => updatePass(pass.id, { start: minutes })} />
               </div>
               <div className="col-span-2">
-                <input type="time" className="rules-input w-full" value={minToTime(pass.end)}
-                  onChange={e => updatePass(pass.id, { end: timeToMin(e.target.value) || pass.end })} />
+                <TimeTextInput className="rules-input w-full" valueMinutes={pass.end}
+                  onCommit={(minutes) => updatePass(pass.id, { end: minutes })} />
               </div>
               <div className="col-span-3 flex flex-wrap gap-1">
                 {DAYS.map(day => {
@@ -2479,7 +2573,7 @@ function SettingsView({ departments, setDepartments, staff, setStaff, coverageBl
           <div className="flex items-start justify-between gap-4 flex-wrap py-2">
             <div className="flex-1 min-w-[200px]">
               <p className="text-sm text-stone-800" style={{ fontWeight: 500 }}>Ladda exempeldata</p>
-              <p className="text-xs text-stone-500 mt-0.5">Öppnar flera påhittade testscenarier med olika storlek, avdelningar och bemanningskrav. Veckopass för mån–tor är inte färdigifyllda.</p>
+            <p className="text-xs text-stone-500 mt-0.5">Öppnar flera påhittade testscenarier med olika storlek, avdelningar och bemanningskrav. Vardagspass är inte färdigifyllda.</p>
               <p className="text-[10px] text-stone-400 mt-1">Varje scenario laddar också en passbank som generatorn använder.</p>
             </div>
             <button onClick={onLoadExample}
@@ -2525,6 +2619,7 @@ function StaffEditModal({ staff, departments, passBank, fridayCycleWeeks, friday
   const normalizedPassBank = normalizePassBank(passBank);
   const effectiveAllowedPassIds = getAllowedPassIdsForPerson(form, normalizedPassBank);
   const usingAllPasses = (form.allowedPassIds || []).length === 0;
+  const backdropPressStarted = useRef(false);
 
   // Uppdatera en enskild fredagsvecka i rullen
   const updateFridayWeek = (weekIdx, idx, val) => {
@@ -2633,9 +2728,22 @@ function StaffEditModal({ staff, departments, passBank, fridayCycleWeeks, friday
     const cur = form.daysOff || [];
     setForm({ ...form, daysOff: cur.includes(day) ? cur.filter(d => d !== day) : [...cur, day] });
   };
+  const handleBackdropMouseDown = (e) => {
+    backdropPressStarted.current = e.target === e.currentTarget;
+  };
+  const handleBackdropClick = (e) => {
+    const shouldClose = backdropPressStarted.current && e.target === e.currentTarget;
+    backdropPressStarted.current = false;
+    if (shouldClose) onClose();
+  };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: 'rgba(28, 25, 23, 0.4)' }} onClick={onClose}>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ backgroundColor: 'rgba(28, 25, 23, 0.4)' }}
+      onMouseDown={handleBackdropMouseDown}
+      onClick={handleBackdropClick}
+    >
       <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
         <div className="sticky top-0 bg-white border-b border-stone-200 px-6 py-4 flex items-center justify-between z-10">
           <div>
@@ -2649,7 +2757,7 @@ function StaffEditModal({ staff, departments, passBank, fridayCycleWeeks, friday
           {/* Grunduppgifter */}
           <Section title="Grunduppgifter">
             <div className="grid grid-cols-2 gap-4">
-              <Field label="Namn"><input className="input" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} /></Field>
+              <Field label="Namn"><input className="input" autoComplete="off" spellCheck="false" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} /></Field>
               <Field label="Roll/undervisning"><input className="input" value={form.role} onChange={e => setForm({ ...form, role: e.target.value })} placeholder="ex. åk 1, musik" /></Field>
               <Field label="Avdelning">
                 <select className="input" value={form.deptId || ''} onChange={e => setForm({ ...form, deptId: e.target.value })}>
@@ -3073,6 +3181,50 @@ function Field({ label, tip, children }) {
   );
 }
 
+function TimeTextInput({ valueMinutes, onCommit, className = '', disabled = false, placeholder = 'HH:MM' }) {
+  const [draft, setDraft] = useState(valueMinutes != null ? minToTime(valueMinutes) : '');
+
+  useEffect(() => {
+    setDraft(valueMinutes != null ? minToTime(valueMinutes) : '');
+  }, [valueMinutes]);
+
+  const commitDraft = () => {
+    if (!draft.trim()) {
+      setDraft(valueMinutes != null ? minToTime(valueMinutes) : '');
+      return;
+    }
+    const parsed = parseFlexibleTimeInput(draft);
+    if (parsed == null) {
+      setDraft(valueMinutes != null ? minToTime(valueMinutes) : '');
+      return;
+    }
+    const normalized = minToTime(parsed);
+    setDraft(normalized);
+    onCommit(parsed);
+  };
+
+  return (
+    <input
+      type="text"
+      inputMode="numeric"
+      autoComplete="off"
+      spellCheck="false"
+      className={className}
+      value={draft}
+      disabled={disabled}
+      placeholder={placeholder}
+      onChange={e => setDraft(e.target.value)}
+      onBlur={commitDraft}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          commitDraft();
+        }
+      }}
+    />
+  );
+}
+
 function Toggle({ checked, onChange, label, hint, tip }) {
   return (
     <div className="flex items-start gap-3">
@@ -3289,7 +3441,7 @@ function ExampleDataModal({ scenarios, onSelect, onClose }) {
         <div className="sticky top-0 bg-white border-b border-stone-200 px-6 py-4 flex items-center justify-between z-10">
           <div>
             <h2 className="display-font text-2xl text-stone-800">Välj exempeldata</h2>
-            <p className="text-xs text-stone-500 mt-0.5">Alla scenarier använder påhittade namn. Veckopass för mån–tor är inte färdigifyllda, utan generatorn utgår från parametrar och respektive scenarios passbank.</p>
+            <p className="text-xs text-stone-500 mt-0.5">Alla scenarier använder påhittade namn. Vardagspass är inte färdigifyllda, utan generatorn utgår från parametrar och respektive scenarios passbank.</p>
           </div>
           <button onClick={onClose} className="text-stone-400 hover:text-stone-700"><X size={20} /></button>
         </div>
@@ -3343,9 +3495,9 @@ function ExampleDataModal({ scenarios, onSelect, onClose }) {
 function WelcomeModal({ onClose, onStartTour }) {
   const STEPS = [
     { num: '1', title: 'Lägg till avdelningar', desc: 'Vad heter era avdelningar? Färgkoda dem så ni ser dem tydligt.' },
-    { num: '2', title: 'Lägg till personal', desc: 'En åt gången. Fyll i avdelning, tjänstgöring, fredagsrutin och villkor som styr när personen kan arbeta.' },
+    { num: '2', title: 'Lägg till pass och personal', desc: 'Börja gärna med passbanken. Fyll sedan i avdelning, tjänstgöring, tillåtna pass, fredagsrutin och villkor för varje person.' },
     { num: '3', title: 'Justera bemanningskrav', desc: 'Lägg gemensamma block och avdelningsblock så appen vet hur bemanningen ska se ut över dagen.' },
-    { num: '4', title: 'Generera schemaförslag', desc: 'Tryck på knappen — appen pusslar fram tre olika alternativ baserat på bemanningskrav, fredagsupplägg och allas villkor.' },
+    { num: '4', title: 'Generera schemaförslag', desc: 'Tryck på knappen — appen pusslar fram tre olika alternativ baserat på passbanken, bemanningskrav, fredagsupplägg och allas villkor.' },
   ];
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: 'rgba(28, 25, 23, 0.5)' }}>
@@ -3353,7 +3505,7 @@ function WelcomeModal({ onClose, onStartTour }) {
         <div className="px-6 py-5 border-b border-stone-200">
           <p className="text-xs uppercase tracking-widest text-stone-500 mb-1">Välkommen till SchemaFIX</p>
           <h2 className="display-font text-3xl text-stone-800" style={{ letterSpacing: '-0.02em' }}>Så här kommer du igång</h2>
-          <p className="text-sm text-stone-600 mt-2">Fyra enkla steg för att skapa ert första schema.</p>
+          <p className="text-sm text-stone-600 mt-2">Fyra enkla steg för att skapa ert första schemaförslag.</p>
         </div>
         <div className="px-6 py-5 space-y-3">
           {STEPS.map((s) => (
@@ -3391,7 +3543,7 @@ function TourBubble({ step, onNext, onClose }) {
     },
     {
       title: 'Steg 2 av 4 · Personal',
-      desc: 'Lägg till en kollega i taget. Börja med avdelning, tjänstgöring, tillåtna pass och villkor som "måste börja senast 08:40 för lektion". Manuell veckoredigering används mest för finjustering efteråt.',
+      desc: 'Lägg först in passbanken under Inställningar, och lägg sedan till en kollega i taget. Börja med avdelning, tjänstgöring, tillåtna pass och villkor som "måste börja senast 08:40 för lektion". Manuell veckoredigering används mest för finjustering efteråt.',
     },
     {
       title: 'Steg 3 av 4 · Bemanningskrav',
@@ -3399,7 +3551,7 @@ function TourBubble({ step, onNext, onClose }) {
     },
     {
       title: 'Steg 4 av 4 · Vecka & Generera',
-      desc: 'Här ser du schemat per dag och täckning över tiden. Tryck på "Generera schemaförslag" högst upp för att låta appen pussla fram tre alternativ baserat på avdelningsbemanning, fredagar och allas villkor — eller justera manuellt genom att klicka på en person.',
+      desc: 'Här ser du schemat per dag och täckning över tiden. Tryck på "Generera schemaförslag" högst upp för att låta appen pussla fram tre alternativ baserat på passbanken, avdelningsbemanning, fredagar och allas villkor. Om något inte går ihop visas bristlistor direkt här.',
     },
   ];
   const cur = STEPS[step];
@@ -3442,7 +3594,7 @@ function AlternativesModal({ alternatives, currentStaff, coverageScopes, fridayC
         <div className="sticky top-0 bg-white border-b border-stone-200 px-6 py-4 flex items-center justify-between z-10">
           <div>
             <h2 className="display-font text-2xl text-stone-800">Tre schemaförslag</h2>
-            <p className="text-xs text-stone-500 mt-0.5">Klicka på ett kort för att förhandsgranska, "Tillämpa" för att använda. Fredag räknas med som snitt över rullen.</p>
+            <p className="text-xs text-stone-500 mt-0.5">Klicka på ett kort för att förhandsgranska, "Tillämpa" för att använda. Vardagar följer passbanken och fredag räknas med som snitt över rullen.</p>
           </div>
           <button onClick={onClose} className="text-stone-400 hover:text-stone-700"><X size={20} /></button>
         </div>
