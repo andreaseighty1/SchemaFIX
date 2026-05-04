@@ -1079,6 +1079,10 @@ function yieldToBrowser() {
   });
 }
 
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 async function runSearchAsync(initialStaff, coverageScopes, cycleWeeks, fridayTemplateRotation, passBank, weights, iterations = 2500, options = {}) {
   const { chunkSize = 100, onProgress } = options;
   let current = initialStaff.map(p => ({ ...p, sched: { ...p.sched } }));
@@ -1675,6 +1679,8 @@ function FritidsSchemaApp() {
       );
       setGenerationProgress({ percent: 100, label: 'Klart', detail: 'Schemaförslagen är färdiga' });
       setAlternatives(alts);
+      await yieldToBrowser();
+      await wait(450);
     } finally {
       setGenerating(false);
     }
@@ -1691,6 +1697,77 @@ function FritidsSchemaApp() {
         @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Geist:wght@400;500;600&display=swap');
         body { font-family: "Geist", system-ui, sans-serif; }
         .display-font { font-family: "Fraunces", Georgia, serif; font-feature-settings: "ss01"; }
+        .coffee-card {
+          background:
+            radial-gradient(circle at top, rgba(255,255,255,0.92), rgba(255,255,255,0.82) 36%, rgba(245,240,232,0.96) 100%);
+        }
+        .coffee-wrap {
+          position: relative;
+          width: 88px;
+          height: 88px;
+          margin: 0 auto 16px;
+        }
+        .coffee-plate {
+          position: absolute;
+          left: 50%;
+          bottom: 8px;
+          width: 74px;
+          height: 14px;
+          transform: translateX(-50%);
+          border-radius: 999px;
+          background: rgba(120, 113, 108, 0.15);
+        }
+        .coffee-cup {
+          position: absolute;
+          left: 50%;
+          bottom: 18px;
+          width: 52px;
+          height: 40px;
+          transform: translateX(-50%);
+          border-radius: 0 0 16px 16px;
+          background: linear-gradient(180deg, #fffdf9 0%, #f4ede1 100%);
+          border: 2px solid rgba(120, 113, 108, 0.18);
+          box-shadow: 0 12px 20px rgba(120, 113, 108, 0.12);
+        }
+        .coffee-cup::after {
+          content: "";
+          position: absolute;
+          right: -13px;
+          top: 8px;
+          width: 14px;
+          height: 16px;
+          border: 3px solid rgba(120, 113, 108, 0.26);
+          border-left: none;
+          border-radius: 0 12px 12px 0;
+        }
+        .coffee-fill {
+          position: absolute;
+          left: 7px;
+          right: 7px;
+          top: 8px;
+          height: 13px;
+          border-radius: 999px;
+          background: linear-gradient(180deg, #7c4a2c 0%, #5f381f 100%);
+        }
+        .coffee-steam {
+          position: absolute;
+          bottom: 58px;
+          width: 10px;
+          height: 34px;
+          border-radius: 999px;
+          background: linear-gradient(180deg, rgba(214, 211, 209, 0) 0%, rgba(214, 211, 209, 0.75) 55%, rgba(214, 211, 209, 0) 100%);
+          animation: steamDrift 2.1s ease-in-out infinite;
+          opacity: 0.8;
+        }
+        .coffee-steam.s1 { left: 28px; animation-delay: 0s; }
+        .coffee-steam.s2 { left: 40px; height: 40px; animation-delay: 0.5s; }
+        .coffee-steam.s3 { left: 52px; animation-delay: 1s; }
+        @keyframes steamDrift {
+          0% { transform: translateY(6px) scaleX(0.92); opacity: 0; }
+          20% { opacity: 0.72; }
+          70% { opacity: 0.48; }
+          100% { transform: translateY(-16px) scaleX(1.08); opacity: 0; }
+        }
       `}</style>
 
       <div className="max-w-7xl mx-auto px-6 py-8">
@@ -1811,11 +1888,21 @@ function FritidsSchemaApp() {
 
       {generating && (
         <div className="fixed inset-0 z-40 flex items-center justify-center" style={{ backgroundColor: 'rgba(28, 25, 23, 0.4)' }}>
-          <div className="bg-white rounded-2xl p-8 shadow-2xl text-center max-w-sm">
-            <div className="display-font text-2xl text-stone-800 mb-2">Pusslar...</div>
-            <p className="text-sm text-stone-600">{generationProgress.detail || 'Testar tusentals justeringar för att hitta tre olika alternativ åt er.'}</p>
-            <div className="mt-4 h-2 bg-stone-200 rounded-full overflow-hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={generationProgress.percent}>
-              <div className="h-full bg-stone-800 transition-all duration-200" style={{ width: `${generationProgress.percent}%` }} />
+          <div className="coffee-card rounded-[28px] p-8 shadow-2xl text-center max-w-sm ring-1 ring-stone-200/70">
+            <div className="coffee-wrap" aria-hidden="true">
+              <div className="coffee-steam s1" />
+              <div className="coffee-steam s2" />
+              <div className="coffee-steam s3" />
+              <div className="coffee-cup">
+                <div className="coffee-fill" />
+              </div>
+              <div className="coffee-plate" />
+            </div>
+            <div className="display-font text-2xl text-stone-800 mb-2">Jobbar med schemapusslet</div>
+            <p className="text-sm text-stone-600">{generationProgress.detail || 'Tar hänsyn till passbanken, bemanningen och allas villkor.'}</p>
+            <p className="text-xs text-stone-500 mt-2">Ta en kopp kaffe så länge.</p>
+            <div className="mt-5 h-2.5 bg-stone-200 rounded-full overflow-hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={generationProgress.percent}>
+              <div className="h-full rounded-full bg-gradient-to-r from-stone-700 via-stone-800 to-amber-700 transition-all duration-300" style={{ width: `${generationProgress.percent}%` }} />
             </div>
             <div className="mt-3 flex items-center justify-between text-xs text-stone-500">
               <span>{generationProgress.label || 'Räknar...'}</span>
