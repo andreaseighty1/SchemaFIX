@@ -303,6 +303,8 @@ function exampleBlock(start, end, min, label, scopeType = COVERAGE_SHARED, deptI
   return { id: Math.random(), start, end, min, max, label, scopeType, deptId };
 }
 
+const SLOT_STEP_MINUTES = 5;
+
 function normalizePassDays(days) {
   const source = Array.isArray(days) && days.length > 0 ? days : WEEKDAY_KEYS;
   return Array.from(new Set(source.filter(day => WEEKDAY_KEYS.includes(day))));
@@ -312,8 +314,8 @@ function normalizePass(pass, fallbackDays = WEEKDAY_KEYS) {
   const days = normalizePassDays(pass?.days || fallbackDays);
   const start = asNumber(pass?.start, 480);
   const end = asNumber(pass?.end, 960);
-  const safeStart = clamp(roundToQuarter(start), 330, 1020);
-  const safeEnd = clamp(roundToQuarter(end), safeStart + 60, 1080);
+  const safeStart = clamp(roundToStep(start), 330, 1020);
+  const safeEnd = clamp(roundToStep(end), safeStart + 60, 1080);
   return {
     id: pass?.id || `pass-${Math.random().toString(36).slice(2, 8)}`,
     name: typeof pass?.name === 'string' ? pass.name : `${minToTime(safeStart)}–${minToTime(safeEnd)}`,
@@ -560,7 +562,7 @@ function blockMatchesScope(block, scopeType, deptId = null) {
 // Konvertera block till 15-min slots som resten av koden använder
 function blocksToSlots(blocks, scopeType = COVERAGE_SHARED, deptId = null) {
   const arr = [];
-  for (let m = 330; m < 1080; m += 15) {
+  for (let m = 330; m < 1080; m += SLOT_STEP_MINUTES) {
     let min = 0;
     let max = 0;
     for (const b of blocks) {
@@ -618,7 +620,7 @@ function parseFlexibleTimeInput(value) {
   if (/^\d{1,2}:\d{2}$/.test(raw)) {
     const [h, m] = raw.split(':').map(Number);
     if (!Number.isFinite(h) || !Number.isFinite(m) || h < 0 || h > 23 || m < 0 || m > 59) return null;
-    return roundToQuarter(h * 60 + m);
+    return roundToStep(h * 60 + m);
   }
   if (/^\d{1,4}$/.test(raw)) {
     let h = 0;
@@ -633,12 +635,12 @@ function parseFlexibleTimeInput(value) {
       m = Number(raw.slice(2));
     }
     if (!Number.isFinite(h) || !Number.isFinite(m) || h < 0 || h > 23 || m < 0 || m > 59) return null;
-    return roundToQuarter(h * 60 + m);
+    return roundToStep(h * 60 + m);
   }
   return null;
 }
 function clamp(value, min, max) { return Math.min(Math.max(value, min), max); }
-function roundToQuarter(min) { return Math.round(min / 15) * 15; }
+function roundToStep(min) { return Math.round(min / SLOT_STEP_MINUTES) * SLOT_STEP_MINUTES; }
 function asNumber(value, fallback = null) {
   const num = typeof value === 'number' ? value : (typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN);
   return Number.isFinite(num) ? num : fallback;
@@ -773,12 +775,12 @@ function getSuggestedDayMinutes(person, cycleWeeks, fridayTemplateRotation = [])
     .filter(Number.isFinite);
   if (explicitDayMinutes.length > 0) {
     const avg = explicitDayMinutes.reduce((sum, min) => sum + min, 0) / explicitDayMinutes.length;
-    return clamp(roundToQuarter(avg), 60, 600);
+    return clamp(roundToStep(avg), 60, 600);
   }
   const workingDays = DAYS.filter(d => !(person.daysOff || []).includes(d.key)).length || DAYS.length;
   const fridayMinutes = avgFridayMinutes(person, cycleWeeks, fridayTemplateRotation);
   const remaining = Math.max(workingDays * 60, getTargetMin(person) - fridayMinutes);
-  return clamp(roundToQuarter(remaining / workingDays), 60, 600);
+  return clamp(roundToStep(remaining / workingDays), 60, 600);
 }
 
 function buildFallbackShift(person, dayKey, cycleWeeks, fridayTemplateRotation = []) {
@@ -788,9 +790,9 @@ function buildFallbackShift(person, dayKey, cycleWeeks, fridayTemplateRotation =
   const durationOffsets = [0, 15, -15, 30, -30, 45, -45, 60, -60, 90, -90, 120, -120];
   let best = null;
 
-  for (let start = 330; start <= 1020; start += 15) {
+  for (let start = 330; start <= 1020; start += SLOT_STEP_MINUTES) {
     for (const offset of durationOffsets) {
-      const length = clamp(roundToQuarter(desiredMinutes + offset), 60, 750);
+      const length = clamp(roundToStep(desiredMinutes + offset), 60, 750);
       const end = start + length;
       if (end > 1080) continue;
       const candidate = [minToTime(start), minToTime(end)];
@@ -940,11 +942,11 @@ function summarizeCoverageHealth(staff, coverageScopes, cycleWeeks, fridayTempla
       for (const s of slots) {
         if (s.count < s.min) {
           totalGaps++;
-          totalGapMinutes += 15 * (s.min - s.count);
+          totalGapMinutes += SLOT_STEP_MINUTES * (s.min - s.count);
         }
         if (s.count > s.max) {
           totalOver++;
-          totalOverMinutes += 15 * (s.count - s.max);
+          totalOverMinutes += SLOT_STEP_MINUTES * (s.count - s.max);
         }
       }
     }
@@ -957,11 +959,11 @@ function summarizeCoverageHealth(staff, coverageScopes, cycleWeeks, fridayTempla
         for (const s of slots) {
           if (s.count < s.min) {
             totalGaps++;
-            totalGapMinutes += 15 * (s.min - s.count);
+            totalGapMinutes += SLOT_STEP_MINUTES * (s.min - s.count);
           }
           if (s.count > s.max) {
             totalOver++;
-            totalOverMinutes += 15 * (s.count - s.max);
+            totalOverMinutes += SLOT_STEP_MINUTES * (s.count - s.max);
           }
         }
       }
@@ -982,11 +984,11 @@ function summarizeDayCoverageHealth(staff, dayKey, coverageScopes) {
     for (const s of slots) {
       if (s.count < s.min) {
         totalGaps++;
-        totalGapMinutes += 15 * (s.min - s.count);
+        totalGapMinutes += SLOT_STEP_MINUTES * (s.min - s.count);
       }
       if (s.count > s.max) {
         totalOver++;
-        totalOverMinutes += 15 * (s.count - s.max);
+        totalOverMinutes += SLOT_STEP_MINUTES * (s.count - s.max);
       }
     }
   }
@@ -1124,8 +1126,8 @@ function summarizeSchedule(staff, coverageScopes, cycleWeeks, fridayTemplateRota
     for (const scope of coverageScopes) {
       const slots = computeSlots(staff, d.key, scope.slots, scope);
       for (const s of slots) {
-        if (s.count < s.min) { totalGaps++; totalGapMinutes += 15 * (s.min - s.count); }
-        if (s.count > s.max) { totalOver++; totalOverMinutes += 15 * (s.count - s.max); }
+        if (s.count < s.min) { totalGaps++; totalGapMinutes += SLOT_STEP_MINUTES * (s.min - s.count); }
+        if (s.count > s.max) { totalOver++; totalOverMinutes += SLOT_STEP_MINUTES * (s.count - s.max); }
       }
     }
   }
@@ -1140,11 +1142,11 @@ function summarizeSchedule(staff, coverageScopes, cycleWeeks, fridayTemplateRota
         for (const s of slots) {
           if (s.count < s.min) {
             fridayGaps++;
-            fridayGapMinutes += 15 * (s.min - s.count);
+            fridayGapMinutes += SLOT_STEP_MINUTES * (s.min - s.count);
           }
           if (s.count > s.max) {
             fridayOver++;
-            fridayOverMinutes += 15 * (s.count - s.max);
+            fridayOverMinutes += SLOT_STEP_MINUTES * (s.count - s.max);
           }
         }
       }
@@ -1561,8 +1563,8 @@ function FritidsSchemaApp() {
         slots,
         gaps,
         overs,
-        gapMinutes: gaps.reduce((sum, s) => sum + 15 * (s.min - s.count), 0),
-        overMinutes: overs.reduce((sum, s) => sum + 15 * (s.count - s.max), 0),
+        gapMinutes: gaps.reduce((sum, s) => sum + SLOT_STEP_MINUTES * (s.min - s.count), 0),
+        overMinutes: overs.reduce((sum, s) => sum + SLOT_STEP_MINUTES * (s.count - s.max), 0),
       };
     });
     const primaryCoverage = coverageViews.find(v => v.key === COVERAGE_SHARED)
