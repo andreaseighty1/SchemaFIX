@@ -299,8 +299,8 @@ const EXAMPLE_PASS_BANK_STRESS = [
   passDef('stress-close', 'Sen stängning', 600, 1065),
 ];
 
-function exampleBlock(start, end, min, label, scopeType = COVERAGE_SHARED, deptId = null) {
-  return { id: Math.random(), start, end, min, label, scopeType, deptId };
+function exampleBlock(start, end, min, label, scopeType = COVERAGE_SHARED, deptId = null, max = min) {
+  return { id: Math.random(), start, end, min, max, label, scopeType, deptId };
 }
 
 function normalizePassDays(days) {
@@ -522,19 +522,23 @@ const EXAMPLE_SCENARIOS = [
 // Bemanningskrav som redigerbara block. Varje block: starttid–sluttid → minst N personer.
 // Tider är i minuter från midnatt (t.ex. 360 = 06:00).
 const initialCoverageBlocks = [
-  { id: 1, start: 350, end: 480, min: 2, label: 'Morgonfritids', scopeType: COVERAGE_SHARED, deptId: null },     // 05:50–08:00
-  { id: 2, start: 480, end: 780, min: 1, label: 'Skoldag', scopeType: COVERAGE_SHARED, deptId: null },            // 08:00–13:00
-  { id: 3, start: 780, end: 990, min: 4, label: 'Eftermiddagsfritids', scopeType: COVERAGE_SHARED, deptId: null },// 13:00–16:30
-  { id: 4, start: 990, end: 1065, min: 2, label: 'Sen eftermiddag', scopeType: COVERAGE_SHARED, deptId: null },   // 16:30–17:45
+  { id: 1, start: 350, end: 480, min: 2, max: 2, label: 'Morgonfritids', scopeType: COVERAGE_SHARED, deptId: null },     // 05:50–08:00
+  { id: 2, start: 480, end: 780, min: 1, max: 1, label: 'Skoldag', scopeType: COVERAGE_SHARED, deptId: null },            // 08:00–13:00
+  { id: 3, start: 780, end: 990, min: 4, max: 4, label: 'Eftermiddagsfritids', scopeType: COVERAGE_SHARED, deptId: null },// 13:00–16:30
+  { id: 4, start: 990, end: 1065, min: 2, max: 2, label: 'Sen eftermiddag', scopeType: COVERAGE_SHARED, deptId: null },   // 16:30–17:45
 ];
 
 function normalizeCoverageBlock(block, fallbackDeptId = '') {
   const scopeType = block?.scopeType === COVERAGE_DEPARTMENT ? COVERAGE_DEPARTMENT : COVERAGE_SHARED;
+  const min = Math.max(0, asNumber(block?.min, 0));
+  const maxRaw = asNumber(block?.max, min);
+  const max = maxRaw == null ? min : Math.max(min, maxRaw);
   return {
     id: block?.id ?? Math.random(),
     start: block?.start ?? 480,
     end: block?.end ?? 540,
-    min: block?.min ?? 0,
+    min,
+    max,
     label: block?.label || 'Nytt block',
     scopeType,
     deptId: scopeType === COVERAGE_DEPARTMENT ? (block?.deptId || fallbackDeptId || '') : null,
@@ -558,11 +562,16 @@ function blocksToSlots(blocks, scopeType = COVERAGE_SHARED, deptId = null) {
   const arr = [];
   for (let m = 330; m < 1080; m += 15) {
     let min = 0;
+    let max = 0;
     for (const b of blocks) {
       if (!blockMatchesScope(b, scopeType, deptId)) continue;
-      if (m >= b.start && m < b.end) { min = b.min; break; }
+      if (m >= b.start && m < b.end) {
+        min = b.min;
+        max = b.max ?? b.min;
+        break;
+      }
     }
-    arr.push({ start: m, min });
+    arr.push({ start: m, min, max });
   }
   return arr;
 }
@@ -885,7 +894,7 @@ function computeSlots(staff, dayKey, coverageSlots, scope = { scopeType: COVERAG
   });
 }
 
-function scheduleScore(staff, coverageScopes, cycleWeeks, fridayTemplateRotation, weights = { gap: 30, hours: 2, over: 1 }) {
+function scheduleScore(staff, coverageScopes, cycleWeeks, fridayTemplateRotation, weights = { gap: 30, hours: 2, over: 10 }) {
   let score = 0;
   // Hour target
   for (const p of staff) {
@@ -898,7 +907,7 @@ function scheduleScore(staff, coverageScopes, cycleWeeks, fridayTemplateRotation
       const slots = computeSlots(staff, d.key, scope.slots, scope);
       for (const s of slots) {
         if (s.count < s.min) score -= (s.min - s.count) ** 2 * weights.gap;
-        if (s.count > s.min + 2) score -= (s.count - s.min - 2) * weights.over;
+        if (s.count > s.max) score -= (s.count - s.max) ** 2 * weights.over;
       }
     }
   }
@@ -910,7 +919,7 @@ function scheduleScore(staff, coverageScopes, cycleWeeks, fridayTemplateRotation
         const slots = computeSlots(staff, 'fri', scope.slots, scope, { fridayWeek: week, cycleWeeks, fridayTemplateRotation });
         for (const s of slots) {
           if (s.count < s.min) fridayPenalty += (s.min - s.count) ** 2 * weights.gap;
-          if (s.count > s.min + 2) fridayPenalty += (s.count - s.min - 2) * weights.over;
+          if (s.count > s.max) fridayPenalty += (s.count - s.max) ** 2 * weights.over;
         }
       }
     }
@@ -1004,16 +1013,21 @@ async function runSearchAsync(initialStaff, coverageScopes, cycleWeeks, fridayTe
 }
 
 function summarizeSchedule(staff, coverageScopes, cycleWeeks, fridayTemplateRotation = []) {
-  let totalGaps = 0, totalGapMinutes = 0;
+  let totalGaps = 0, totalGapMinutes = 0, totalOver = 0, totalOverMinutes = 0;
   for (const d of DAYS) {
     for (const scope of coverageScopes) {
       const slots = computeSlots(staff, d.key, scope.slots, scope);
-      for (const s of slots) if (s.count < s.min) { totalGaps++; totalGapMinutes += 15 * (s.min - s.count); }
+      for (const s of slots) {
+        if (s.count < s.min) { totalGaps++; totalGapMinutes += 15 * (s.min - s.count); }
+        if (s.count > s.max) { totalOver++; totalOverMinutes += 15 * (s.count - s.max); }
+      }
     }
   }
   if (cycleWeeks > 0) {
     let fridayGaps = 0;
     let fridayGapMinutes = 0;
+    let fridayOver = 0;
+    let fridayOverMinutes = 0;
     for (let week = 1; week <= cycleWeeks; week++) {
       for (const scope of coverageScopes) {
         const slots = computeSlots(staff, 'fri', scope.slots, scope, { fridayWeek: week, cycleWeeks, fridayTemplateRotation });
@@ -1022,11 +1036,17 @@ function summarizeSchedule(staff, coverageScopes, cycleWeeks, fridayTemplateRota
             fridayGaps++;
             fridayGapMinutes += 15 * (s.min - s.count);
           }
+          if (s.count > s.max) {
+            fridayOver++;
+            fridayOverMinutes += 15 * (s.count - s.max);
+          }
         }
       }
     }
     totalGaps += Math.round(fridayGaps / cycleWeeks);
     totalGapMinutes += Math.round(fridayGapMinutes / cycleWeeks);
+    totalOver += Math.round(fridayOver / cycleWeeks);
+    totalOverMinutes += Math.round(fridayOverMinutes / cycleWeeks);
   }
   let totalHourDev = 0, peopleOff = 0;
   for (const p of staff) {
@@ -1034,7 +1054,7 @@ function summarizeSchedule(staff, coverageScopes, cycleWeeks, fridayTemplateRota
     totalHourDev += Math.abs(dev);
     if (Math.abs(dev) > 5) peopleOff++;
   }
-  return { totalGaps, totalGapMinutes, totalHourDev, peopleOff };
+  return { totalGaps, totalGapMinutes, totalOver, totalOverMinutes, totalHourDev, peopleOff };
 }
 
 function summarizeGapSegments(slots = []) {
@@ -1068,9 +1088,9 @@ function summarizeGapSegments(slots = []) {
 
 async function generateAlternativesAsync(initialStaff, coverageScopes, cycleWeeks, fridayTemplateRotation, passBank, onProgress) {
   const variants = [
-    { label: 'Bemannings­fokus', desc: 'Prioriterar att alla pass är täckta', weights: { gap: 50, hours: 1, over: 1 } },
-    { label: 'Tim­fokus',        desc: 'Prioriterar exakta veckotimmar',     weights: { gap: 15, hours: 5, over: 1 } },
-    { label: 'Balanserat',       desc: 'Väger båda målen lika',                weights: { gap: 30, hours: 2, over: 1 } },
+    { label: 'Bemannings­fokus', desc: 'Prioriterar att alla pass är täckta utan att överbemanna', weights: { gap: 50, hours: 1, over: 35 } },
+    { label: 'Tim­fokus',        desc: 'Prioriterar exakta veckotimmar men respekterar maxantal',  weights: { gap: 15, hours: 5, over: 22 } },
+    { label: 'Balanserat',       desc: 'Väger bemanning, timmål och maxantal',                     weights: { gap: 30, hours: 2, over: 28 } },
   ];
   const results = [];
   for (let i = 0; i < variants.length; i++) {
@@ -1425,15 +1445,18 @@ function FritidsSchemaApp() {
         : present;
       const slots = scope.slots.map(slot => {
         const count = scopePresent.filter(p => p.startMin <= slot.start && p.endMin > slot.start).length;
-        return { ...slot, count, gap: count < slot.min };
+        return { ...slot, count, gap: count < slot.min, over: count > slot.max };
       });
       const gaps = slots.filter(s => s.gap);
+      const overs = slots.filter(s => s.over);
       return {
         ...scope,
         present: scopePresent,
         slots,
         gaps,
+        overs,
         gapMinutes: gaps.reduce((sum, s) => sum + 15 * (s.min - s.count), 0),
+        overMinutes: overs.reduce((sum, s) => sum + 15 * (s.count - s.max), 0),
       };
     });
     const primaryCoverage = coverageViews.find(v => v.key === COVERAGE_SHARED)
@@ -1445,6 +1468,8 @@ function FritidsSchemaApp() {
       coverageViews,
       totalGaps: coverageViews.reduce((sum, v) => sum + v.gaps.length, 0),
       totalGapMinutes: coverageViews.reduce((sum, v) => sum + v.gapMinutes, 0),
+      totalOvers: coverageViews.reduce((sum, v) => sum + v.overs.length, 0),
+      totalOverMinutes: coverageViews.reduce((sum, v) => sum + v.overMinutes, 0),
       primaryCoverageKey: primaryCoverage?.key || COVERAGE_SHARED,
     };
   }, [staff, activeDay, coverageScopes, currentFridayWeek, fridayCycleWeeks]);
@@ -1793,6 +1818,21 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
       slotCount: segment.slotCount,
     })))
     .sort((a, b) => b.totalShortfallMinutes - a.totalShortfallMinutes || a.start - b.start);
+  const overAlerts = visibleCoverageViews
+    .filter(view => view.overs.length > 0)
+    .flatMap(view => summarizeGapSegments(view.slots.map(slot => ({
+      ...slot,
+      min: slot.over ? ((slot.count || 0) - (slot.max || 0)) : 0,
+      count: 0,
+    }))).map((segment, idx) => ({
+      id: `${view.key}-over-${idx}`,
+      label: view.label,
+      start: segment.start,
+      end: segment.end,
+      maxOverflow: segment.maxShortfall,
+      totalOverflowMinutes: segment.totalShortfallMinutes,
+    })))
+    .sort((a, b) => b.totalOverflowMinutes - a.totalOverflowMinutes || a.start - b.start);
 
   if (staffCount === 0) {
     return (
@@ -1881,6 +1921,28 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
         </div>
       )}
 
+      {overAlerts.length > 0 && (
+        <div className="bg-amber-50 ring-1 ring-amber-200 rounded-xl p-4">
+          <div className="flex items-center gap-2 mb-3">
+            <AlertCircle size={15} className="text-amber-700" />
+            <p className="text-sm text-stone-800" style={{ fontWeight: 500 }}>
+              Fler än planerat {isFriday && hasFridaySetup ? `på fredag vecka ${currentFridayWeek}` : `på ${dayLabel.toLowerCase()}`}
+            </p>
+          </div>
+          <div className="space-y-1.5">
+            {overAlerts.slice(0, 4).map(alert => (
+              <div key={alert.id} className="text-sm text-stone-700 flex items-start gap-2">
+                <ChevronRight size={14} className="text-amber-700 mt-0.5 flex-shrink-0" />
+                <span>
+                  <span style={{ fontWeight: 500 }}>{alert.label}:</span> fler än max {minToTime(alert.start)}–{minToTime(alert.end)}
+                  {` · som mest ${alert.maxOverflow} ${alert.maxOverflow === 1 ? 'person för mycket' : 'personer för mycket'}`}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {visibleCoverageViews.length > 0 && (
         <div className="grid md:grid-cols-2 xl:grid-cols-4 gap-3">
           {visibleCoverageViews.map(view => {
@@ -1894,7 +1956,7 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
                 </div>
                 <p className={`text-xs mt-2 ${selected ? 'text-stone-300' : 'text-stone-500'}`}>
                   {view.slots.some(s => s.min > 0)
-                    ? `${view.gaps.length} gap · ${view.gapMinutes} min underskott`
+                    ? `${view.gaps.length} gap · ${view.gapMinutes} min underskott${view.overs.length > 0 ? ` · ${view.overs.length} över max` : ''}`
                     : 'Inga krav satta än'}
                 </p>
               </button>
@@ -1973,6 +2035,10 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
                 <span className="text-xs text-orange-600 flex items-center gap-1">
                   <AlertCircle size={12} />{focusedCoverage.gaps.length} gap mot bemanningskrav
                 </span>
+              ) : focusedCoverage.overs.length > 0 ? (
+                <span className="text-xs text-amber-700 flex items-center gap-1">
+                  <AlertCircle size={12} />{focusedCoverage.overs.length} perioder över max
+                </span>
               ) : (
                 <span className="text-xs text-emerald-600 flex items-center gap-1">
                   <CheckCircle2 size={12} />Täcker alla krav
@@ -1985,7 +2051,7 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
                 const left = ((s.start - TIMELINE_START) / TIMELINE_RANGE) * 100;
                 const h = (s.count / maxCount) * 100;
                 return <div key={s.start} className="absolute bottom-0" style={{ left: `${left}%`, width: `${w}%`, height: `${h}%`,
-                  backgroundColor: s.gap ? '#F59E0B' : focusedCoverage.color, opacity: s.gap ? 0.85 : 0.55 }} />;
+                  backgroundColor: s.gap ? '#F59E0B' : (s.over ? '#D97706' : focusedCoverage.color), opacity: s.gap || s.over ? 0.85 : 0.55 }} />;
               })}
               {focusedCoverage.slots.map(s => {
                 const left = ((s.start - TIMELINE_START) / TIMELINE_RANGE) * 100;
@@ -1998,6 +2064,7 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
             <div className="ml-32 mt-1 flex items-center gap-4 text-[10px] text-stone-500">
               <span className="flex items-center gap-1"><span className="w-2 h-2" style={{ backgroundColor: focusedCoverage.color, opacity: 0.55 }} />Faktisk</span>
               <span className="flex items-center gap-1"><span className="w-2 h-2" style={{ backgroundColor: '#F59E0B', opacity: 0.85 }} />Under min</span>
+              <span className="flex items-center gap-1"><span className="w-2 h-2" style={{ backgroundColor: '#D97706', opacity: 0.85 }} />Över max</span>
               <span className="flex items-center gap-1"><span className="w-3 h-px" style={{ backgroundColor: '#dc2626' }} />Krav</span>
             </div>
           </div>
@@ -2140,19 +2207,29 @@ function StaffView({ staff, fridayCycleWeeks, fridayTemplateRotation, violations
 function RulesView({ blocks, setBlocks, departments }) {
   const updateBlock = (id, patch) => setBlocks(blocks.map(b => b.id === id ? { ...b, ...patch } : b));
   const removeBlock = (id) => setBlocks(blocks.filter(b => b.id !== id));
-  const addBlock = (scopeType = COVERAGE_SHARED) => {
+  const addBlock = (scopeType = COVERAGE_SHARED, preset = {}) => {
     const newId = Math.max(0, ...blocks.map(b => b.id)) + 1;
     const lastEnd = blocks.length > 0 ? Math.max(...blocks.map(b => b.end)) : 480;
+    const min = preset.min ?? 1;
+    const max = preset.max ?? min;
     setBlocks([...blocks, {
       id: newId,
-      start: lastEnd,
-      end: lastEnd + 60,
-      min: 1,
-      label: 'Nytt block',
+      start: preset.start ?? lastEnd,
+      end: preset.end ?? (lastEnd + 60),
+      min,
+      max,
+      label: preset.label || 'Nytt block',
       scopeType,
-      deptId: scopeType === COVERAGE_DEPARTMENT ? (departments[0]?.id || '') : null,
+      deptId: scopeType === COVERAGE_DEPARTMENT ? (preset.deptId || departments[0]?.id || '') : null,
     }]);
   };
+  const quickPresets = [
+    { id: 'open', label: 'Öppning 05:50–06:30', scopeType: COVERAGE_SHARED, start: 350, end: 390, min: 1, max: 1 },
+    { id: 'morning', label: 'Morgon 06:30–08:00', scopeType: COVERAGE_SHARED, start: 390, end: 480, min: 2, max: 2 },
+    { id: 'f23', label: 'F-2 från 13:15', scopeType: COVERAGE_DEPARTMENT, start: 795, end: 990, min: 2, max: 2 },
+    { id: '345', label: 'Åk 3-5 från 14:15', scopeType: COVERAGE_DEPARTMENT, start: 855, end: 990, min: 2, max: 2 },
+    { id: 'close', label: 'Stängning 16:30–17:45', scopeType: COVERAGE_SHARED, start: 990, end: 1065, min: 1, max: 1 },
+  ];
 
   const sorted = [...blocks].sort((a, b) => a.start - b.start);
   const scopeViews = buildCoverageScopes(blocks, departments);
@@ -2164,13 +2241,13 @@ function RulesView({ blocks, setBlocks, departments }) {
   return (
     <div className="space-y-4">
       <TabIntro>
-        Här definierar du hur många personer som behöver vara på plats vid olika tider. Block kan gälla hela fritids tillsammans eller en viss avdelning, vilket gör att ni kan ha sammanslagen morgon men olika eftermiddagsstarter.
+        Här definierar du hur många personer som behöver vara på plats vid olika tider. Varje block har nu både min och max, så du kan säga "exakt 1 på öppning" i stället för bara "minst 1".
       </TabIntro>
       <div className="bg-white rounded-2xl ring-1 ring-stone-200 p-5">
         <div className="flex items-start justify-between mb-4 gap-4 flex-wrap">
           <div>
             <h2 className="display-font text-xl text-stone-800">Bemanningskrav</h2>
-            <p className="text-sm text-stone-500 mt-0.5">Definiera gemensamma block och avdelningsblock. Olika avdelningar kan starta olika tider.</p>
+            <p className="text-sm text-stone-500 mt-0.5">Definiera gemensamma block och avdelningsblock. Olika avdelningar kan starta olika tider, och öppning/stängning kan styras mer exakt med maxantal.</p>
           </div>
           <div className="flex gap-2 flex-wrap">
             <button onClick={() => addBlock(COVERAGE_SHARED)}
@@ -2184,9 +2261,24 @@ function RulesView({ blocks, setBlocks, departments }) {
           </div>
         </div>
 
+        <div className="mb-5 rounded-xl bg-stone-50 ring-1 ring-stone-200 p-4">
+          <p className="text-xs uppercase tracking-wider text-stone-500 mb-2">Snabbblock</p>
+          <p className="text-sm text-stone-600 mb-3">Lägg in vanliga delar av dagen som startvärden och justera sedan tider eller antal efter ert fritids.</p>
+          <div className="flex gap-2 flex-wrap">
+            {quickPresets.map(preset => (
+              <button key={preset.id} type="button"
+                onClick={() => addBlock(preset.scopeType, preset)}
+                disabled={preset.scopeType === COVERAGE_DEPARTMENT && departments.length === 0}
+                className="px-3 py-1.5 rounded-lg text-sm bg-white text-stone-700 ring-1 ring-stone-200 hover:bg-stone-100 disabled:opacity-50">
+                {preset.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
         <div className="grid md:grid-cols-2 xl:grid-cols-4 gap-3 mb-5">
           {scopeViews.map(view => {
-            const maxMin = Math.max(...view.slots.map(s => s.min), 1);
+            const maxMin = Math.max(...view.slots.map(s => s.max), 1);
             return (
               <div key={view.key} className="rounded-xl ring-1 ring-stone-200 bg-stone-50/70 p-3">
                 <div className="flex items-center justify-between gap-3 mb-2">
@@ -2197,13 +2289,13 @@ function RulesView({ blocks, setBlocks, departments }) {
                   {view.slots.map(s => {
                     const left = ((s.start - TIMELINE_START) / TIMELINE_RANGE) * 100;
                     const w = 100 / view.slots.length;
-                    const h = (s.min / maxMin) * 100;
+                    const h = (s.max / maxMin) * 100;
                     return <div key={s.start} className="absolute bottom-0"
                       style={{ left: `${left}%`, width: `${w}%`, height: `${h}%`, backgroundColor: view.color, opacity: 0.55 }} />;
                   })}
                 </div>
                 <p className="text-[10px] text-stone-500 mt-2">
-                  {view.slots.some(s => s.min > 0) ? 'Minimikrav över dagen' : 'Inga block satta än'}
+                  {view.slots.some(s => s.max > 0) ? 'Bemanningsspann över dagen' : 'Inga block satta än'}
                 </p>
               </div>
             );
@@ -2215,7 +2307,8 @@ function RulesView({ blocks, setBlocks, departments }) {
             <div className="col-span-3">Namn på block</div>
             <div className="col-span-3">Gäller för</div>
             <div className="col-span-3">Tid</div>
-            <div className="col-span-2">Minsta personal</div>
+            <div className="col-span-1 text-center">Min</div>
+            <div className="col-span-1 text-center">Max</div>
             <div className="col-span-1"></div>
           </div>
           {sorted.map(b => (
@@ -2232,19 +2325,18 @@ function RulesView({ blocks, setBlocks, departments }) {
                 {scopeOptions.map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
               </select>
               <div className="col-span-3 flex items-center gap-1">
-                <input type="time" className="rules-input flex-1"
-                  value={minToTime(b.start)} onChange={e => updateBlock(b.id, { start: timeToMin(e.target.value) })} />
+                <TimeTextInput className="rules-input flex-1" valueMinutes={b.start}
+                  onCommit={(minutes) => updateBlock(b.id, { start: minutes })} />
                 <span className="text-stone-400 text-xs">–</span>
-                <input type="time" className="rules-input flex-1"
-                  value={minToTime(b.end)} onChange={e => updateBlock(b.id, { end: timeToMin(e.target.value) })} />
+                <TimeTextInput className="rules-input flex-1" valueMinutes={b.end}
+                  onCommit={(minutes) => updateBlock(b.id, { end: minutes })} />
               </div>
-              <div className="col-span-2 flex items-center gap-2">
-                <button type="button" onClick={() => updateBlock(b.id, { min: Math.max(0, b.min - 1) })}
-                  className="w-7 h-7 rounded bg-stone-100 hover:bg-stone-200 text-stone-700">−</button>
-                <span className="display-font text-lg text-stone-800 w-8 text-center tabular-nums">{b.min}</span>
-                <button type="button" onClick={() => updateBlock(b.id, { min: b.min + 1 })}
-                  className="w-7 h-7 rounded bg-stone-100 hover:bg-stone-200 text-stone-700">+</button>
-              </div>
+              <input type="number" min="0" className="rules-input col-span-1 text-center"
+                value={b.min}
+                onChange={e => updateBlock(b.id, { min: Math.max(0, parseInt(e.target.value, 10) || 0), max: Math.max(Math.max(0, parseInt(e.target.value, 10) || 0), b.max ?? b.min) })} />
+              <input type="number" min={b.min} className="rules-input col-span-1 text-center"
+                value={b.max ?? b.min}
+                onChange={e => updateBlock(b.id, { max: Math.max(b.min, parseInt(e.target.value, 10) || b.min) })} />
               <div className="col-span-1 flex justify-end">
                 <button onClick={() => removeBlock(b.id)} className="text-stone-400 hover:text-red-600 p-1">
                   <Trash2 size={14} />
@@ -2255,7 +2347,7 @@ function RulesView({ blocks, setBlocks, departments }) {
         </div>
 
         <div className="mt-5 pt-4 border-t border-stone-100 text-xs text-stone-500">
-          <p>Tips: skapa ett gemensamt block för t.ex. 06:00–08:00 och lägg sedan avdelningsblock med olika starttider, t.ex. 13:15 för F–2 och 14:15 för åk 3–5. Om block överlappar inom samma vy används det första i tidsordning.</p>
+          <p>Tips: om du vill ha exakt en öppnare mellan 05:50 och 06:30 sätter du både min och max till 1 i det blocket. Om block överlappar inom samma vy används det första i tidsordning.</p>
         </div>
       </div>
 
@@ -3619,6 +3711,12 @@ function AlternativesModal({ alternatives, currentStaff, coverageScopes, fridayC
                       </span>
                     </div>
                     <div className="flex justify-between">
+                      <span className={isSelected ? 'text-stone-300' : 'text-stone-500'}>Över max:</span>
+                      <span className={isSelected ? 'text-white' : better(alt.summary.totalOver, currentSummary.totalOver)} style={{ fontWeight: 500 }}>
+                        {alt.summary.totalOver} {alt.summary.totalOverMinutes > 0 && `(${alt.summary.totalOverMinutes} min)`}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
                       <span className={isSelected ? 'text-stone-300' : 'text-stone-500'}>Pers. m. tim-avvik.:</span>
                       <span className={isSelected ? 'text-white' : better(alt.summary.peopleOff, currentSummary.peopleOff)} style={{ fontWeight: 500 }}>
                         {alt.summary.peopleOff} pers.
@@ -3640,6 +3738,8 @@ function AlternativesModal({ alternatives, currentStaff, coverageScopes, fridayC
           <div className="bg-stone-50 rounded-lg p-3 mb-6 text-xs text-stone-600 flex items-center gap-3 flex-wrap">
             <span className="text-stone-500">Nuvarande schema till jämförelse:</span>
             <span><span style={{ fontWeight: 500 }}>{currentSummary.totalGaps}</span> gap</span>
+            <span>·</span>
+            <span><span style={{ fontWeight: 500 }}>{currentSummary.totalOver}</span> över max</span>
             <span>·</span>
             <span><span style={{ fontWeight: 500 }}>{currentSummary.peopleOff}</span> personer m. tim-avvikelse</span>
             <span>·</span>
@@ -3675,12 +3775,16 @@ function PreviewSchedule({ staff, originalStaff, coverageScopes, departments }) 
           const slots = computeSlots(staff, d.key, scope.slots, scope);
           return sum + slots.filter(s => s.count < s.min).length;
         }, 0);
+        const overs = coverageScopes.reduce((sum, scope) => {
+          const slots = computeSlots(staff, d.key, scope.slots, scope);
+          return sum + slots.filter(s => s.count > s.max).length;
+        }, 0);
         return (
           <div key={d.key} className="bg-white ring-1 ring-stone-200 rounded-lg p-3">
             <div className="flex items-center justify-between mb-2">
               <p className="text-sm text-stone-700" style={{ fontWeight: 500 }}>{d.label}</p>
-              <span className={`text-[10px] px-2 py-0.5 rounded ${gaps === 0 ? 'bg-emerald-50 text-emerald-700' : 'bg-orange-50 text-orange-700'}`}>
-                {gaps === 0 ? 'Täcker krav' : `${gaps} gap`}
+              <span className={`text-[10px] px-2 py-0.5 rounded ${gaps > 0 ? 'bg-orange-50 text-orange-700' : overs > 0 ? 'bg-amber-50 text-amber-700' : 'bg-emerald-50 text-emerald-700'}`}>
+                {gaps > 0 ? `${gaps} gap` : overs > 0 ? `${overs} över max` : 'Täcker krav'}
               </span>
             </div>
             <div className="space-y-0.5">
