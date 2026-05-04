@@ -1033,6 +1033,7 @@ function attemptMutation(staff, passBank = [], cycleWeeks = 8, fridayTemplateRot
     .filter(shift => !current || shift[0] !== current[0] || shift[1] !== current[1]);
   if (possibleShifts.length === 0) return null;
   const preferred = buildSuggestedShift(p, d.key, cycleWeeks, fridayTemplateRotation, passBank);
+  const currentDayHealth = coverageScopes.length > 0 ? summarizeDayCoverageHealth(staff, d.key, coverageScopes) : null;
   const variants = possibleShifts.map(shift => {
     const candidate = staff.map(person => person.id === p.id
       ? { ...person, sched: { ...person.sched, [d.key]: shift } }
@@ -1054,11 +1055,13 @@ function attemptMutation(staff, passBank = [], cycleWeeks = 8, fridayTemplateRot
     return a.preferenceScore - b.preferenceScore;
   });
 
-  const bestHealth = variants[0]?.dayHealth || null;
-  const bestVariants = variants.filter(variant => compareCoverageHealth(variant.dayHealth, bestHealth) === 0);
-  const selectedPool = bestVariants.length > 0 ? bestVariants : variants;
-  const chosen = Math.random() < 0.8
-    ? selectedPool[0]
+  const nonWorsening = currentDayHealth
+    ? variants.filter(variant => compareCoverageHealth(variant.dayHealth, currentDayHealth) <= 0)
+    : variants;
+  const selectedPool = nonWorsening.length > 0 ? nonWorsening : variants;
+  const topSlice = selectedPool.slice(0, Math.min(4, selectedPool.length));
+  const chosen = Math.random() < 0.55
+    ? topSlice[Math.floor(Math.random() * topSlice.length)]
     : selectedPool[Math.floor(Math.random() * selectedPool.length)];
 
   return chosen?.candidate || null;
