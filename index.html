@@ -1109,7 +1109,60 @@ function computeSlots(staff, dayKey, coverageSlots, scope = { scopeType: COVERAG
   });
 }
 
-function scheduleScore(staff, coverageScopes, cycleWeeks, fridayTemplateRotation, weights = { gap: 30, hours: 2, over: 10 }) {
+function getAssignedPassMeta(shift, dayKey, passBank = []) {
+  if (!shift) return null;
+  const pass = normalizePassBank(passBank).find(candidate => candidate.days.includes(dayKey) && shiftMatchesPass(shift, candidate));
+  if (pass) {
+    return {
+      key: pass.id,
+      type: pass.passType || inferPassType(pass),
+    };
+  }
+  return {
+    key: `${shift[0]}-${shift[1]}`,
+    type: inferPassType({ start: timeToMin(shift[0]), end: timeToMin(shift[1]) }),
+  };
+}
+
+function scheduleSpreadPenalty(staff, passBank = []) {
+  let penalty = 0;
+  const normalizedPasses = normalizePassBank(passBank);
+
+  for (const day of DAYS) {
+    const passOptionsByType = new Map();
+    normalizedPasses
+      .filter(pass => pass.days.includes(day.key))
+      .forEach(pass => {
+        const type = pass.passType || inferPassType(pass);
+        if (!passOptionsByType.has(type)) passOptionsByType.set(type, new Set());
+        passOptionsByType.get(type).add(pass.id);
+      });
+
+    const assignedByType = new Map();
+    for (const person of staff) {
+      const shift = getShiftForDay(person, day.key);
+      if (!shift) continue;
+      const meta = getAssignedPassMeta(shift, day.key, passBank);
+      if (!meta) continue;
+      if (!assignedByType.has(meta.type)) assignedByType.set(meta.type, new Map());
+      const counts = assignedByType.get(meta.type);
+      counts.set(meta.key, (counts.get(meta.key) || 0) + 1);
+    }
+
+    assignedByType.forEach((counts, type) => {
+      const assignedTotal = [...counts.values()].reduce((sum, count) => sum + count, 0);
+      const optionCount = Math.max(1, passOptionsByType.get(type)?.size || counts.size || 1);
+      const softCap = Math.max(1, Math.ceil(assignedTotal / optionCount));
+      counts.forEach(count => {
+        if (count > softCap) penalty += (count - softCap) ** 2;
+      });
+    });
+  }
+
+  return penalty;
+}
+
+function scheduleScore(staff, coverageScopes, cycleWeeks, fridayTemplateRotation, weights = { gap: 30, hours: 2, over: 10, spread: 0 }, passBank = []) {
   let score = 0;
   // Hour target
   for (const p of staff) {
@@ -1139,6 +1192,9 @@ function scheduleScore(staff, coverageScopes, cycleWeeks, fridayTemplateRotation
       }
     }
     score -= fridayPenalty / cycleWeeks;
+  }
+  if ((weights.spread || 0) > 0) {
+    score -= scheduleSpreadPenalty(staff, passBank) * weights.spread;
   }
   return score;
 }
@@ -1391,7 +1447,7 @@ async function runSearchAsync(initialStaff, coverageScopes, cycleWeeks, fridayTe
   const { chunkSize = 100, onProgress } = options;
   let current = initialStaff.map(p => ({ ...p, sched: { ...p.sched } }));
   let currentAnchorHealth = summarizeGlobalAnchorCoverageHealth(current, coverageScopes, cycleWeeks, fridayTemplateRotation);
-  let currentScore = scheduleScore(current, coverageScopes, cycleWeeks, fridayTemplateRotation, weights);
+  let currentScore = scheduleScore(current, coverageScopes, cycleWeeks, fridayTemplateRotation, weights, passBank);
   let currentHealth = summarizeCoverageHealth(current, coverageScopes, cycleWeeks, fridayTemplateRotation);
   let best = current;
   let bestAnchorHealth = currentAnchorHealth;
@@ -1406,7 +1462,7 @@ async function runSearchAsync(initialStaff, coverageScopes, cycleWeeks, fridayTe
       const cand = attemptMutation(current, passBank, cycleWeeks, fridayTemplateRotation, coverageScopes);
       if (!cand) continue;
       const candAnchorHealth = summarizeGlobalAnchorCoverageHealth(cand, coverageScopes, cycleWeeks, fridayTemplateRotation);
-      const cs = scheduleScore(cand, coverageScopes, cycleWeeks, fridayTemplateRotation, weights);
+      const cs = scheduleScore(cand, coverageScopes, cycleWeeks, fridayTemplateRotation, weights, passBank);
       const candHealth = summarizeCoverageHealth(cand, coverageScopes, cycleWeeks, fridayTemplateRotation);
       const anchorDelta = compareCoverageHealth(candAnchorHealth, currentAnchorHealth);
       const healthDelta = compareCoverageHealth(candHealth, currentHealth);
@@ -1514,9 +1570,9 @@ function summarizeGapSegments(slots = []) {
 
 async function generateAlternativesAsync(initialStaff, coverageScopes, cycleWeeks, fridayTemplateRotation, passBank, onProgress) {
   const variants = [
-    { label: 'Bemannings­fokus', desc: 'Prioriterar att alla pass är täckta utan att överbemanna', weights: { gap: 50, hours: 1, over: 35 } },
-    { label: 'Tim­fokus',        desc: 'Prioriterar exakta veckotimmar men respekterar maxantal',  weights: { gap: 15, hours: 5, over: 22 } },
-    { label: 'Balanserat',       desc: 'Väger bemanning, timmål och maxantal',                     weights: { gap: 30, hours: 2, over: 28 } },
+    { label: 'Bemannings­fokus', desc: 'Prioriterar att alla pass är täckta utan att överbemanna', weights: { gap: 50, hours: 1, over: 35, spread: 4 } },
+    { label: 'Tim­fokus',        desc: 'Prioriterar exakta veckotimmar men försöker sprida passen', weights: { gap: 15, hours: 5, over: 22, spread: 12 } },
+    { label: 'Balanserat',       desc: 'Väger bemanning, timmål, maxantal och passpridning',        weights: { gap: 30, hours: 2, over: 28, spread: 8 } },
   ];
   const results = [];
   for (let i = 0; i < variants.length; i++) {
@@ -2256,7 +2312,7 @@ function FritidsSchemaApp() {
             <p className="text-xs uppercase tracking-widest text-stone-500 mb-1">Fritidshem · schemaverktyg</p>
             <h1 className="display-font text-4xl text-stone-800" style={{ letterSpacing: '-0.02em' }}>SchemaFIX</h1>
             <div className="flex items-center gap-2 mt-1">
-              <p className="text-stone-600 text-sm">Prototyp v19 · hårdare ankarlogik i generatorn och stabilare blocktolkning</p>
+              <p className="text-stone-600 text-sm">Prototyp v20 · hårdare ankarlogik och mjuk spridning av pass</p>
               {dirty && (
                 <span className="inline-flex items-center gap-1 text-xs text-amber-700 bg-amber-50 ring-1 ring-amber-200 rounded-full px-2 py-0.5">
                   <Circle size={6} fill="currentColor" />
