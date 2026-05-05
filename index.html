@@ -575,10 +575,15 @@ function normalizeCoverageBlock(block, fallbackDeptId = '') {
   const min = Math.max(0, asNumber(block?.min, 0));
   const maxRaw = asNumber(block?.max, min);
   const max = maxRaw == null ? min : Math.max(min, maxRaw);
+  const start = block?.start ?? 480;
+  const end = block?.end ?? 540;
+  const fullFromRaw = asNumber(block?.fullFrom, start);
+  const fullFrom = clamp(roundToStep(fullFromRaw), start, end);
   return {
     id: block?.id ?? Math.random(),
-    start: block?.start ?? 480,
-    end: block?.end ?? 540,
+    start,
+    end,
+    fullFrom,
     min,
     max,
     label: typeof block?.label === 'string' ? block.label : 'Nytt block',
@@ -599,6 +604,13 @@ function blockMatchesScope(block, scopeType, deptId = null) {
   return block.scopeType !== COVERAGE_DEPARTMENT;
 }
 
+function getCoverageBlockActiveStart(block) {
+  const start = asNumber(block?.start, 480);
+  const end = asNumber(block?.end, 540);
+  const fullFrom = asNumber(block?.fullFrom, start);
+  return clamp(roundToStep(fullFrom), start, end);
+}
+
 // Konvertera block till 15-min slots som resten av koden använder
 function blocksToSlots(blocks, scopeType = COVERAGE_SHARED, deptId = null) {
   const arr = [];
@@ -607,7 +619,7 @@ function blocksToSlots(blocks, scopeType = COVERAGE_SHARED, deptId = null) {
     let max = 0;
     for (const b of blocks) {
       if (!blockMatchesScope(b, scopeType, deptId)) continue;
-      if (m >= b.start && m < b.end) {
+      if (m >= getCoverageBlockActiveStart(b) && m < b.end) {
         min = b.min;
         max = b.max ?? b.min;
         break;
@@ -1520,6 +1532,26 @@ function analyzeCoverageFeasibility(staff, passBank, coverageScopes, cycleWeeks 
       }
     });
 
+    const boundaryTimes = positiveTimes.filter((time, idx) => idx === 0 || getTotalRequiredAtTime(coverageScopes, time) !== getTotalRequiredAtTime(coverageScopes, positiveTimes[idx - 1]));
+    for (let i = 0; i < boundaryTimes.length; i++) {
+      for (let j = i + 1; j < boundaryTimes.length; j++) {
+        const early = boundaryTimes[i];
+        const late = boundaryTimes[j];
+        const earlyRequired = getTotalRequiredAtTime(coverageScopes, early);
+        const lateRequired = getTotalRequiredAtTime(coverageScopes, late);
+        const neededOverlap = Math.max(0, earlyRequired + lateRequired - dayStaff.length);
+        if (neededOverlap <= 0) continue;
+        const overlapAvailable = dayStaff.filter(person => personCanCoverTimes(person, day.key, [early, late], passBank)).length;
+        if (overlapAvailable < neededOverlap) {
+          issues.push({
+            kind: 'flow',
+            dayKey: day.key,
+            message: `${getDayMeta(day.key).label}: bemanningen kräver att minst ${neededOverlap} person${neededOverlap === 1 ? '' : 'er'} täcker både ${minToTime(early)} och ${minToTime(late)}, men bara ${overlapAvailable} kan göra det med ett och samma pass. Det betyder att blocken över dagen krockar matematiskt.`,
+          });
+        }
+      }
+    }
+
     const criticalTimes = positiveTimes.filter(time => {
       const required = getTotalRequiredAtTime(coverageScopes, time);
       const available = availabilityByTime.get(time) || 0;
@@ -1576,7 +1608,7 @@ function analyzeCoverageBlockStatus(block, staff, passBank, cycleWeeks = 8) {
     deptId: block.scopeType === COVERAGE_DEPARTMENT ? block.deptId : null,
   };
   const times = [];
-  for (let time = block.start; time < block.end; time += SLOT_STEP_MINUTES) times.push(time);
+  for (let time = getCoverageBlockActiveStart(block); time < block.end; time += SLOT_STEP_MINUTES) times.push(time);
 
   const dayChecks = DAYS.map(day => {
     let worstAvailable = Infinity;
@@ -2161,7 +2193,7 @@ function FritidsSchemaApp() {
             <p className="text-xs uppercase tracking-widest text-stone-500 mb-1">Fritidshem · schemaverktyg</p>
             <h1 className="display-font text-4xl text-stone-800" style={{ letterSpacing: '-0.02em' }}>SchemaFIX</h1>
             <div className="flex items-center gap-2 mt-1">
-              <p className="text-stone-600 text-sm">Prototyp v16 · live-kontroll i bemanning och tydligare blockstatus</p>
+              <p className="text-stone-600 text-sm">Prototyp v18 · full från-tid för upptrappning och tydligare bemanningsflöde</p>
               {dirty && (
                 <span className="inline-flex items-center gap-1 text-xs text-amber-700 bg-amber-50 ring-1 ring-amber-200 rounded-full px-2 py-0.5">
                   <Circle size={6} fill="currentColor" />
@@ -3189,6 +3221,7 @@ function RulesView({ blocks, setBlocks, departments, staff, passBank, fridayCycl
       id: newId,
       start: preset.start ?? lastEnd,
       end: preset.end ?? (lastEnd + 60),
+      fullFrom: preset.fullFrom ?? (preset.start ?? lastEnd),
       min,
       max,
       label: preset.label || 'Nytt block',
@@ -3220,7 +3253,7 @@ function RulesView({ blocks, setBlocks, departments, staff, passBank, fridayCycl
   return (
     <div className="space-y-4">
       <TabIntro>
-        Här definierar du hur många personer som behöver vara på plats vid olika tider. Varje block har både min och max, så du kan säga "exakt 1 på öppning" i stället för bara "minst 1". Tänk i delar av dagen: tidig öppning, morgonfritids, skoltid om något måste täckas, och sedan avdelningsblock när olika fritidsgrupper startar.
+        Här definierar du hur många personer som behöver vara på plats vid olika tider. Varje block har både min och max, så du kan säga "exakt 1 på öppning" i stället för bara "minst 1". Med `Full från` kan ett block börja tidigare som ett spann, men först kräva full bemanning från en senare tid.
       </TabIntro>
       <div className="bg-white rounded-2xl ring-1 ring-stone-200 p-5">
         <div className="flex items-start justify-between mb-4 gap-4 flex-wrap">
@@ -3305,7 +3338,11 @@ function RulesView({ blocks, setBlocks, departments, staff, passBank, fridayCycl
                   <div className="flex items-start justify-between gap-3">
                     <div>
                       <p className="text-sm text-stone-800" style={{ fontWeight: 500 }}>{block.label || 'Nytt block'}</p>
-                      <p className="text-xs text-stone-500 mt-0.5">{scopeLabel} · {minToTime(block.start)}–{minToTime(block.end)} · min {block.min} / max {block.max ?? block.min}</p>
+                      <p className="text-xs text-stone-500 mt-0.5">
+                        {scopeLabel} · {minToTime(block.start)}–{minToTime(block.end)}
+                        {getCoverageBlockActiveStart(block) > block.start ? ` · full från ${minToTime(getCoverageBlockActiveStart(block))}` : ''}
+                        {' · '}min {block.min} / max {block.max ?? block.min}
+                      </p>
                     </div>
                     <span className={`text-[10px] px-2 py-1 rounded-full ${badge.cls}`}>{badge.label}</span>
                   </div>
@@ -3387,12 +3424,25 @@ function RulesView({ blocks, setBlocks, departments, staff, passBank, fridayCycl
                 }}>
                 {scopeOptions.map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
               </select>
-              <div className="col-span-3 flex items-center gap-1">
-                <TimeTextInput className="rules-input flex-1" valueMinutes={b.start}
-                  onCommit={(minutes) => updateBlock(b.id, { start: minutes })} />
-                <span className="text-stone-400 text-xs">–</span>
-                <TimeTextInput className="rules-input flex-1" valueMinutes={b.end}
-                  onCommit={(minutes) => updateBlock(b.id, { end: minutes })} />
+              <div className="col-span-3 space-y-1">
+                <div className="flex items-center gap-1">
+                  <TimeTextInput className="rules-input flex-1" valueMinutes={b.start}
+                    onCommit={(minutes) => updateBlock(b.id, {
+                      start: minutes,
+                      fullFrom: clamp(b.fullFrom ?? minutes, minutes, b.end),
+                    })} />
+                  <span className="text-stone-400 text-xs">–</span>
+                  <TimeTextInput className="rules-input flex-1" valueMinutes={b.end}
+                    onCommit={(minutes) => updateBlock(b.id, {
+                      end: minutes,
+                      fullFrom: clamp(b.fullFrom ?? b.start, b.start, minutes),
+                    })} />
+                </div>
+                <div className="flex items-center gap-1">
+                  <span className="text-[10px] text-stone-400 whitespace-nowrap">Full från</span>
+                  <TimeTextInput className="rules-input flex-1" valueMinutes={b.fullFrom ?? b.start}
+                    onCommit={(minutes) => updateBlock(b.id, { fullFrom: clamp(minutes, b.start, b.end) })} />
+                </div>
               </div>
               <input type="number" min="0" className="rules-input col-span-1 text-center"
                 value={b.min}
@@ -3411,7 +3461,7 @@ function RulesView({ blocks, setBlocks, departments, staff, passBank, fridayCycl
         </div>
 
         <div className="mt-5 pt-4 border-t border-stone-100 text-xs text-stone-500">
-          <p>Tips: använd gemensamma block när alla avdelningar är sammanslagna, och avdelningsblock när fritids startar olika tider. Om du inte har något särskilt som måste täckas under skoltid kan du låta den perioden vara utan bemanningskrav. Om block överlappar inom samma vy används det första i tidsordning. Live-kontrollen tittar på om blocket går att täcka med nuvarande passbank och personalvillkor.</p>
+          <p>Tips: använd gemensamma block när alla avdelningar är sammanslagna, och avdelningsblock när fritids startar olika tider. Om du inte har något särskilt som måste täckas under skoltid kan du låta den perioden vara utan bemanningskrav. `Full från` är bra när ni trappar upp till full styrka, till exempel öppning 05:50–06:30 och full bemanning 5 senast 07:15. Live-kontrollen tittar på om blocket går att täcka med nuvarande passbank och personalvillkor.</p>
         </div>
       </div>
 
