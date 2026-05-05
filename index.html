@@ -891,6 +891,43 @@ function buildSuggestedShift(person, dayKey, cycleWeeks, fridayTemplateRotation 
   return buildFallbackShift(person, dayKey, cycleWeeks, fridayTemplateRotation);
 }
 
+function buildCoverageAwareShift(person, dayKey, baseStaff, coverageScopes, cycleWeeks, fridayTemplateRotation = [], passBank = []) {
+  const eligiblePasses = getEligiblePassesForDay(person, dayKey, passBank);
+  if (eligiblePasses.length === 0) return null;
+  if (!coverageScopes || coverageScopes.length === 0) {
+    return buildSuggestedShift(person, dayKey, cycleWeeks, fridayTemplateRotation, passBank);
+  }
+
+  const desiredMinutes = getSuggestedDayMinutes(person, cycleWeeks, fridayTemplateRotation);
+  const preferredStart = person.onlyAfternoons ? 13 * 60 : 8 * 60;
+  const currentDayHealth = summarizeDayCoverageHealth(baseStaff, dayKey, coverageScopes);
+
+  const ranked = eligiblePasses
+    .map(pass => {
+      const shift = passToShift(pass);
+      const candidateStaff = baseStaff.map(member => member.id === person.id
+        ? { ...member, sched: { ...member.sched, [dayKey]: shift } }
+        : member
+      );
+      return {
+        pass,
+        shift,
+        dayHealth: summarizeDayCoverageHealth(candidateStaff, dayKey, coverageScopes),
+        fitScore: Math.abs(pass.start - preferredStart) + Math.abs(passDuration(pass) - desiredMinutes) * 2,
+      };
+    })
+    .sort((a, b) => {
+      const currentVsA = compareCoverageHealth(a.dayHealth, currentDayHealth);
+      const currentVsB = compareCoverageHealth(b.dayHealth, currentDayHealth);
+      if ((currentVsA <= 0) !== (currentVsB <= 0)) return currentVsA <= 0 ? -1 : 1;
+      const healthDiff = compareCoverageHealth(a.dayHealth, b.dayHealth);
+      if (healthDiff !== 0) return healthDiff;
+      return a.fitScore - b.fitScore || a.pass.start - b.pass.start;
+    });
+
+  return ranked[0]?.shift || null;
+}
+
 function preparePersonForUse(person, cycleWeeks = 8, fridayTemplateRotation = [], passBank = []) {
   const normalized = normalizePerson(person, cycleWeeks);
   const sched = { ...normalized.sched };
@@ -907,8 +944,44 @@ function preparePersonForUse(person, cycleWeeks = 8, fridayTemplateRotation = []
   });
   return { ...normalized, sched };
 }
-function prepareStaffForUse(staff, cycleWeeks = 8, fridayTemplateRotation = [], passBank = []) {
-  return normalizeStaffList(staff, cycleWeeks).map(person => preparePersonForUse(person, cycleWeeks, fridayTemplateRotation, passBank));
+function prepareStaffForUse(staff, cycleWeeks = 8, fridayTemplateRotation = [], passBank = [], coverageScopes = []) {
+  const prepared = normalizeStaffList(staff, cycleWeeks).map(person => ({ ...person, sched: { ...person.sched } }));
+
+  DAYS.forEach(day => {
+    const candidates = prepared
+      .filter(person => !(person.daysOff || []).includes(day.key))
+      .map(person => {
+        const eligiblePasses = getEligiblePassesForDay(person, day.key, passBank);
+        const currentShift = normalizeShift(person.sched?.[day.key]);
+        const isValidCurrentPass = currentShift && eligiblePasses.some(pass => shiftMatchesPass(currentShift, pass));
+        return { person, eligiblePasses, isValidCurrentPass };
+      })
+      .sort((a, b) => {
+        if (a.isValidCurrentPass !== b.isValidCurrentPass) return a.isValidCurrentPass ? 1 : -1;
+        if (a.person.fixedTimes !== b.person.fixedTimes) return a.person.fixedTimes ? 1 : -1;
+        if (a.eligiblePasses.length !== b.eligiblePasses.length) return a.eligiblePasses.length - b.eligiblePasses.length;
+        const aLatest = getStrictConstraints(a.person, day.key).latestStart;
+        const bLatest = getStrictConstraints(b.person, day.key).latestStart;
+        return (aLatest ?? Infinity) - (bLatest ?? Infinity);
+      });
+
+    candidates.forEach(({ person, eligiblePasses, isValidCurrentPass }) => {
+      if (isValidCurrentPass || eligiblePasses.length === 0) return;
+      const autoShift = buildCoverageAwareShift(person, day.key, prepared, coverageScopes, cycleWeeks, fridayTemplateRotation, passBank)
+        || buildSuggestedShift(person, day.key, cycleWeeks, fridayTemplateRotation, passBank);
+      const idx = prepared.findIndex(member => member.id === person.id);
+      if (idx === -1) return;
+      if (autoShift) {
+        prepared[idx] = { ...prepared[idx], sched: { ...prepared[idx].sched, [day.key]: autoShift } };
+      } else {
+        const nextSched = { ...prepared[idx].sched };
+        delete nextSched[day.key];
+        prepared[idx] = { ...prepared[idx], sched: nextSched };
+      }
+    });
+  });
+
+  return prepared;
 }
 function weeklyMinutes(staff, cycleWeeks = 8, fridayTemplateRotation = []) {
   let total = 0;
@@ -1715,7 +1788,7 @@ function FritidsSchemaApp() {
   };
 
   const handleGenerate = async () => {
-    const preparedStaff = prepareStaffForUse(staff, fridayCycleWeeks, fridayTemplateRotation, passBank);
+    const preparedStaff = prepareStaffForUse(staff, fridayCycleWeeks, fridayTemplateRotation, passBank, coverageScopes);
     setGenerating(true);
     setAlternatives(null);
     setGenerationProgress({ percent: 3, label: 'Förbereder...', detail: 'Samlar regler och bemanningskrav' });
