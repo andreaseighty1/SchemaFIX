@@ -928,6 +928,79 @@ function buildCoverageAwareShift(person, dayKey, baseStaff, coverageScopes, cycl
   return ranked[0]?.shift || null;
 }
 
+function getCoverageAnchorSlots(scope) {
+  const positive = (scope?.slots || []).filter(slot => slot.min > 0);
+  if (positive.length === 0) return [];
+  const anchors = [{ ...positive[0], anchorKind: 'open' }];
+  const last = positive[positive.length - 1];
+  if (last.start !== positive[0].start) anchors.push({ ...last, anchorKind: 'close' });
+  return anchors;
+}
+
+function chooseCoveringPassForAnchor(person, coveringPasses, anchor, cycleWeeks, fridayTemplateRotation = []) {
+  if (!coveringPasses || coveringPasses.length === 0) return null;
+  const desiredMinutes = getSuggestedDayMinutes(person, cycleWeeks, fridayTemplateRotation);
+  const anchorTarget = anchor.anchorKind === 'open' ? anchor.start : anchor.start + SLOT_STEP_MINUTES;
+  const ranked = [...coveringPasses].sort((a, b) => {
+    const aPoint = anchor.anchorKind === 'open' ? a.start : a.end;
+    const bPoint = anchor.anchorKind === 'open' ? b.start : b.end;
+    const aScore = Math.abs(aPoint - anchorTarget) * 3 + Math.abs(passDuration(a) - desiredMinutes) * 2;
+    const bScore = Math.abs(bPoint - anchorTarget) * 3 + Math.abs(passDuration(b) - desiredMinutes) * 2;
+    return aScore - bScore || a.start - b.start;
+  });
+  return ranked[0] || null;
+}
+
+function applyAnchorCoverageForDay(prepared, dayKey, coverageScopes, cycleWeeks, fridayTemplateRotation = [], passBank = []) {
+  coverageScopes.forEach(scope => {
+    const anchors = getCoverageAnchorSlots(scope);
+    anchors.forEach(anchor => {
+      const currentCount = prepared.filter(member => {
+        if (!personMatchesCoverageScope(member, scope)) return false;
+        const shift = member.sched?.[dayKey];
+        if (!shift) return false;
+        return timeToMin(shift[0]) <= anchor.start && timeToMin(shift[1]) > anchor.start;
+      }).length;
+      let needed = Math.max(0, (anchor.min || 0) - currentCount);
+      if (needed === 0) return;
+
+      const candidates = prepared
+        .filter(member => personMatchesCoverageScope(member, scope) && !(member.daysOff || []).includes(dayKey) && !member.fixedTimes)
+        .map(member => {
+          const current = normalizeShift(member.sched?.[dayKey]);
+          const currentCovers = current && timeToMin(current[0]) <= anchor.start && timeToMin(current[1]) > anchor.start;
+          const coveringPasses = getEligiblePassesForDay(member, dayKey, passBank)
+            .filter(pass => pass.start <= anchor.start && pass.end > anchor.start);
+          return {
+            member,
+            currentCovers,
+            coveringPasses,
+            optionCount: coveringPasses.length,
+            latestStart: getStrictConstraints(member, dayKey).latestStart ?? Infinity,
+          };
+        })
+        .filter(item => !item.currentCovers && item.coveringPasses.length > 0)
+        .sort((a, b) => a.optionCount - b.optionCount || a.latestStart - b.latestStart);
+
+      for (const candidate of candidates) {
+        if (needed <= 0) break;
+        const chosenPass = chooseCoveringPassForAnchor(candidate.member, candidate.coveringPasses, anchor, cycleWeeks, fridayTemplateRotation);
+        if (!chosenPass) continue;
+        const idx = prepared.findIndex(member => member.id === candidate.member.id);
+        if (idx === -1) continue;
+        prepared[idx] = {
+          ...prepared[idx],
+          sched: {
+            ...prepared[idx].sched,
+            [dayKey]: passToShift(chosenPass),
+          },
+        };
+        needed--;
+      }
+    });
+  });
+}
+
 function preparePersonForUse(person, cycleWeeks = 8, fridayTemplateRotation = [], passBank = []) {
   const normalized = normalizePerson(person, cycleWeeks);
   const sched = { ...normalized.sched };
@@ -948,6 +1021,7 @@ function prepareStaffForUse(staff, cycleWeeks = 8, fridayTemplateRotation = [], 
   const prepared = normalizeStaffList(staff, cycleWeeks).map(person => ({ ...person, sched: { ...person.sched } }));
 
   DAYS.forEach(day => {
+    applyAnchorCoverageForDay(prepared, day.key, coverageScopes, cycleWeeks, fridayTemplateRotation, passBank);
     const candidates = prepared
       .filter(person => !(person.daysOff || []).includes(day.key))
       .map(person => {
@@ -1129,6 +1203,37 @@ function compareCoverageHealth(a, b) {
   return 0;
 }
 
+function summarizeAnchorCoverageHealth(staff, dayKey, coverageScopes, person = null) {
+  let totalGaps = 0;
+  let totalGapMinutes = 0;
+  let totalOver = 0;
+  let totalOverMinutes = 0;
+
+  for (const scope of coverageScopes) {
+    if (person && !personMatchesCoverageScope(person, scope)) continue;
+    const anchors = getCoverageAnchorSlots(scope);
+    for (const anchor of anchors) {
+      let count = 0;
+      for (const member of staff) {
+        if (!personMatchesCoverageScope(member, scope)) continue;
+        const shift = member.sched?.[dayKey];
+        if (!shift) continue;
+        if (timeToMin(shift[0]) <= anchor.start && timeToMin(shift[1]) > anchor.start) count++;
+      }
+      if (count < anchor.min) {
+        totalGaps++;
+        totalGapMinutes += SLOT_STEP_MINUTES * (anchor.min - count);
+      }
+      if (count > anchor.max) {
+        totalOver++;
+        totalOverMinutes += SLOT_STEP_MINUTES * (count - anchor.max);
+      }
+    }
+  }
+
+  return { totalGaps, totalGapMinutes, totalOver, totalOverMinutes };
+}
+
 function isShiftLegal(person, dayKey, newShift) {
   const start = timeToMin(newShift[0]);
   const end = timeToMin(newShift[1]);
@@ -1160,6 +1265,7 @@ function attemptMutation(staff, passBank = [], cycleWeeks = 8, fridayTemplateRot
     .filter(shift => !current || shift[0] !== current[0] || shift[1] !== current[1]);
   if (possibleShifts.length === 0) return null;
   const preferred = buildSuggestedShift(p, d.key, cycleWeeks, fridayTemplateRotation, passBank);
+  const currentAnchorHealth = coverageScopes.length > 0 ? summarizeAnchorCoverageHealth(staff, d.key, coverageScopes, p) : null;
   const currentDayHealth = coverageScopes.length > 0 ? summarizeDayCoverageHealth(staff, d.key, coverageScopes) : null;
   const variants = possibleShifts.map(shift => {
     const candidate = staff.map(person => person.id === p.id
@@ -1173,19 +1279,27 @@ function attemptMutation(staff, passBank = [], cycleWeeks = 8, fridayTemplateRot
       shift,
       candidate,
       preferenceScore,
+      anchorHealth: coverageScopes.length > 0 ? summarizeAnchorCoverageHealth(candidate, d.key, coverageScopes, p) : null,
       dayHealth: coverageScopes.length > 0 ? summarizeDayCoverageHealth(candidate, d.key, coverageScopes) : null,
     };
   });
   variants.sort((a, b) => {
+    const anchorDiff = compareCoverageHealth(a.anchorHealth, b.anchorHealth);
+    if (anchorDiff !== 0) return anchorDiff;
     const healthDiff = compareCoverageHealth(a.dayHealth, b.dayHealth);
     if (healthDiff !== 0) return healthDiff;
     return a.preferenceScore - b.preferenceScore;
   });
 
-  const nonWorsening = currentDayHealth
-    ? variants.filter(variant => compareCoverageHealth(variant.dayHealth, currentDayHealth) <= 0)
+  const anchorSafe = currentAnchorHealth
+    ? variants.filter(variant => compareCoverageHealth(variant.anchorHealth, currentAnchorHealth) <= 0)
     : variants;
-  const selectedPool = nonWorsening.length > 0 ? nonWorsening : variants;
+  const nonWorsening = currentDayHealth
+    ? anchorSafe.filter(variant => compareCoverageHealth(variant.dayHealth, currentDayHealth) <= 0)
+    : anchorSafe;
+  const selectedPool = nonWorsening.length > 0
+    ? nonWorsening
+    : (anchorSafe.length > 0 ? anchorSafe : variants);
   const topSlice = selectedPool.slice(0, Math.min(4, selectedPool.length));
   const chosen = Math.random() < 0.55
     ? topSlice[Math.floor(Math.random() * topSlice.length)]
