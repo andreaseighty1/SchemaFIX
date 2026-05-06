@@ -2579,8 +2579,9 @@ function FritidsSchemaApp() {
 
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
           <StatCard label="Personal" value={staff.length} sub="aktiva" />
-          <StatCard label="Veckotimmar tot." value={minToHM(staff.reduce((a, s) => a + weeklyMinutes(s, fridayCycleWeeks, fridayTemplateRotation), 0))} />
-          <StatCard label="Täckningsgap" value={dayData.totalGaps} sub={`på ${activeDay === 'fri' ? 'fredag' : DAYS.find(d => d.key === activeDay).label.toLowerCase()}`}
+          <StatCard label="Veckotimmar tot." value={minToHM(staff.reduce((a, s) => a + weeklyMinutes(s, fridayCycleWeeks, fridayTemplateRotation), 0))}
+            tooltip="Summan av all personals veckotimmar. Användbart för att se den totala personalkapaciteten." />
+          <StatCard label="Underbemannade tillfällen" value={dayData.totalGaps} sub={`på ${activeDay === 'fri' ? 'fredag' : DAYS.find(d => d.key === activeDay).label.toLowerCase()}`}
             highlight={dayData.totalGaps > 0 ? 'warn' : 'ok'} />
           <StatCard label="Regelbrott" value={violations.length}
             highlight={violations.length > 0 ? 'warn' : 'ok'} sub={violations.length > 0 ? 'se Personal-fliken' : 'allt ok'} />
@@ -2591,7 +2592,7 @@ function FritidsSchemaApp() {
         {view === 'schedule' && (
           <ScheduleView dayData={dayData} activeDay={activeDay} setActiveDay={setActiveDay} onEdit={setEditingId}
             staffCount={staff.length} onGoToStaff={() => setView('staff')} onLoadExample={loadExample}
-            departments={departments}
+            departments={departments} passBank={passBank}
             fridayCycleWeeks={fridayCycleWeeks} currentFridayWeek={currentFridayWeek}
             setCurrentFridayWeek={setCurrentFridayWeek}
             hasFridaySetup={staff.some(s => (s.hasFridayRotation && Array.isArray(s.fridayRotation) && s.fridayRotation.some(x => x)) || (!s.hasFridayRotation && s.fridayShift))} />
@@ -3056,12 +3057,12 @@ function CoverageWizardModal({ departments, staff, blocks, onClose, onApply }) {
   );
 }
 
-function StatCard({ label, value, sub, highlight }) {
+function StatCard({ label, value, sub, highlight, tooltip }) {
   const ring = highlight === 'warn' ? 'ring-1 ring-orange-300 bg-orange-50/60'
              : highlight === 'ok'   ? 'ring-1 ring-emerald-200 bg-emerald-50/40'
              : 'ring-1 ring-stone-200 bg-white';
   return (
-    <div className={`rounded-xl p-4 ${ring}`}>
+    <div className={`rounded-xl p-4 ${ring}`} title={tooltip || undefined}>
       <p className="text-xs uppercase tracking-wider text-stone-500">{label}</p>
       <p className="display-font text-2xl mt-1 text-stone-800">{value}</p>
       {sub && <p className="text-xs text-stone-500 mt-0.5">{sub}</p>}
@@ -3105,7 +3106,7 @@ function FeasibilityPanel({ issues, onGoToRules }) {
   );
 }
 
-function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, onGoToStaff, onLoadExample, departments,
+function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, onGoToStaff, onLoadExample, departments, passBank,
                         fridayCycleWeeks, currentFridayWeek, setCurrentFridayWeek, hasFridaySetup }) {
   const [coverageFocus, setCoverageFocus] = useState(dayData.primaryCoverageKey || COVERAGE_SHARED);
   const ticks = []; for (let m = 360; m <= TIMELINE_END; m += 60) ticks.push(m);
@@ -3323,9 +3324,18 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
           {visiblePresent.map(p => {
             const dept = getDept(p.deptId, departments);
             const soft = softColor(dept.color);
-            const shiftLabel = isFriday
-              ? `${p._friShift[0]}–${p._friShift[1]}`
-              : `${p.sched[activeDay][0]}–${p.sched[activeDay][1]}`;
+            const currentShift = isFriday ? p._friShift : p.sched[activeDay];
+            const shiftLabel = `${currentShift[0]}–${currentShift[1]}`;
+            // Hitta passnamnet om passet matchar passbanken
+            const matchingPass = (typeof passBank !== 'undefined' && Array.isArray(passBank))
+              ? normalizePassBank(passBank).find(pass =>
+                  pass.days.includes(activeDay) && shiftMatchesPass(currentShift, pass)
+                )
+              : null;
+            const passName = matchingPass?.name || '';
+            const tooltipText = passName
+              ? `${p.name} – ${passName} (${shiftLabel})`
+              : `${p.name} – ${shiftLabel}`;
             return (
               <div key={p.id} className="flex items-center group">
                 <div className="w-32 pr-3 text-right">
@@ -3334,12 +3344,12 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
                   </button>
                   {p.role && <p className="text-[10px] text-stone-500 truncate">{p.role}</p>}
                 </div>
-                <div className="flex-1 relative h-7 bg-stone-50 rounded-md cursor-pointer" onClick={() => onEdit(p.id)}>
+                <div className="flex-1 relative h-7 bg-stone-50 rounded-md cursor-pointer" onClick={() => onEdit(p.id)} title={tooltipText}>
                   <div className="absolute h-full rounded-md flex items-center px-2 transition-all hover:opacity-90"
                     style={{ left: `${pctFromMin(p.startMin)}%`, width: `${pctFromMin(p.endMin) - pctFromMin(p.startMin)}%`,
                       backgroundColor: soft, borderLeft: `3px solid ${dept.color}` }}>
                     <span className="text-[11px] truncate text-stone-700" style={{ fontWeight: 500 }}>
-                      {shiftLabel}
+                      {passName ? `${shiftLabel} · ${passName}` : shiftLabel}
                     </span>
                   </div>
                 </div>
@@ -3354,7 +3364,7 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
               <p className="text-xs uppercase tracking-wider text-stone-500">Antal personal per 15 min</p>
               {focusedCoverage.gaps.length > 0 ? (
                 <span className="text-xs text-orange-600 flex items-center gap-1">
-                  <AlertCircle size={12} />{focusedCoverage.gaps.length} gap mot bemanningskrav
+                  <AlertCircle size={12} />{focusedCoverage.gaps.length} {focusedCoverage.gaps.length === 1 ? 'tillfälle' : 'tillfällen'} med för lite personal
                 </span>
               ) : focusedCoverage.overs.length > 0 ? (
                 <span className="text-xs text-amber-700 flex items-center gap-1">
@@ -5266,7 +5276,7 @@ function AlternativesModal({ alternatives, currentStaff, coverageScopes, fridayC
                   <p className={`text-xs mt-1 ${isSelected ? 'text-stone-300' : 'text-stone-500'}`}>{alt.desc}</p>
                   <div className="mt-3 pt-3 border-t border-stone-200/30 space-y-1 text-xs">
                     <div className="flex justify-between">
-                      <span className={isSelected ? 'text-stone-300' : 'text-stone-500'}>Täckningsgap:</span>
+                      <span className={isSelected ? 'text-stone-300' : 'text-stone-500'}>För lite personal:</span>
                       <span className={isSelected ? 'text-white' : better(alt.summary.totalGaps, currentSummary.totalGaps)} style={{ fontWeight: 500 }}>
                         {alt.summary.totalGaps} {alt.summary.totalGapMinutes > 0 && `(${alt.summary.totalGapMinutes} min)`}
                       </span>
