@@ -254,8 +254,8 @@ function inferPassType(pass) {
   return 'day';
 }
 
-function passDef(id, name, start, end, days = WEEKDAY_KEYS, deptId = '', passType = inferPassType({ name, start, end })) {
-  return { id, name, start, end, days, deptId, passType };
+function passDef(id, name, start, end, days = WEEKDAY_KEYS, deptId = '', passType = inferPassType({ name, start, end }), instances = 1) {
+  return { id, name, start, end, days, deptId, passType, instances };
 }
 const initialPassBank = [
   passDef('p-open-0600', 'Öppning', 360, 840, WEEKDAY_KEYS),
@@ -349,6 +349,17 @@ function normalizePass(pass, fallbackDays = WEEKDAY_KEYS) {
   const safeStart = clamp(roundToStep(start), 330, 1020);
   const safeEnd = clamp(roundToStep(end), safeStart + 60, 1080);
   const passType = inferPassType({ ...pass, start: safeStart, end: safeEnd });
+  // instances = max antal personer som får tilldelas detta pass per dag.
+  // 1 = unikt pass (default). 0 eller negativt tolkas som obegränsat.
+  // Saknat fält (gamla data) tolkas som obegränsat så befintliga
+  // scenarier inte plötsligt blir för restriktiva.
+  let instances;
+  if (pass?.instances === undefined || pass?.instances === null) {
+    instances = 0; // obegränsat – bakåtkompatibilitet
+  } else {
+    const parsed = Math.floor(Number(pass.instances));
+    instances = Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+  }
   return {
     id: pass?.id || `pass-${Math.random().toString(36).slice(2, 8)}`,
     name: typeof pass?.name === 'string' ? pass.name : `${minToTime(safeStart)}–${minToTime(safeEnd)}`,
@@ -357,6 +368,7 @@ function normalizePass(pass, fallbackDays = WEEKDAY_KEYS) {
     days,
     deptId: pass?.deptId || '',
     passType,
+    instances,
   };
 }
 
@@ -376,6 +388,40 @@ function passDuration(pass) {
 function shiftMatchesPass(shift, pass) {
   if (!shift || !pass) return false;
   return shift[0] === minToTime(pass.start) && shift[1] === minToTime(pass.end);
+}
+
+// Räknar hur många personer som har varje pass tilldelat en given dag.
+// Returnerar en Map från passId → antal personer.
+// Endast pass som matchar exakt (samma start- och sluttid) räknas.
+function countPassUsageForDay(staff, dayKey, passBank = []) {
+  const usage = new Map();
+  const passes = normalizePassBank(passBank).filter(p => p.days.includes(dayKey));
+  if (passes.length === 0) return usage;
+  staff.forEach(person => {
+    const shift = normalizeShift(person.sched?.[dayKey]);
+    if (!shift) return;
+    // Hitta matchande pass i passbanken
+    const match = passes.find(p => shiftMatchesPass(shift, p));
+    if (match) {
+      usage.set(match.id, (usage.get(match.id) || 0) + 1);
+    }
+  });
+  return usage;
+}
+
+// Returnerar true om passet kan tilldelas till en (till) person.
+// instances === 0 betyder obegränsat. Annars: usage < instances.
+// Om personen redan har passet räknas det som tillgängligt (för byten).
+function isPassAvailableForPerson(pass, dayKey, staff, person, passBank = []) {
+  if (!pass) return false;
+  if (!pass.instances || pass.instances <= 0) return true; // obegränsat
+  const usage = countPassUsageForDay(staff, dayKey, passBank);
+  const currentUsage = usage.get(pass.id) || 0;
+  // Om personen redan har detta pass, räkna ned med 1 (de är redan inräknade)
+  const currentShift = normalizeShift(person?.sched?.[dayKey]);
+  const personHasThisPass = currentShift && shiftMatchesPass(currentShift, pass);
+  const effectiveUsage = personHasThisPass ? currentUsage - 1 : currentUsage;
+  return effectiveUsage < pass.instances;
 }
 
 function getPassDisplayLabel(pass) {
@@ -833,6 +879,24 @@ function getEligiblePassesForDay(person, dayKey, passBank = []) {
   });
 }
 
+// Som getEligiblePassesForDay, men filtrerar dessutom bort pass som
+// redan är fullbokade enligt instances-gränsen. Om personen redan har
+// passet räknas det som tillgängligt (för att tillåta att "stå kvar" på
+// samma pass när man räknar om).
+function getAvailableEligiblePassesForDay(person, dayKey, staff, passBank = []) {
+  const eligible = getEligiblePassesForDay(person, dayKey, passBank);
+  if (!Array.isArray(staff) || staff.length === 0) return eligible;
+  const usage = countPassUsageForDay(staff, dayKey, passBank);
+  const currentShift = normalizeShift(person?.sched?.[dayKey]);
+  return eligible.filter(pass => {
+    if (!pass.instances || pass.instances <= 0) return true;
+    const used = usage.get(pass.id) || 0;
+    const personHasIt = currentShift && shiftMatchesPass(currentShift, pass);
+    const effective = personHasIt ? used - 1 : used;
+    return effective < pass.instances;
+  });
+}
+
 function getSuggestedDayMinutes(person, cycleWeeks, fridayTemplateRotation = []) {
   const explicitDayMinutes = DAYS
     .map(d => normalizeShift(person.sched?.[d.key]))
@@ -887,8 +951,12 @@ function buildFallbackShift(person, dayKey, cycleWeeks, fridayTemplateRotation =
   return fallback && isShiftLegal(person, dayKey, fallback) ? fallback : null;
 }
 
-function buildSuggestedShift(person, dayKey, cycleWeeks, fridayTemplateRotation = [], passBank = []) {
-  const eligiblePasses = getEligiblePassesForDay(person, dayKey, passBank);
+function buildSuggestedShift(person, dayKey, cycleWeeks, fridayTemplateRotation = [], passBank = [], staff = null) {
+  // Om staff-listan är tillgänglig, filtrera bort fullbokade pass.
+  // Annars (gamla anrop utan staff) faller vi tillbaka på vanlig logik.
+  const eligiblePasses = staff
+    ? getAvailableEligiblePassesForDay(person, dayKey, staff, passBank)
+    : getEligiblePassesForDay(person, dayKey, passBank);
   if (eligiblePasses.length > 0) {
     const desiredMinutes = getSuggestedDayMinutes(person, cycleWeeks, fridayTemplateRotation);
     const preferredStart = person.onlyAfternoons ? 13 * 60 : 8 * 60;
@@ -906,10 +974,11 @@ function buildSuggestedShift(person, dayKey, cycleWeeks, fridayTemplateRotation 
 }
 
 function buildCoverageAwareShift(person, dayKey, baseStaff, coverageScopes, cycleWeeks, fridayTemplateRotation = [], passBank = []) {
-  const eligiblePasses = getEligiblePassesForDay(person, dayKey, passBank);
+  // Filtrera fullbokade pass baserat på baseStaff
+  const eligiblePasses = getAvailableEligiblePassesForDay(person, dayKey, baseStaff, passBank);
   if (eligiblePasses.length === 0) return null;
   if (!coverageScopes || coverageScopes.length === 0) {
-    return buildSuggestedShift(person, dayKey, cycleWeeks, fridayTemplateRotation, passBank);
+    return buildSuggestedShift(person, dayKey, cycleWeeks, fridayTemplateRotation, passBank, baseStaff);
   }
 
   const desiredMinutes = getSuggestedDayMinutes(person, cycleWeeks, fridayTemplateRotation);
@@ -967,7 +1036,14 @@ function chooseCoveringPassForAnchor(person, coveringPasses, anchor, cycleWeeks,
 
 function applyAnchorCoverageForDay(prepared, dayKey, coverageScopes, cycleWeeks, fridayTemplateRotation = [], passBank = []) {
   coverageScopes.forEach(scope => {
-    const anchors = getCoverageAnchorSlots(scope);
+    // Bakifrån-byggande: stängning fylls FÖRE öppning eftersom stängning typiskt
+    // är den mest begränsade rollen (färre personer kan/vill jobba sent).
+    // Detta speglar hur en mänsklig schemaläggare faktiskt jobbar.
+    const anchors = getCoverageAnchorSlots(scope).slice().sort((a, b) => {
+      if (a.anchorKind === 'close' && b.anchorKind !== 'close') return -1;
+      if (b.anchorKind === 'close' && a.anchorKind !== 'close') return 1;
+      return 0;
+    });
     anchors.forEach(anchor => {
       const currentCount = prepared.filter(member => {
         if (!personMatchesCoverageScope(member, scope)) return false;
@@ -983,7 +1059,8 @@ function applyAnchorCoverageForDay(prepared, dayKey, coverageScopes, cycleWeeks,
         .map(member => {
           const current = normalizeShift(member.sched?.[dayKey]);
           const currentCovers = current && timeToMin(current[0]) <= anchor.start && timeToMin(current[1]) > anchor.start;
-          const coveringPasses = getEligiblePassesForDay(member, dayKey, passBank)
+          // Ta hänsyn till instances – fullbokade pass ska inte väljas
+          const coveringPasses = getAvailableEligiblePassesForDay(member, dayKey, prepared, passBank)
             .filter(pass => pass.start <= anchor.start && pass.end > anchor.start);
           return {
             member,
@@ -1039,7 +1116,8 @@ function prepareStaffForUse(staff, cycleWeeks = 8, fridayTemplateRotation = [], 
     const candidates = prepared
       .filter(person => !(person.daysOff || []).includes(day.key))
       .map(person => {
-        const eligiblePasses = getEligiblePassesForDay(person, day.key, passBank);
+        // Använd available-varianten så vi inte tilldelar fullbokade pass
+        const eligiblePasses = getAvailableEligiblePassesForDay(person, day.key, prepared, passBank);
         const currentShift = normalizeShift(person.sched?.[day.key]);
         const isValidCurrentPass = currentShift && eligiblePasses.some(pass => shiftMatchesPass(currentShift, pass));
         return { person, eligiblePasses, isValidCurrentPass };
@@ -1055,8 +1133,9 @@ function prepareStaffForUse(staff, cycleWeeks = 8, fridayTemplateRotation = [], 
 
     candidates.forEach(({ person, eligiblePasses, isValidCurrentPass }) => {
       if (isValidCurrentPass || eligiblePasses.length === 0) return;
+      // Skicka in prepared så build-funktionerna ser uppdaterad usage
       const autoShift = buildCoverageAwareShift(person, day.key, prepared, coverageScopes, cycleWeeks, fridayTemplateRotation, passBank)
-        || buildSuggestedShift(person, day.key, cycleWeeks, fridayTemplateRotation, passBank);
+        || buildSuggestedShift(person, day.key, cycleWeeks, fridayTemplateRotation, passBank, prepared);
       const idx = prepared.findIndex(member => member.id === person.id);
       if (idx === -1) return;
       if (autoShift) {
@@ -1273,6 +1352,17 @@ function compareCoverageHealth(a, b) {
   return 0;
 }
 
+// För ankarbemanning (öppning/stängning) bryr vi oss enbart om UNDERBEMANNING.
+// Att ha "för många" på öppning är inte ett ankarbrott – det är bara onödigt
+// och hanteras av den vanliga overbemanning-poängen. Den här jämförelsen
+// låter sökmotorn flytta runt personer fritt så länge det fortfarande
+// finns någon som öppnar och någon som stänger.
+function compareAnchorDeficit(a, b) {
+  if ((a?.totalGaps || 0) !== (b?.totalGaps || 0)) return (a?.totalGaps || 0) - (b?.totalGaps || 0);
+  if ((a?.totalGapMinutes || 0) !== (b?.totalGapMinutes || 0)) return (a?.totalGapMinutes || 0) - (b?.totalGapMinutes || 0);
+  return 0;
+}
+
 function summarizeAnchorCoverageHealth(staff, dayKey, coverageScopes, person = null) {
   let totalGaps = 0;
   let totalGapMinutes = 0;
@@ -1370,21 +1460,23 @@ function isShiftLegal(person, dayKey, newShift) {
   return true;
 }
 
-function attemptMutation(staff, passBank = [], cycleWeeks = 8, fridayTemplateRotation = [], coverageScopes = []) {
+function attemptShiftMutation(staff, passBank = [], cycleWeeks = 8, fridayTemplateRotation = [], coverageScopes = []) {
   const mutables = staff.filter(p => !p.fixedTimes);
   if (mutables.length === 0) return null;
   const p = mutables[Math.floor(Math.random() * mutables.length)];
   const validDays = DAYS.filter(d => !(p.daysOff || []).includes(d.key));
   if (validDays.length === 0) return null;
   const d = validDays[Math.floor(Math.random() * validDays.length)];
-  const eligiblePasses = getEligiblePassesForDay(p, d.key, passBank);
+  // Respektera instances: bara pass som inte är fullbokade får väljas.
+  // Personens nuvarande pass räknas som tillgängligt.
+  const eligiblePasses = getAvailableEligiblePassesForDay(p, d.key, staff, passBank);
   if (eligiblePasses.length === 0) return null;
   const current = normalizeShift(p.sched?.[d.key]);
   const possibleShifts = eligiblePasses
     .map(passToShift)
     .filter(shift => !current || shift[0] !== current[0] || shift[1] !== current[1]);
   if (possibleShifts.length === 0) return null;
-  const preferred = buildSuggestedShift(p, d.key, cycleWeeks, fridayTemplateRotation, passBank);
+  const preferred = buildSuggestedShift(p, d.key, cycleWeeks, fridayTemplateRotation, passBank, staff);
   const currentAnchorHealth = coverageScopes.length > 0 ? summarizeAnchorCoverageHealth(staff, d.key, coverageScopes, p) : null;
   const currentDayHealth = coverageScopes.length > 0 ? summarizeDayCoverageHealth(staff, d.key, coverageScopes) : null;
   const variants = possibleShifts.map(shift => {
@@ -1404,7 +1496,7 @@ function attemptMutation(staff, passBank = [], cycleWeeks = 8, fridayTemplateRot
     };
   });
   variants.sort((a, b) => {
-    const anchorDiff = compareCoverageHealth(a.anchorHealth, b.anchorHealth);
+    const anchorDiff = compareAnchorDeficit(a.anchorHealth, b.anchorHealth);
     if (anchorDiff !== 0) return anchorDiff;
     const healthDiff = compareCoverageHealth(a.dayHealth, b.dayHealth);
     if (healthDiff !== 0) return healthDiff;
@@ -1412,7 +1504,7 @@ function attemptMutation(staff, passBank = [], cycleWeeks = 8, fridayTemplateRot
   });
 
   const anchorSafe = currentAnchorHealth
-    ? variants.filter(variant => compareCoverageHealth(variant.anchorHealth, currentAnchorHealth) <= 0)
+    ? variants.filter(variant => compareAnchorDeficit(variant.anchorHealth, currentAnchorHealth) <= 0)
     : variants;
   if (currentAnchorHealth && anchorSafe.length === 0) return null;
   const nonWorsening = currentDayHealth
@@ -1427,6 +1519,76 @@ function attemptMutation(staff, passBank = [], cycleWeeks = 8, fridayTemplateRot
     : selectedPool[Math.floor(Math.random() * selectedPool.length)];
 
   return chosen?.candidate || null;
+}
+
+// Swap-mutation: byter pass mellan två personer på samma dag i ETT steg.
+// Detta är värdefullt eftersom det låter algoritmen flytta runt personer
+// utan att gå genom dåliga mellanlägen. Exempel: om Anna har stängningen
+// och Bo har öppningen, men det vore bättre tvärtom – då kan vi byta direkt
+// utan att tillfälligt ha "ingen på stängning" eller "två på öppning".
+function attemptSwapMutation(staff, passBank = [], cycleWeeks = 8, fridayTemplateRotation = [], coverageScopes = []) {
+  const mutables = staff.filter(p => !p.fixedTimes);
+  if (mutables.length < 2) return null;
+  // Välj slumpmässig dag
+  const allDays = DAYS.slice();
+  const d = allDays[Math.floor(Math.random() * allDays.length)];
+  // Hitta personer som jobbar denna dag (har ett pass och inte är ledig)
+  const workingToday = mutables.filter(p =>
+    !(p.daysOff || []).includes(d.key) && p.sched?.[d.key]
+  );
+  if (workingToday.length < 2) return null;
+  // Välj två slumpmässiga personer
+  const idxA = Math.floor(Math.random() * workingToday.length);
+  let idxB = Math.floor(Math.random() * (workingToday.length - 1));
+  if (idxB >= idxA) idxB++;
+  const personA = workingToday[idxA];
+  const personB = workingToday[idxB];
+  const shiftA = normalizeShift(personA.sched?.[d.key]);
+  const shiftB = normalizeShift(personB.sched?.[d.key]);
+  if (!shiftA || !shiftB) return null;
+  // Identiska pass – inget att byta
+  if (shiftA[0] === shiftB[0] && shiftA[1] === shiftB[1]) return null;
+  // Kontrollera att båda personerna kan ta varandras pass
+  if (!isShiftLegal(personA, d.key, shiftB)) return null;
+  if (!isShiftLegal(personB, d.key, shiftA)) return null;
+  // Och att passen finns i deras respektive eligible-lista (passBank-regler)
+  const eligibleA = getEligiblePassesForDay(personA, d.key, passBank);
+  const eligibleB = getEligiblePassesForDay(personB, d.key, passBank);
+  const aCanTakeB = eligibleA.some(pass => {
+    const s = passToShift(pass);
+    return s[0] === shiftB[0] && s[1] === shiftB[1];
+  });
+  const bCanTakeA = eligibleB.some(pass => {
+    const s = passToShift(pass);
+    return s[0] === shiftA[0] && s[1] === shiftA[1];
+  });
+  if (!aCanTakeB || !bCanTakeA) return null;
+  // Bygg kandidat med bytet
+  const candidate = staff.map(person => {
+    if (person.id === personA.id) return { ...person, sched: { ...person.sched, [d.key]: shiftB } };
+    if (person.id === personB.id) return { ...person, sched: { ...person.sched, [d.key]: shiftA } };
+    return person;
+  });
+  // Ankarsäkerhet: byte får inte öka underbemanning av öppning/stängning
+  if (coverageScopes.length > 0) {
+    const currentAnchor = summarizeAnchorCoverageHealth(staff, d.key, coverageScopes);
+    const candAnchor = summarizeAnchorCoverageHealth(candidate, d.key, coverageScopes);
+    if (compareAnchorDeficit(candAnchor, currentAnchor) > 0) return null;
+  }
+  return candidate;
+}
+
+// Dispatcher: ~70% shift-mutation (en person byter pass), ~30% swap-mutation
+// (två personer byter pass). Behåller originalfunktionens namn så
+// resten av koden inte behöver ändras.
+function attemptMutation(staff, passBank = [], cycleWeeks = 8, fridayTemplateRotation = [], coverageScopes = []) {
+  if (Math.random() < 0.3) {
+    const swapResult = attemptSwapMutation(staff, passBank, cycleWeeks, fridayTemplateRotation, coverageScopes);
+    if (swapResult) return swapResult;
+    // Om swap inte gick (t.ex. för få personer på dagen), faller vi tillbaka
+    // på shift-mutation istället för att returnera null.
+  }
+  return attemptShiftMutation(staff, passBank, cycleWeeks, fridayTemplateRotation, coverageScopes);
 }
 
 function yieldToBrowser() {
@@ -1464,20 +1626,39 @@ async function runSearchAsync(initialStaff, coverageScopes, cycleWeeks, fridayTe
       const candAnchorHealth = summarizeGlobalAnchorCoverageHealth(cand, coverageScopes, cycleWeeks, fridayTemplateRotation);
       const cs = scheduleScore(cand, coverageScopes, cycleWeeks, fridayTemplateRotation, weights, passBank);
       const candHealth = summarizeCoverageHealth(cand, coverageScopes, cycleWeeks, fridayTemplateRotation);
-      const anchorDelta = compareCoverageHealth(candAnchorHealth, currentAnchorHealth);
+      // Ankaret skyddas hårt: vi accepterar ALDRIG mutationer som ökar
+      // underbemanningen på öppning/stängning. Däremot tillåter vi nu
+      // försämringar i andra mål med temperaturberoende sannolikhet
+      // (riktig simulated annealing) – annars fastnar sökningen i
+      // första närmaste lokala minimum.
+      const anchorDelta = compareAnchorDeficit(candAnchorHealth, currentAnchorHealth);
       const healthDelta = compareCoverageHealth(candHealth, currentHealth);
       const delta = cs - currentScore;
-      const acceptCandidate = anchorDelta < 0
-        || (anchorDelta === 0 && (
-          healthDelta < 0
-          || (healthDelta === 0 && (delta >= 0 || Math.random() < Math.exp(delta / temp)))
-        ));
+      let acceptCandidate = false;
+      if (anchorDelta <= 0) {
+        // Ankaret är minst lika bra – pröva resten med annealing.
+        if (anchorDelta < 0) {
+          // Strikt förbättring av ankaret – alltid acceptera.
+          acceptCandidate = true;
+        } else if (healthDelta < 0) {
+          // Ankaret oförändrat, övrig bemanning bättre – acceptera.
+          acceptCandidate = true;
+        } else if (delta >= 0) {
+          // Ingen försämring – acceptera.
+          acceptCandidate = true;
+        } else {
+          // Försämring – acceptera med temperaturberoende sannolikhet.
+          // Detta är hjärtat i simulated annealing och behövs för att
+          // sökningen ska kunna ta sig ur lokala minima.
+          acceptCandidate = Math.random() < Math.exp(delta / temp);
+        }
+      }
       if (acceptCandidate) {
         current = cand;
         currentAnchorHealth = candAnchorHealth;
         currentScore = cs;
         currentHealth = candHealth;
-        const bestAnchorDelta = compareCoverageHealth(candAnchorHealth, bestAnchorHealth);
+        const bestAnchorDelta = compareAnchorDeficit(candAnchorHealth, bestAnchorHealth);
         const bestHealthDelta = compareCoverageHealth(candHealth, bestHealth);
         if (bestAnchorDelta < 0 || (bestAnchorDelta === 0 && (bestHealthDelta < 0 || (bestHealthDelta === 0 && cs > bestScore)))) {
           best = cand;
@@ -1648,6 +1829,24 @@ function analyzeCoverageFeasibility(staff, passBank, coverageScopes, cycleWeeks 
           dayKey: day.key,
           message: `${getDayMeta(day.key).label}: ${required} behövs ${minToTime(time)}, men bara ${available} personer har något giltigt pass som täcker den tiden.`,
         });
+      }
+
+      // NY: Kontrollera att passbankens instances räcker för att täcka kravet.
+      // Summera max-kapaciteten av alla pass som täcker tiden.
+      const passes = normalizePassBank(passBank).filter(p =>
+        p.days.includes(day.key) && p.start <= time && p.end > time
+      );
+      // Om något pass har obegränsat (instances=0), är kapaciteten oändlig.
+      const hasUnlimited = passes.some(p => !p.instances || p.instances <= 0);
+      if (!hasUnlimited && passes.length > 0) {
+        const maxCapacity = passes.reduce((sum, p) => sum + (p.instances || 0), 0);
+        if (maxCapacity < required) {
+          issues.push({
+            kind: 'instances',
+            dayKey: day.key,
+            message: `${getDayMeta(day.key).label}: ${minToTime(time)} kräver ${required} personer, men passbanken har bara plats för ${maxCapacity} (summan av "Antal" på pass som täcker tiden). Öka antalet på något pass eller lägg till ett pass.`,
+          });
+        }
       }
     });
 
@@ -3651,6 +3850,7 @@ function SettingsView({ departments, setDepartments, staff, setStaff, coverageBl
       days: WEEKDAY_KEYS,
       deptId: '',
       passType: base?.passType || inferPassType({ start, end }),
+      instances: 1, // Default: 1 instans (unikt pass). Användaren kan öka för delade pass.
     })]);
   };
 
@@ -3749,11 +3949,12 @@ function SettingsView({ departments, setDepartments, staff, setStaff, coverageBl
           <div className="grid grid-cols-12 gap-2 text-[10px] uppercase tracking-wider text-stone-500 px-2 pb-1">
             <div className="col-span-2">Namn</div>
             <div className="col-span-2">Typ</div>
-            <div className="col-span-2">Start</div>
-            <div className="col-span-2">Slut</div>
+            <div className="col-span-1">Start</div>
+            <div className="col-span-1">Slut</div>
+            <div className="col-span-1" title="Max antal personer som kan tilldelas detta pass per dag. 1 = unikt pass. Lämna tomt eller skriv 0 för obegränsat.">Antal</div>
             <div className="col-span-2">Dagar</div>
             <div className="col-span-1">Avd.</div>
-            <div className="col-span-1"></div>
+            <div className="col-span-2"></div>
           </div>
           {normalizePassBank(passBank).map(pass => (
             <div key={pass.id} className="grid grid-cols-12 gap-2 items-center py-2 px-2 rounded-lg hover:bg-stone-50">
@@ -3767,13 +3968,32 @@ function SettingsView({ departments, setDepartments, staff, setStaff, coverageBl
                   {PASS_TYPES.map(type => <option key={type.id} value={type.id}>{type.label}</option>)}
                 </select>
               </div>
-              <div className="col-span-2">
+              <div className="col-span-1">
                 <TimeTextInput className="rules-input w-full" valueMinutes={pass.start}
                   onCommit={(minutes) => updatePass(pass.id, { start: minutes })} />
               </div>
-              <div className="col-span-2">
+              <div className="col-span-1">
                 <TimeTextInput className="rules-input w-full" valueMinutes={pass.end}
                   onCommit={(minutes) => updatePass(pass.id, { end: minutes })} />
+              </div>
+              <div className="col-span-1">
+                <input
+                  type="number"
+                  min="0"
+                  step="1"
+                  className="rules-input w-full text-center"
+                  value={pass.instances === 0 ? '' : pass.instances}
+                  placeholder="∞"
+                  title={pass.instances === 0 ? 'Obegränsat antal personer kan ta detta pass' : `Max ${pass.instances} ${pass.instances === 1 ? 'person' : 'personer'} per dag`}
+                  onChange={e => {
+                    const v = e.target.value;
+                    if (v === '') {
+                      updatePass(pass.id, { instances: 0 });
+                    } else {
+                      const num = parseInt(v, 10);
+                      if (Number.isFinite(num) && num >= 0) updatePass(pass.id, { instances: num });
+                    }
+                  }} />
               </div>
               <div className="col-span-2 flex flex-wrap gap-1">
                 {DAYS.map(day => {
@@ -3795,7 +4015,7 @@ function SettingsView({ departments, setDepartments, staff, setStaff, coverageBl
                   {departments.map(dept => <option key={dept.id} value={dept.id}>{dept.name}</option>)}
                 </select>
               </div>
-              <div className="col-span-1 flex justify-end">
+              <div className="col-span-2 flex justify-end">
                 <button onClick={() => removePass(pass.id)} className="text-stone-400 hover:text-red-600 p-1">
                   <Trash2 size={14} />
                 </button>
@@ -3809,6 +4029,7 @@ function SettingsView({ departments, setDepartments, staff, setStaff, coverageBl
           <div className="space-y-1 text-sm text-stone-600">
             <p>Generatorn väljer i första hand bland dessa pass i stället för att hitta på fria tider.</p>
             <p>Passtypen hjälper personalrutan att svara på frågor som "kan öppna" eller "kan bara ta eftermiddag" utan att du behöver välja varje pass manuellt.</p>
+            <p><strong>Antal:</strong> max antal personer som kan tilldelas passet per dag. 1 betyder att passet är unikt – t.ex. bara en person stänger. Sätt högre om flera kan ha samma passtider, eller lämna tomt för obegränsat.</p>
             <p>Bemanningsblocken avgör när de här passen faktiskt behövs, så passbank och bemanning måste fungera tillsammans.</p>
             <p>Pass kan göras avdelningsspecifika eller gälla alla avdelningar.</p>
             <p>Fredag styrs fortfarande separat av fast fredag eller fredagsrull längre ner i personalens formulär.</p>
