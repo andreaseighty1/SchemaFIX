@@ -207,6 +207,14 @@ const DEFAULTS = {
   // Dagsundantag har högst prioritet, sen paritet, sen generellt.
   // Format: { even: { earliestStart: 480, ... }, odd: { ... } }
   parityOverrides: {},
+  // Fredagshantering: tre möjliga lägen.
+  //  - 'passbank' = fredag genereras från passbanken precis som mån-tor
+  //  - 'fixed'    = fast fredagstid (eller alltid ledig)
+  //  - 'rotation' = 8-veckors fredagsrull (egen eller central mall)
+  //  - null       = användaren har ännu inte valt (visar valdialog i edit-modalen)
+  // hasFridayRotation behålls som spegel för bakåtkompatibilitet i kodvägar
+  // som inte uppdaterats än, och avgör migration från legacy-data.
+  fridayMode: null,
   daysOff: [], hasFridayRotation: true, fridayShift: null, fridayRotation: null,
   fridayUseTemplate: false, fridayTemplateStartWeek: 1, fridayTemplateOverrides: {},
   allowedPassTypes: [],
@@ -756,9 +764,11 @@ function normalizeShift(shift) {
 }
 function normalizeWeekSched(sched) {
   const next = {};
-  DAYS.forEach(d => {
-    const sh = normalizeShift(sched?.[d.key]);
-    if (sh) next[d.key] = sh;
+  // Tar med alla dagar inkl fredag. Fredag används bara av passbank-läget;
+  // legacy-lägen får sin sched.fri rensad i normalizePerson nedan.
+  ALL_DAY_KEYS.forEach(dayKey => {
+    const sh = normalizeShift(sched?.[dayKey]);
+    if (sh) next[dayKey] = sh;
   });
   return next;
 }
@@ -822,7 +832,33 @@ function getStrictConstraints(person, dayKey) {
 }
 function normalizePerson(person, cycleWeeks = 8) {
   const merged = { ...P({}), ...(person || {}) };
-  const hasFridayRotation = merged.hasFridayRotation !== false;
+
+  // Härled fridayMode. Tre källor i prioritetsordning:
+  //  1. merged.fridayMode är explicit satt till ett giltigt värde (inkl null = "ej valt")
+  //  2. Migration från legacy: hasFridayRotation:false → 'fixed', annars → 'rotation'
+  // Notera: null är ett *giltigt* värde (betyder "användaren har ännu inte valt")
+  // men det måste komma från personobjektet explicit – inte från default-mergen –
+  // för att inte överskrida legacy-migrationen.
+  const personHasExplicitFridayMode = person && Object.prototype.hasOwnProperty.call(person, 'fridayMode');
+  let fridayMode;
+  if (personHasExplicitFridayMode &&
+      (merged.fridayMode === 'passbank' || merged.fridayMode === 'fixed' ||
+       merged.fridayMode === 'rotation' || merged.fridayMode === null)) {
+    fridayMode = merged.fridayMode;
+  } else {
+    // Legacy-data utan fridayMode: härleda från hasFridayRotation
+    fridayMode = merged.hasFridayRotation === false ? 'fixed' : 'rotation';
+  }
+
+  const isPassbankFriday = fridayMode === 'passbank';
+  const isRotationFriday = fridayMode === 'rotation';
+  const isFixedFriday = fridayMode === 'fixed';
+
+  const sched = normalizeWeekSched(merged.sched);
+  // Säkerhet: bara passbank-läget får ha sched.fri. Förhindrar orphan-data
+  // om någon byter läge fram och tillbaka.
+  if (!isPassbankFriday) delete sched.fri;
+
   return {
     ...merged,
     name: merged.name || '',
@@ -836,18 +872,21 @@ function normalizePerson(person, cycleWeeks = 8) {
     latestStart: asNumber(merged.latestStart, null),
     earliestEnd: asNumber(merged.earliestEnd, null),
     latestEnd: asNumber(merged.latestEnd, null),
-    sched: normalizeWeekSched(merged.sched),
+    sched,
     dayOverrides: normalizeDayOverrides(merged.dayOverrides),
     parityOverrides: normalizeParityOverrides(merged.parityOverrides),
     daysOff: Array.from(new Set((Array.isArray(merged.daysOff) ? merged.daysOff : []).filter(day => ALL_DAY_KEYS.includes(day)))),
     allowedPassTypes: normalizeAllowedPassTypes(merged.allowedPassTypes),
     allowedPassIds: normalizeAllowedPassIds(merged.allowedPassIds),
-    hasFridayRotation,
-    fridayShift: hasFridayRotation ? null : normalizeShift(merged.fridayShift),
-    fridayRotation: hasFridayRotation ? resizeRotation((Array.isArray(merged.fridayRotation) ? merged.fridayRotation : []).map(normalizeShift), cycleWeeks) : null,
-    fridayUseTemplate: hasFridayRotation ? !!merged.fridayUseTemplate : false,
+    fridayMode,
+    // hasFridayRotation speglar fridayMode för bakåtkompatibilitet i kodvägar
+    // som ännu inte uppdaterats. Sant ENDAST när fridayMode === 'rotation'.
+    hasFridayRotation: isRotationFriday,
+    fridayShift: isFixedFriday ? normalizeShift(merged.fridayShift) : null,
+    fridayRotation: isRotationFriday ? resizeRotation((Array.isArray(merged.fridayRotation) ? merged.fridayRotation : []).map(normalizeShift), cycleWeeks) : null,
+    fridayUseTemplate: isRotationFriday ? !!merged.fridayUseTemplate : false,
     fridayTemplateStartWeek: clamp(asNumber(merged.fridayTemplateStartWeek, 1), 1, cycleWeeks),
-    fridayTemplateOverrides: hasFridayRotation ? normalizeFridayTemplateOverrides(merged.fridayTemplateOverrides, cycleWeeks) : {},
+    fridayTemplateOverrides: isRotationFriday ? normalizeFridayTemplateOverrides(merged.fridayTemplateOverrides, cycleWeeks) : {},
   };
 }
 function normalizeStaffList(staff, cycleWeeks = 8) {
@@ -1153,11 +1192,22 @@ function prepareStaffForUse(staff, cycleWeeks = 8, fridayTemplateRotation = [], 
 function weeklyMinutes(staff, cycleWeeks = 8, fridayTemplateRotation = []) {
   let total = 0;
   for (const d of DAYS) if (staff.sched?.[d.key]) total += dayMinutes(staff.sched[d.key]);
-  total += avgFridayMinutes(staff, cycleWeeks, fridayTemplateRotation);
+  // Fredag: passbank-läget räknar sched.fri direkt; övriga lägen använder
+  // legacy-snittet över rullen (avgFridayMinutes returnerar 0 för passbank-läge
+  // eftersom fridayShift och fridayRotation då är tomma, så vi kan inte bara
+  // alltid kalla det – vi måste byta beräkningssätt baserat på läge).
+  if (staff.fridayMode === 'passbank') {
+    if (staff.sched?.fri) total += dayMinutes(staff.sched.fri);
+  } else {
+    total += avgFridayMinutes(staff, cycleWeeks, fridayTemplateRotation);
+  }
   return Math.round(total);
 }
 function hasWeekdaySchedule(person) {
-  return DAYS.some(d => normalizeShift(person.sched?.[d.key]));
+  if (DAYS.some(d => normalizeShift(person.sched?.[d.key]))) return true;
+  // Passbank-läget kan ha schemat enbart på fredag – räkna det också.
+  if (person.fridayMode === 'passbank' && normalizeShift(person.sched?.fri)) return true;
+  return false;
 }
 
 // ==================== SCHEDULE GENERATOR (Simulated Annealing) ====================
@@ -1168,6 +1218,11 @@ function personMatchesCoverageScope(person, scope) {
 
 function getShiftForDay(person, dayKey, options = {}) {
   if (dayKey === 'fri') {
+    // Passbank-läget: fredag bor i sched.fri precis som vilken annan dag.
+    if (person.fridayMode === 'passbank') {
+      return person.sched?.fri || null;
+    }
+    // Övriga lägen (rotation, fixed, eller ej valt): använd legacy-uppslagningen.
     return getFridayShift(person, options.fridayWeek || 1, options.cycleWeeks || 8, options.fridayTemplateRotation || []);
   }
   return person.sched?.[dayKey] || null;
