@@ -347,7 +347,9 @@ const SLOT_STEP_MINUTES = 5;
 
 function normalizePassDays(days) {
   const source = Array.isArray(days) && days.length > 0 ? days : WEEKDAY_KEYS;
-  return Array.from(new Set(source.filter(day => WEEKDAY_KEYS.includes(day))));
+  // Tar nu med fredag som giltig dag (steg 4c). Pass kan markeras för 'fri'
+  // om de ska kunna tilldelas av generatorn till passbank-läges-personer.
+  return Array.from(new Set(source.filter(day => ALL_DAY_KEYS.includes(day))));
 }
 
 function normalizePass(pass, fallbackDays = WEEKDAY_KEYS) {
@@ -2330,7 +2332,12 @@ function FritidsSchemaApp() {
       present = staff
         .filter(s => !(s.daysOff || []).includes('fri'))
         .map(s => {
-          const sh = getFridayShift(s, currentFridayWeek, fridayCycleWeeks, fridayTemplateRotation);
+          // Passbank-läge: fredag bor i sched.fri precis som vilken annan dag.
+          // Övriga lägen (rotation/fixed/null): använd legacy-uppslagningen som
+          // tar hänsyn till veckonummer i rullen.
+          const sh = s.fridayMode === 'passbank'
+            ? (s.sched?.fri || null)
+            : getFridayShift(s, currentFridayWeek, fridayCycleWeeks, fridayTemplateRotation);
           if (!sh) return null;
           return { ...s, _friShift: sh, startMin: timeToMin(sh[0]), endMin: timeToMin(sh[1]) };
         })
@@ -2650,7 +2657,15 @@ function FritidsSchemaApp() {
             departments={departments} passBank={passBank}
             fridayCycleWeeks={fridayCycleWeeks} currentFridayWeek={currentFridayWeek}
             setCurrentFridayWeek={setCurrentFridayWeek}
-            hasFridaySetup={staff.some(s => (s.hasFridayRotation && Array.isArray(s.fridayRotation) && s.fridayRotation.some(x => x)) || (!s.hasFridayRotation && s.fridayShift))} />
+            hasFridaySetup={staff.some(s =>
+              (s.fridayMode === 'rotation' && Array.isArray(s.fridayRotation) && s.fridayRotation.some(x => x))
+              || (s.fridayMode === 'rotation' && s.fridayUseTemplate)
+              || (s.fridayMode === 'fixed' && s.fridayShift)
+              || (s.fridayMode === 'passbank' && s.sched?.fri)
+              // Bakåtkompatibilitet för data som inte hunnit migreras
+              || (s.hasFridayRotation && Array.isArray(s.fridayRotation) && s.fridayRotation.some(x => x))
+              || (!s.hasFridayRotation && s.fridayShift)
+            )} />
         )}
         {view === 'staff' && <StaffView staff={staff} fridayCycleWeeks={fridayCycleWeeks} fridayTemplateRotation={fridayTemplateRotation} violations={violations} onEdit={setEditingId} onAdd={addStaff}
           onLoadExample={loadExample} departments={departments} />}
@@ -3525,8 +3540,10 @@ function StaffView({ staff, fridayCycleWeeks, fridayTemplateRotation, violations
               const parityKeys = Object.keys(s.parityOverrides || {}).filter(k => s.parityOverrides[k] && Object.values(s.parityOverrides[k]).some(v => v != null));
               if (parityKeys.length > 0) tags.push(`Varannan: ${parityKeys.map(k => k === 'even' ? 'jämn' : 'udda').join(', ')}`);
               if ((s.daysOff || []).length > 0) tags.push(`Ledig ${s.daysOff.map(d => getDayMeta(d).short).join(', ')}`);
-              if (s.hasFridayRotation && s.fridayUseTemplate) tags.push(`Fredagsmall: start v${s.fridayTemplateStartWeek || 1}`);
-              if (!s.hasFridayRotation && s.fridayShift) tags.push('Fast fredag');
+              if (s.fridayMode === 'rotation' && s.fridayUseTemplate) tags.push(`Fredagsmall: start v${s.fridayTemplateStartWeek || 1}`);
+              if (s.fridayMode === 'fixed' && s.fridayShift) tags.push('Fast fredag');
+              if (s.fridayMode === 'passbank') tags.push('Passbank på fredag');
+              if (s.fridayMode == null) tags.push('⚠ Fredagsläge ej valt');
               return (
                 <tr key={s.id} className="border-b border-stone-100 last:border-0 hover:bg-stone-50/50">
                   <td className="px-4 py-3"><p className="text-stone-800" style={{ fontWeight: 500 }}>{s.name}</p></td>
@@ -4061,7 +4078,7 @@ function SettingsView({ departments, setDepartments, staff, setStaff, coverageBl
                   }} />
               </div>
               <div className="col-span-2 flex flex-wrap gap-1">
-                {DAYS.map(day => {
+                {DAY_META.map(day => {
                   const active = pass.days.includes(day.key);
                   return (
                     <button key={day.key} type="button" onClick={() => updatePass(pass.id, {
@@ -4330,6 +4347,48 @@ function StaffEditModal({ staff, departments, passBank, fridayCycleWeeks, friday
   };
   const setFixedFridayOff = (off) => {
     setForm({ ...form, fridayShift: off ? null : (form.fridayShift || ['07:45','15:45']) });
+  };
+  // Byt fredagsläge. Helpern säkerställer att alla syskonfält är konsistenta så
+  // att UI:t inte visar gammal rotation-data när man bytt till fast tid osv.
+  // sched.fri rensas bara när man byter BORT från passbank, så generatorns ev.
+  // tidigare tilldelning behålls om man tillfälligt tittar på ett annat läge
+  // och byter tillbaka.
+  const setFridayMode = (mode) => {
+    if (mode === 'passbank') {
+      setForm({
+        ...form,
+        fridayMode: 'passbank',
+        hasFridayRotation: false,
+        fridayShift: null,
+        fridayRotation: null,
+        fridayUseTemplate: false,
+        fridayTemplateOverrides: {},
+      });
+    } else if (mode === 'fixed') {
+      const nextSched = { ...(form.sched || {}) };
+      delete nextSched.fri;
+      setForm({
+        ...form,
+        fridayMode: 'fixed',
+        hasFridayRotation: false,
+        fridayShift: form.fridayShift || ['07:45','15:45'],
+        fridayRotation: null,
+        fridayUseTemplate: false,
+        fridayTemplateOverrides: {},
+        sched: nextSched,
+      });
+    } else if (mode === 'rotation') {
+      const nextSched = { ...(form.sched || {}) };
+      delete nextSched.fri;
+      setForm({
+        ...form,
+        fridayMode: 'rotation',
+        hasFridayRotation: true,
+        fridayShift: null,
+        fridayRotation: resizeRotation(form.fridayRotation || [], fridayCycleWeeks),
+        sched: nextSched,
+      });
+    }
   };
   const scrollToFridaySection = () => {
     document.getElementById('staff-edit-friday-section')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -4648,18 +4707,63 @@ function StaffEditModal({ staff, departments, passBank, fridayCycleWeeks, friday
           {/* Fredag */}
           <Section title="Fredagar">
             <div id="staff-edit-friday-section" />
-            <Toggle checked={form.hasFridayRotation}
-              onChange={v => setForm({
-                ...form,
-                hasFridayRotation: v,
-                fridayShift: v ? null : (form.fridayShift || ['07:45','15:45']),
-                fridayRotation: v ? resizeRotation(form.fridayRotation, fridayCycleWeeks) : null,
-              })}
-              label={`Ingår i fredagsrullen (${fridayCycleWeeks}-veckors cykel)`}
-              hint="Annars: fast fredagstid (eller alltid ledig)" />
 
-            {form.hasFridayRotation && (
-              <div className="mt-3 ml-6">
+            {/* Tre-vägs-väljare för fredagshanteringsläget */}
+            <div className="flex gap-1 p-1 bg-stone-100 rounded-lg mb-3">
+              {[
+                { key: 'passbank', label: 'Passbank', hint: 'Genereras som mån-tor' },
+                { key: 'fixed', label: 'Fast tid', hint: 'Samma varje vecka' },
+                { key: 'rotation', label: 'Rull', hint: `${fridayCycleWeeks}-veckors rotation` },
+              ].map(opt => (
+                <button key={opt.key} type="button" onClick={() => setFridayMode(opt.key)}
+                  className={`flex-1 px-3 py-2 rounded-md text-sm transition text-left ${
+                    form.fridayMode === opt.key
+                      ? 'bg-white text-stone-900 shadow-sm ring-1 ring-stone-200'
+                      : 'text-stone-600 hover:bg-stone-50'
+                  }`}>
+                  <div style={{ fontWeight: 500 }}>{opt.label}</div>
+                  <div className="text-[10px] opacity-70">{opt.hint}</div>
+                </button>
+              ))}
+            </div>
+
+            {/* Läge ej valt: prompta användaren */}
+            {form.fridayMode == null && (
+              <div className="rounded-lg bg-amber-50 ring-1 ring-amber-200 p-4 text-sm text-stone-700">
+                <p style={{ fontWeight: 500 }} className="mb-1">Välj fredagshantering ovan</p>
+                <p className="text-xs text-stone-600">
+                  <strong>Passbank</strong> rekommenderas om fredag fungerar likadant som övriga vardagar.
+                  {' '}<strong>Fast tid</strong> om personen alltid har samma fredag (eller alltid är ledig).
+                  {' '}<strong>Rull</strong> om fredagstiderna varierar enligt en veckorotation.
+                </p>
+              </div>
+            )}
+
+            {/* Passbank-läge: informerande, ingen direkt redigering här (sker via Manuell veckoredigering eller generatorn) */}
+            {form.fridayMode === 'passbank' && (
+              <div className="space-y-2">
+                <div className="rounded-lg bg-stone-50 ring-1 ring-stone-200 p-3 text-sm text-stone-600">
+                  <p>Fredag genereras automatiskt från passbanken — precis som mån-tor.</p>
+                  <p className="text-xs text-stone-500 mt-1">
+                    Tipsa: aktivera fredag som dag på relevanta pass i passbanken (Inställningar → Passbank) så att generatorn kan tilldela dem.
+                  </p>
+                </div>
+                {form.sched?.fri ? (
+                  <div className="text-xs text-stone-600 ml-1">
+                    <span className="text-stone-500">Nuvarande fredagspass:</span>{' '}
+                    <span className="display-font text-sm text-stone-800 tabular-nums">{form.sched.fri[0]} – {form.sched.fri[1]}</span>
+                    {' '}
+                    <span className="text-stone-400">({minToHM(dayMinutes(form.sched.fri))})</span>
+                  </div>
+                ) : (
+                  <p className="text-xs text-stone-500 ml-1">Inget pass tilldelat än. Klicka "Generera nytt schema" så fyller appen i.</p>
+                )}
+              </div>
+            )}
+
+            {/* Rotation-läge: befintligt rull-UI */}
+            {form.fridayMode === 'rotation' && (
+              <div className="mt-1">
                 <div className="flex gap-2 flex-wrap mb-3">
                   <button type="button" onClick={switchToTemplateFridayRotation}
                     className={`px-3 py-1.5 rounded-full text-xs transition ${form.fridayUseTemplate ? 'bg-stone-800 text-white' : 'bg-stone-100 text-stone-700 hover:bg-stone-200'}`}>
@@ -4757,13 +4861,19 @@ function StaffEditModal({ staff, departments, passBank, fridayCycleWeeks, friday
               </div>
             )}
 
-            {!form.hasFridayRotation && (
-              <div className="mt-3 ml-6 flex items-center gap-3 flex-wrap">
+            {/* Fast-läge: befintligt fast-fredag-UI */}
+            {form.fridayMode === 'fixed' && (
+              <div className="mt-1 flex items-center gap-3 flex-wrap">
                 <span className="text-sm text-stone-700 w-20">Fast fredag</span>
                 <input type="time" className="input w-32" value={form.fridayShift?.[0] || ''} onChange={e => setForm({ ...form, fridayShift: [e.target.value, form.fridayShift?.[1] || ''] })} />
                 <span className="text-stone-400">–</span>
                 <input type="time" className="input w-32" value={form.fridayShift?.[1] || ''} onChange={e => setForm({ ...form, fridayShift: [form.fridayShift?.[0] || '', e.target.value] })} />
-                <button onClick={() => setForm({ ...form, fridayShift: null })} className="text-xs text-stone-500 hover:text-stone-800">×</button>
+                {form.fridayShift?.[0] && form.fridayShift?.[1] && (
+                  <span className="text-xs text-stone-500">{minToHM(dayMinutes(form.fridayShift))}</span>
+                )}
+                <button onClick={() => setForm({ ...form, fridayShift: null })} className="ml-auto text-[10px] px-2 py-0.5 rounded bg-stone-100 text-stone-600 hover:bg-stone-200" type="button">
+                  Markera som ledig
+                </button>
               </div>
             )}
           </Section>
@@ -4801,9 +4911,30 @@ function StaffEditModal({ staff, departments, passBank, fridayCycleWeeks, friday
                     </div>
                   );
                 })}
-                <div className={`flex items-center gap-3 flex-wrap py-1 rounded ${fixedFridayOff ? 'opacity-60' : ''}`}>
+                <div className={`flex items-center gap-3 flex-wrap py-1 rounded ${form.fridayMode === 'fixed' && fixedFridayOff ? 'opacity-60' : ''}`}>
                   <span className="text-sm text-stone-700 w-20">Fredag</span>
-                  {!form.hasFridayRotation ? (
+                  {form.fridayMode === 'passbank' ? (
+                    <>
+                      {/* Passbank-läge: editera sched.fri direkt som vilken annan dag */}
+                      <input type="time" className="input w-32" value={form.sched?.fri?.[0] || ''}
+                        onChange={e => updateShift('fri', 0, e.target.value)} />
+                      <span className="text-stone-400">–</span>
+                      <input type="time" className="input w-32" value={form.sched?.fri?.[1] || ''}
+                        onChange={e => updateShift('fri', 1, e.target.value)} />
+                      {form.sched?.fri?.[0] && form.sched?.fri?.[1] && (
+                        <span className="text-xs text-stone-500 ml-1">{minToHM(dayMinutes(form.sched.fri))}</span>
+                      )}
+                      <button type="button" onClick={() => {
+                        const next = { ...(form.sched || {}) };
+                        if (next.fri) delete next.fri;
+                        else next.fri = ['07:00','15:30'];
+                        setForm({ ...form, sched: next });
+                      }}
+                        className={`ml-auto text-[10px] px-2 py-0.5 rounded ${!form.sched?.fri ? 'bg-stone-700 text-white' : 'bg-stone-100 text-stone-600 hover:bg-stone-200'}`}>
+                        {!form.sched?.fri ? 'Inget pass' : 'Ta bort pass'}
+                      </button>
+                    </>
+                  ) : form.fridayMode === 'fixed' ? (
                     <>
                       <input type="time" className="input w-32" value={form.fridayShift?.[0] || ''} disabled={fixedFridayOff}
                         onChange={e => setForm({ ...form, fridayShift: [e.target.value, form.fridayShift?.[1] || ''] })} />
@@ -4818,7 +4949,7 @@ function StaffEditModal({ staff, departments, passBank, fridayCycleWeeks, friday
                         {fixedFridayOff ? 'Ledig' : 'Markera som ledig'}
                       </button>
                     </>
-                  ) : (
+                  ) : form.fridayMode === 'rotation' ? (
                     <>
                       <div className="flex-1 min-w-[260px] rounded-lg bg-white px-3 py-2 ring-1 ring-stone-200">
                         <p className="text-xs text-stone-700" style={{ fontWeight: 500 }}>
@@ -4833,6 +4964,15 @@ function StaffEditModal({ staff, departments, passBank, fridayCycleWeeks, friday
                       <button type="button" onClick={scrollToFridaySection}
                         className="ml-auto text-[10px] px-2 py-0.5 rounded bg-stone-100 text-stone-600 hover:bg-stone-200">
                         Gå till fredagar
+                      </button>
+                    </>
+                  ) : (
+                    /* fridayMode === null: be användaren välja läge i fredagssektionen ovan */
+                    <>
+                      <span className="text-xs text-stone-500 italic">Fredagsläge ej valt</span>
+                      <button type="button" onClick={scrollToFridaySection}
+                        className="ml-auto text-[10px] px-2 py-0.5 rounded bg-stone-100 text-stone-600 hover:bg-stone-200">
+                        Välj läge
                       </button>
                     </>
                   )}
