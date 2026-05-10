@@ -33,7 +33,7 @@
 // Vi bygger en React-komponent som tar size/className/fill/style etc precis som lucide-react.
 (function() {
   const { createElement: h } = React;
-  const iconNames = ['AlertCircle', 'Clock', 'Users', 'Calendar', 'CheckCircle2', 'ChevronRight', 'Edit3', 'Sparkles', 'X', 'Plus', 'Trash2', 'Wand2', 'Settings', 'Download', 'Upload', 'Circle', 'HelpCircle', 'ArrowRight'];
+  const iconNames = ['AlertCircle', 'Clock', 'Users', 'Calendar', 'CheckCircle2', 'ChevronRight', 'Edit3', 'Sparkles', 'X', 'Plus', 'Trash2', 'Wand2', 'Settings', 'Download', 'Upload', 'Circle', 'HelpCircle', 'ArrowRight', 'Printer'];
   const defaultSvgAttrs = {
     xmlns: 'http://www.w3.org/2000/svg',
     viewBox: '0 0 24 24',
@@ -77,7 +77,7 @@
 
 <script type="text/babel" data-presets="react">
 // Plocka ut ikon-komponenterna så att resten av koden kan använda dem direkt
-const { AlertCircle, Clock, Users, Calendar, CheckCircle2, ChevronRight, Edit3, Sparkles, X, Plus, Trash2, Wand2, Settings, Download, Upload, Circle, HelpCircle, ArrowRight } = window.__icons;
+const { AlertCircle, Clock, Users, Calendar, CheckCircle2, ChevronRight, Edit3, Sparkles, X, Plus, Trash2, Wand2, Settings, Download, Upload, Circle, HelpCircle, ArrowRight, Printer } = window.__icons;
 const { useState, useMemo, useEffect, useRef } = React;
 
 
@@ -1908,12 +1908,14 @@ async function generateAlternativesAsync(initialStaff, coverageScopes, cycleWeek
       v.weights,
       2500,
       {
-        chunkSize: 100,
+        chunkSize: 50,
         onProgress: (variantProgress) => {
           if (!onProgress) return;
           const overall = ((i + variantProgress) / variants.length) * 100;
+          // Min 1% (bara så bar:n syns alls) i stället för 3% – då börjar
+          // den röra sig direkt i stället för att stå still de första chunkarna
           onProgress({
-            percent: Math.max(3, Math.min(100, Math.round(overall))),
+            percent: Math.max(1, Math.min(100, overall)),
             label: `${v.label} · ${Math.round(variantProgress * 100)} %`,
             detail: `Tar fram alternativ ${i + 1} av ${variants.length}`,
           });
@@ -2134,6 +2136,11 @@ let nextId = 100;
 
 function FritidsSchemaApp() {
   const [staff, setStaff] = useState(initialStaff);
+  // Baseline: snapshot av staff från senaste "utgångspunkt" (generering,
+  // exempelinläsning, filimport eller tömning). Används av schemavyn för att
+  // visa vad användaren har manuellt ändrat sedan dess, och för återställning.
+  // null betyder "ingen utgångspunkt satt än" – då visas inga diff-markeringar.
+  const [baselineStaff, setBaselineStaff] = useState(null);
   const [departments, setDepartments] = useState(initialDepartments);
   const [coverageBlocks, setCoverageBlocks] = useState(initialCoverageBlocks);
   const [passBank, setPassBank] = useState(() => normalizePassBank(initialPassBank));
@@ -2265,10 +2272,13 @@ function FritidsSchemaApp() {
 
   // Hjälp: bygg datapaketet att skriva till fil
   const buildSaveData = () => ({
-    version: 3,
+    version: 4,
     exportedAt: new Date().toISOString(),
     staff: normalizeStaffList(staff, fridayCycleWeeks),
     departments, coverageBlocks: normalizedCoverageBlocks, passBank: normalizePassBank(passBank), fridayCycleWeeks, fridayTemplateRotation,
+    // Snapshot av staff från senaste utgångspunkt – används av schemavyn
+    // för att visa vad som ändrats manuellt sedan generering/inläsning.
+    baselineStaff: baselineStaff ? normalizeStaffList(baselineStaff, fridayCycleWeeks) : null,
   });
 
   // Skriv data till en redan öppnad fil-handle
@@ -2365,6 +2375,13 @@ function FritidsSchemaApp() {
         const loadedDepartments = data.departments || [];
         const normalizedStaff = normalizeStaffList(data.staff || [], data.fridayCycleWeeks || 8);
         setStaff(normalizedStaff);
+        // Använd sparad baseline om filen har en. Annars sätt nuvarande
+        // staff som baseline – då visas inga diff-markeringar tills
+        // användaren genererar eller laddar exempel.
+        const loadedBaseline = Array.isArray(data.baselineStaff) && data.baselineStaff.length > 0
+          ? normalizeStaffList(data.baselineStaff, data.fridayCycleWeeks || 8)
+          : JSON.parse(JSON.stringify(normalizedStaff));
+        setBaselineStaff(loadedBaseline);
         setDepartments(loadedDepartments);
         setCoverageBlocks(normalizeCoverageBlocks(data.coverageBlocks || initialCoverageBlocks, loadedDepartments));
         setPassBank(normalizePassBank(data.passBank || initialPassBank));
@@ -2404,6 +2421,7 @@ function FritidsSchemaApp() {
     if (staff.length > 0 && !confirm(`Detta ersätter nuvarande data med testscenariot "${scenario.name}". Fortsätt?`)) return;
     const normalizedStaff = normalizeStaffList(scenario.staff, scenario.fridayCycleWeeks);
     setStaff(normalizedStaff);
+    setBaselineStaff(JSON.parse(JSON.stringify(normalizedStaff)));
     setDepartments(scenario.departments);
     setCoverageBlocks(normalizeCoverageBlocks(scenario.coverageBlocks, scenario.departments));
     setPassBank(normalizePassBank(scenario.passBank || initialPassBank));
@@ -2421,6 +2439,7 @@ function FritidsSchemaApp() {
   const clearAll = () => {
     if (!confirm('Detta tar bort all personal. Avdelningar behålls. Är du säker?')) return;
     setStaff([]);
+    setBaselineStaff(null);
   };
 
   const dayData = useMemo(() => {
@@ -2629,13 +2648,42 @@ function FritidsSchemaApp() {
     }
   };
 
+  // Återställ en specifik cells värde till baseline (senaste utgångspunkten).
+  // Hanterar alla fredagsläges-fält via updateScheduleShift.
+  // Begränsning: om personens fridayMode har ändrats sedan baselinen så
+  // återställs bara själva tids-värdet, inte läget – det är ett edge case
+  // som inte täcks här.
+  const resetPersonShiftToBaseline = (personId, dayKey, options = {}) => {
+    if (!baselineStaff) return;
+    const baselinePerson = baselineStaff.find(p => p.id === personId);
+    if (!baselinePerson) return;
+    const baselineShift = getShiftForDay(baselinePerson, dayKey, {
+      fridayWeek: options.fridayWeek || 1,
+      cycleWeeks: fridayCycleWeeks,
+      fridayTemplateRotation,
+    });
+    updateScheduleShift(personId, dayKey, baselineShift, options);
+  };
+
+  // Återställ HELA staff till baselinen. Slänger alla manuella ändringar
+  // som gjorts sedan senaste generering/inläsning.
+  const resetAllToBaseline = () => {
+    if (!baselineStaff) return;
+    if (!confirm('Detta återställer alla manuella ändringar i schemat till den senaste utgångspunkten. Fortsätt?')) return;
+    setStaff(JSON.parse(JSON.stringify(baselineStaff)));
+  };
+
   const applyAlternative = (alt) => {
     setStaff(alt.staff);
+    // Snapshot: genererade schemat är nu den nya utgångspunkten. Allt
+    // användaren ändrar manuellt efter detta blir markerat som "ändrad".
+    setBaselineStaff(JSON.parse(JSON.stringify(alt.staff)));
     setAlternatives(null);
   };
 
   return (
-    <div className="min-h-screen w-full" style={{ backgroundColor: '#FBF8F4', fontFamily: '"Geist", -apple-system, system-ui, sans-serif' }}>
+    <>
+    <div className="screen-only min-h-screen w-full" style={{ backgroundColor: '#FBF8F4', fontFamily: '"Geist", -apple-system, system-ui, sans-serif' }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Geist:wght@400;500;600&display=swap');
         body { font-family: "Geist", system-ui, sans-serif; }
@@ -2710,6 +2758,31 @@ function FritidsSchemaApp() {
           20% { opacity: 0.72; }
           70% { opacity: 0.48; }
           100% { transform: translateY(-16px) scaleX(1.08); opacity: 0; }
+        }
+
+        /* --- Utskriftsregler ---
+           På skärm: .print-only är dolt. På utskrift: skärm-UI:t göms och bara
+           den print-specifika vyn visas. Användaren får då en ren A4-vänlig
+           sida som kan sparas som PDF via webbläsarens print-dialog. */
+        .print-only { display: none; }
+        @media print {
+          @page { size: A4 landscape; margin: 1.2cm; }
+          body { background: #fff !important; color: #000; }
+          .screen-only { display: none !important; }
+          .print-only { display: block !important; }
+          .print-only h1 { font-family: "Fraunces", Georgia, serif; font-size: 22pt; margin: 0 0 4pt; }
+          .print-only .print-meta { font-size: 9pt; color: #666; margin-bottom: 14pt; }
+          .print-only .print-day { page-break-inside: avoid; margin-bottom: 14pt; }
+          .print-only .print-day-header { font-family: "Fraunces", Georgia, serif; font-size: 13pt; margin: 0 0 4pt; border-bottom: 1px solid #ccc; padding-bottom: 2pt; }
+          .print-only .print-day-empty { font-size: 9pt; color: #888; font-style: italic; }
+          .print-only table.print-day-table { width: 100%; border-collapse: collapse; font-size: 10pt; }
+          .print-only table.print-day-table td { padding: 3pt 6pt; vertical-align: middle; border-bottom: 1px solid #eee; }
+          .print-only table.print-day-table td.print-name { font-weight: 500; width: 26%; }
+          .print-only table.print-day-table td.print-role { color: #666; width: 18%; }
+          .print-only table.print-day-table td.print-time { font-variant-numeric: tabular-nums; width: 18%; }
+          .print-only table.print-day-table td.print-pass { color: #444; width: 24%; }
+          .print-only table.print-day-table td.print-dur { color: #666; font-variant-numeric: tabular-nums; width: 14%; text-align: right; }
+          .print-only .print-dot { display: inline-block; width: 8pt; height: 8pt; border-radius: 50%; margin-right: 6pt; vertical-align: middle; }
         }
       `}</style>
 
@@ -2805,6 +2878,9 @@ function FritidsSchemaApp() {
             setCurrentFridayWeek={setCurrentFridayWeek}
             fridayTemplateRotation={fridayTemplateRotation}
             onUpdateShift={updateScheduleShift}
+            baselineStaff={baselineStaff}
+            onResetShift={resetPersonShiftToBaseline}
+            onResetAll={resetAllToBaseline}
             hasFridaySetup={staff.some(s =>
               (s.fridayMode === 'rotation' && Array.isArray(s.fridayRotation) && s.fridayRotation.some(x => x))
               || (s.fridayMode === 'rotation' && s.fridayUseTemplate)
@@ -2857,12 +2933,12 @@ function FritidsSchemaApp() {
             <div className="display-font text-2xl text-stone-800 mb-2">Jobbar med schemapusslet</div>
             <p className="text-sm text-stone-600">{generationProgress.detail || 'Tar hänsyn till passbanken, bemanningen och allas villkor.'}</p>
             <p className="text-xs text-stone-500 mt-2">Ta en kopp kaffe så länge.</p>
-            <div className="mt-5 h-2.5 bg-stone-200 rounded-full overflow-hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={generationProgress.percent}>
-              <div className="h-full rounded-full bg-gradient-to-r from-stone-700 via-stone-800 to-amber-700 transition-all duration-300" style={{ width: `${generationProgress.percent}%` }} />
+            <div className="mt-5 h-2.5 bg-stone-200 rounded-full overflow-hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(generationProgress.percent)}>
+              <div className="h-full rounded-full bg-gradient-to-r from-stone-700 via-stone-800 to-amber-700 transition-all duration-150" style={{ width: `${generationProgress.percent}%` }} />
             </div>
             <div className="mt-3 flex items-center justify-between text-xs text-stone-500">
               <span>{generationProgress.label || 'Räknar...'}</span>
-              <span>{generationProgress.percent}%</span>
+              <span>{Math.round(generationProgress.percent)}%</span>
             </div>
             <p className="text-[11px] text-stone-400 mt-2">Appen jobbar i små steg för att sidan ska fortsätta kännas levande.</p>
           </div>
@@ -2887,10 +2963,104 @@ function FritidsSchemaApp() {
         <TourBubble step={tourStep} onNext={nextTourStep} onClose={endTour} />
       )}
     </div>
+    {/* Print-vy: dolt på skärm, visas bara vid utskrift via window.print().
+        Innehåller en kompakt veckosammanfattning som A4-landskap. */}
+    <PrintableSchedule
+      staff={staff}
+      departments={departments}
+      passBank={passBank}
+      fridayCycleWeeks={fridayCycleWeeks}
+      currentFridayWeek={currentFridayWeek}
+      fridayTemplateRotation={fridayTemplateRotation}
+      savedFileName={savedFileName} />
+    </>
   );
 }
 
 // ==================== SUBCOMPONENTS ====================
+
+// Print-vyn: dolt på skärm (.print-only{display:none}), syns bara i print-läge.
+// Renderar veckans schema på ett sätt som passar A4-landskap. För fredag visas
+// just den vecka användaren har aktiv – fredagsrullen exporteras inte i sin
+// helhet eftersom det skulle bli flera sidor och få användare behöver det.
+function PrintableSchedule({ staff, departments, passBank, fridayCycleWeeks, currentFridayWeek, fridayTemplateRotation, savedFileName }) {
+  const normalizedPassBank = useMemo(() => normalizePassBank(passBank || []), [passBank]);
+
+  const printDays = useMemo(() => {
+    return DAY_META.map(day => {
+      const present = (staff || [])
+        .filter(s => !(s.daysOff || []).includes(day.key))
+        .map(s => {
+          const shift = getShiftForDay(s, day.key, {
+            fridayWeek: currentFridayWeek,
+            cycleWeeks: fridayCycleWeeks,
+            fridayTemplateRotation,
+          });
+          if (!shift) return null;
+          const startMin = timeToMin(shift[0]);
+          const endMin = timeToMin(shift[1]);
+          if (startMin == null || endMin == null) return null;
+          const matchingPass = normalizedPassBank.find(pass =>
+            pass.days.includes(day.key) && shiftMatchesPass(shift, pass)
+          );
+          return {
+            id: s.id,
+            name: s.name || '(utan namn)',
+            role: s.role || '',
+            dept: getDept(s.deptId, departments),
+            shift,
+            startMin,
+            durationMin: endMin - startMin,
+            passName: matchingPass?.name || '',
+          };
+        })
+        .filter(Boolean)
+        .sort((a, b) => a.startMin - b.startMin);
+      return { day, present };
+    });
+  }, [staff, departments, normalizedPassBank, currentFridayWeek, fridayCycleWeeks, fridayTemplateRotation]);
+
+  const printedDate = new Date().toLocaleDateString('sv-SE');
+
+  return (
+    <div className="print-only">
+      <h1>Schema</h1>
+      <p className="print-meta">
+        Utskrivet {printedDate}
+        {savedFileName && ` · ${savedFileName}`}
+        {` · Fredag visas för vecka ${currentFridayWeek} av ${fridayCycleWeeks}`}
+      </p>
+      {printDays.map(({ day, present }) => (
+        <div key={day.key} className="print-day">
+          <h2 className="print-day-header">
+            {day.label}
+            {day.key === 'fri' && ` · vecka ${currentFridayWeek}`}
+          </h2>
+          {present.length === 0 ? (
+            <p className="print-day-empty">Ingen personal arbetar denna dag.</p>
+          ) : (
+            <table className="print-day-table">
+              <tbody>
+                {present.map(p => (
+                  <tr key={p.id}>
+                    <td className="print-name">
+                      <span className="print-dot" style={{ backgroundColor: p.dept.color }} />
+                      {p.name}
+                    </td>
+                    <td className="print-role">{p.role || p.dept.name}</td>
+                    <td className="print-time">{p.shift[0]} – {p.shift[1]}</td>
+                    <td className="print-pass">{p.passName}</td>
+                    <td className="print-dur">{minToHM(p.durationMin)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
 
 // Liten introduktionsruta som visas högst upp på varje flik. Förklarar vad fliken är till för.
 function TabIntro({ children }) {
@@ -3326,7 +3496,8 @@ function FeasibilityPanel({ issues, onGoToRules }) {
 
 function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, onGoToStaff, onLoadExample, departments, passBank,
                         fridayCycleWeeks, currentFridayWeek, setCurrentFridayWeek, hasFridaySetup,
-                        fridayTemplateRotation = [], onUpdateShift }) {
+                        fridayTemplateRotation = [], onUpdateShift,
+                        baselineStaff = null, onResetShift, onResetAll }) {
   const [coverageFocus, setCoverageFocus] = useState(dayData.primaryCoverageKey || COVERAGE_SHARED);
   // Inline-redigering: vilken person redigeras just nu (id eller null), och
   // utkasts-värdena innan användaren sparar. null = ingen rad redigeras.
@@ -3404,6 +3575,55 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
     cancelInlineEdit();
   }
 
+  // Baseline-lookup (O(1)) för "ändrad sedan generering"-jämförelse.
+  // baselineStaff är en snapshot av staff[] från senaste utgångspunkten
+  // (generering, exempelinläsning eller filinläsning).
+  const baselineById = useMemo(() => {
+    if (!baselineStaff) return null;
+    return new Map(baselineStaff.map(p => [p.id, p]));
+  }, [baselineStaff]);
+
+  // Helper: avgör om två shifts är olika. Båda null = lika (oförändrad).
+  function shiftsDiffer(a, b) {
+    if (a == null && b == null) return false;
+    if (a == null || b == null) return true;
+    return a[0] !== b[0] || a[1] !== b[1];
+  }
+
+  // Vilka av de synliga raderna är ändrade sedan baselinen?
+  // Räknar bara aktiv dag (för fredag: aktiv vecka). Andra dagar har sina egna
+  // räknare när man navigerar till dem.
+  // Personer som inte finns i baselinen (tillagda efter utgångspunkten) räknas
+  // INTE som ändrade – de är nya tillägg och har inget att återställa till.
+  const changedRowIds = useMemo(() => {
+    if (!baselineById) return new Set();
+    const ids = new Set();
+    for (const p of dayData.present) {
+      const bp = baselineById.get(p.id);
+      if (!bp) continue;
+      const currentSh = isFriday ? p._friShift : p.sched?.[activeDay];
+      const baselineSh = getShiftForDay(bp, activeDay, {
+        fridayWeek: currentFridayWeek,
+        cycleWeeks: fridayCycleWeeks,
+        fridayTemplateRotation,
+      });
+      if (shiftsDiffer(currentSh, baselineSh)) ids.add(p.id);
+    }
+    return ids;
+  }, [baselineById, dayData.present, activeDay, isFriday, currentFridayWeek, fridayCycleWeeks, fridayTemplateRotation]);
+
+  // Återställ alla ändrade rader på aktiv dag/vecka. Skickar ett anrop per
+  // ändrad person till onResetShift, som hanterar rätt fält per fredagsläge.
+  function resetActiveDay() {
+    if (changedRowIds.size === 0) return;
+    const weekSuffix = isFriday ? ` vecka ${currentFridayWeek}` : '';
+    const count = changedRowIds.size;
+    if (!confirm(`Återställa ${count} manuell ändring${count === 1 ? '' : 'ar'} på ${dayLabel.toLowerCase()}${weekSuffix} till utgångspunkten?`)) return;
+    for (const id of changedRowIds) {
+      onResetShift?.(id, activeDay, { fridayWeek: currentFridayWeek });
+    }
+  }
+
   const focusedCoverage = visibleCoverageViews.find(v => v.key === coverageFocus)
     || visibleCoverageViews[0]
     || dayData.coverageViews[0]
@@ -3476,17 +3696,27 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
             Fredag
           </button>
         </div>
-        {isFriday && hasFridaySetup && (
-          <div className="flex items-center gap-2 bg-white ring-1 ring-stone-200 rounded-lg px-2 py-1">
-            <button onClick={() => setCurrentFridayWeek(w => ((w - 2 + fridayCycleWeeks) % fridayCycleWeeks) + 1)}
-              className="p-1 hover:bg-stone-100 rounded text-stone-600">‹</button>
-            <span className="text-sm tabular-nums text-stone-700 px-2">
-              Vecka <span className="display-font" style={{ fontWeight: 500 }}>{currentFridayWeek}</span> av {fridayCycleWeeks}
-            </span>
-            <button onClick={() => setCurrentFridayWeek(w => (w % fridayCycleWeeks) + 1)}
-              className="p-1 hover:bg-stone-100 rounded text-stone-600">›</button>
-          </div>
-        )}
+        <div className="flex items-center gap-2 flex-wrap">
+          {isFriday && hasFridaySetup && (
+            <div className="flex items-center gap-2 bg-white ring-1 ring-stone-200 rounded-lg px-2 py-1">
+              <button onClick={() => setCurrentFridayWeek(w => ((w - 2 + fridayCycleWeeks) % fridayCycleWeeks) + 1)}
+                className="p-1 hover:bg-stone-100 rounded text-stone-600">‹</button>
+              <span className="text-sm tabular-nums text-stone-700 px-2">
+                Vecka <span className="display-font" style={{ fontWeight: 500 }}>{currentFridayWeek}</span> av {fridayCycleWeeks}
+              </span>
+              <button onClick={() => setCurrentFridayWeek(w => (w % fridayCycleWeeks) + 1)}
+                className="p-1 hover:bg-stone-100 rounded text-stone-600">›</button>
+            </div>
+          )}
+          {staffCount > 0 && (
+            <button onClick={() => window.print()}
+              className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm bg-white text-stone-700 ring-1 ring-stone-200 hover:bg-stone-50 transition"
+              title="Skriv ut hela veckan – välj 'Spara som PDF' i webbläsarens print-dialog för att skapa en PDF-fil">
+              <Printer size={14} />
+              Skriv ut / PDF
+            </button>
+          )}
+        </div>
       </div>
 
       {isFriday && !hasFridaySetup && (
@@ -3496,6 +3726,25 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
             <p style={{ fontWeight: 500 }}>Ingen fredagsrutin ifylld än</p>
             <p className="text-xs text-stone-600 mt-1">Klicka på en person i Personal-fliken och fyll i deras fredagstider.</p>
           </div>
+        </div>
+      )}
+
+      {/* Diff-indikator: visas bara om det finns ändringar på aktiv dag/vecka
+          sedan senaste utgångspunkt (generering, exempelinläsning eller filimport). */}
+      {changedRowIds.size > 0 && (
+        <div className="bg-amber-50 ring-1 ring-amber-200 rounded-lg px-4 py-2.5 flex items-center justify-between gap-3 flex-wrap">
+          <div className="text-sm text-stone-700 flex items-center gap-2">
+            <span className="text-amber-700">★</span>
+            <span>
+              <span style={{ fontWeight: 500 }}>{changedRowIds.size}</span> manuell ändring{changedRowIds.size === 1 ? '' : 'ar'} sedan utgångspunkten
+              {isFriday && ` på fredag vecka ${currentFridayWeek}`}
+              {!isFriday && ` på ${dayLabel.toLowerCase()}`}
+            </span>
+          </div>
+          <button type="button" onClick={resetActiveDay}
+            className="text-xs px-3 py-1 rounded-md bg-white text-amber-700 ring-1 ring-amber-300 hover:bg-amber-100 transition">
+            Återställ {isFriday ? 'fredag v.' + currentFridayWeek : dayLabel.toLowerCase()}
+          </button>
         </div>
       )}
 
@@ -3610,6 +3859,7 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
             const currentShift = isFriday ? p._friShift : p.sched[activeDay];
             const shiftLabel = `${currentShift[0]}–${currentShift[1]}`;
             const isEditing = editingRowId === p.id;
+            const isChanged = changedRowIds.has(p.id);
             // Hitta passnamnet om passet matchar passbanken
             const matchingPass = (typeof passBank !== 'undefined' && Array.isArray(passBank))
               ? normalizePassBank(passBank).find(pass =>
@@ -3684,16 +3934,28 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
                   </div>
                 ) : (
                   /* Läsläge: stapel som öppnar inline-redigering vid klick */
-                  <div className="flex-1 relative h-7 bg-stone-50 rounded-md cursor-pointer"
+                  <div className={`flex-1 relative h-7 bg-stone-50 rounded-md cursor-pointer ${isChanged ? 'ring-1 ring-amber-400 ring-dashed' : ''}`}
                     onClick={() => startInlineEdit(p)}
-                    title={`${tooltipText} · Klicka för att redigera tid`}>
+                    title={`${tooltipText}${isChanged ? ' · Ändrad sedan utgångspunkt' : ''} · Klicka för att redigera tid`}>
                     <div className="absolute h-full rounded-md flex items-center px-2 transition-all hover:opacity-90"
                       style={{ left: `${pctFromMin(p.startMin)}%`, width: `${pctFromMin(p.endMin) - pctFromMin(p.startMin)}%`,
-                        backgroundColor: soft, borderLeft: `3px solid ${dept.color}` }}>
+                        backgroundColor: soft, borderLeft: `3px solid ${isChanged ? '#d97706' : dept.color}` }}>
                       <span className="text-[11px] truncate text-stone-700" style={{ fontWeight: 500 }}>
+                        {isChanged && <span className="text-amber-700 mr-1" title="Ändrad sedan utgångspunkt">★</span>}
                         {passName ? `${shiftLabel} · ${passName}` : shiftLabel}
                       </span>
                     </div>
+                    {isChanged && onResetShift && (
+                      <button type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onResetShift(p.id, activeDay, { fridayWeek: currentFridayWeek });
+                        }}
+                        className="absolute right-1 top-1/2 -translate-y-1/2 text-[10px] px-1.5 py-0.5 rounded bg-white text-amber-700 ring-1 ring-amber-300 hover:bg-amber-50 opacity-0 group-hover:opacity-100 transition"
+                        title="Återställ denna rad till utgångspunkten">
+                        Återställ
+                      </button>
+                    )}
                   </div>
                 )}
               </div>
