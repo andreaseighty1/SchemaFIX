@@ -36,7 +36,9 @@ SchemaFIX är ett mellanting: tillräckligt smart för att göra själva pussela
 
 **Generera tre alternativ.** Appen pusslar fram tre olika versioner av samma vecka — en med fokus på bemanning, en med fokus på exakta veckotimmar, en balanserad. Du jämför, väljer den som känns bäst, eller kör en blandning.
 
-**Finputsa direkt i veckovyn.** Klicka på en stapel och ändra start- eller sluttid. Veckotimmarna räknas om medan du skriver, så du ser direkt om personen får för många eller för få timmar. Det är så de bästa kommersiella schemaverktygen funkar — *generera utkast → manuell finjustering* — men utan prislappen.
+**Finputsa direkt i veckovyn.** Klicka på en stapel och ändra start- eller sluttid. Veckotimmarna räknas om medan du skriver, så du ser direkt om personen får för många eller för få timmar. Allt du ändrat manuellt markeras tydligt — och om du har trasslat in dig kan du återställa enskilda rader eller hela dagen till det genererade utgångsläget. Det är så de bästa kommersiella schemaverktygen funkar — *generera utkast → manuell finjustering* — men utan prislappen.
+
+**Skriv ut eller spara som PDF.** En klick i schemavyn ger dig en print-vänlig vy med hela veckan, passnamn och avdelningsfärger. Välj "Spara som PDF" i webbläsarens print-dialog så får du en fil att skicka eller sätta upp i personalrummet.
 
 **Fredagshantering på dina villkor.** Tre alternativ per person:
 - *Passbank* — fredag genereras automatiskt som vilken vardag som helst
@@ -55,7 +57,6 @@ SchemaFIX är ett mellanting: tillräckligt smart för att göra själva pussela
 - **Ingen frånvaro- eller semesterhantering.** Den här versionen handlar om att bygga en *typvecka*. Sjukdomar och vab gör du själv ovanpå.
 - **Ingen lönerapportering.** Det här är ett pusselverktyg, inte ett HR-system.
 - **Ett fritids åt gången.** Om du schemalägger flera enheter får du ha en fil per fritids tills vidare.
-- **PDF-utskrift kommer.** Just nu kan du bara skriva ut via webbläsarens skriv-ut-funktion.
 - **Det här är beta.** Saker kan ändras, och det kan finnas buggar. Säkra dina filer ofta.
 
 ---
@@ -67,7 +68,8 @@ SchemaFIX är ett mellanting: tillräckligt smart för att göra själva pussela
 3. **Lägg till personalen.** För varje person: avdelning, tjänstegrad, vilka pass de får ta, ev. regler om när de kan börja/sluta. Välj fredagshantering: passbank, fast tid eller rull.
 4. **Sätt bemanningskraven.** Hur många behövs vid olika tider? Gör det per avdelning eller gemensamt.
 5. **Klicka *Generera schemaförslag*.** Appen ger tre alternativ — välj det du gillar bäst.
-6. **Finputsa.** Klicka på en stapel i schemavyn för att ändra tider direkt. Timmar räknas om medan du skriver.
+6. **Finputsa.** Klicka på en stapel i schemavyn för att ändra tider direkt. Timmar räknas om medan du skriver, och dina manuella ändringar markeras så du kan ångra dem individuellt.
+7. **Skriv ut eller spara som PDF** när du är nöjd — knappen finns uppe till höger i schemavyn.
 
 Det första försöket är aldrig perfekt. Det är heller inte poängen — poängen är att du börjar 80% framme istället för från noll.
 
