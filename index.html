@@ -1271,6 +1271,41 @@ function getShiftForDay(person, dayKey, options = {}) {
   return person.sched?.[dayKey] || null;
 }
 
+// Bygger en hypotetisk personkopia med ett pass på en specifik dag — används av
+// inline-redigering i schemavyn för att förhandsvisa veckotimmar utan att
+// behöva spara. Speglar logiken i updateScheduleShift (uppdaterar rätt fält
+// baserat på fredagsläget) men *muterar inget* — returnerar en ny person.
+function buildPreviewPerson(person, dayKey, newShift, fridayWeek = 1, cycleWeeks = 8) {
+  const cleanShift = newShift ? normalizeShift(newShift) : null;
+  if (dayKey !== 'fri') {
+    const sched = { ...(person.sched || {}) };
+    if (cleanShift) sched[dayKey] = cleanShift;
+    else delete sched[dayKey];
+    return { ...person, sched };
+  }
+  if (person.fridayMode === 'passbank') {
+    const sched = { ...(person.sched || {}) };
+    if (cleanShift) sched.fri = cleanShift;
+    else delete sched.fri;
+    return { ...person, sched };
+  }
+  if (person.fridayMode === 'fixed') {
+    return { ...person, fridayShift: cleanShift };
+  }
+  if (person.fridayMode === 'rotation') {
+    if (person.fridayUseTemplate) {
+      const overrides = { ...(person.fridayTemplateOverrides || {}) };
+      overrides[String(fridayWeek)] = cleanShift;
+      return { ...person, fridayTemplateOverrides: overrides };
+    }
+    const rotation = (person.fridayRotation || []).slice();
+    while (rotation.length < cycleWeeks) rotation.push(null);
+    rotation[fridayWeek - 1] = cleanShift;
+    return { ...person, fridayRotation: rotation };
+  }
+  return person;
+}
+
 function computeSlots(staff, dayKey, coverageSlots, scope = { scopeType: COVERAGE_SHARED, deptId: null }, options = {}) {
   return coverageSlots.map(slot => {
     let count = 0;
@@ -2505,6 +2540,55 @@ function FritidsSchemaApp() {
 
   const updateStaff = (updated) => setStaff(prev => prev.map(s => s.id === updated.id ? normalizePerson(updated, fridayCycleWeeks) : s));
   const removeStaff = (id) => setStaff(prev => prev.filter(s => s.id !== id));
+
+  // Direktredigering från schemavyn: uppdaterar EN persons pass på EN dag.
+  // Hanterar alla fyra fredagslägen så att klick-redigering på fredagen
+  // landar i rätt fält (sched.fri / fridayShift / fridayRotation[week] /
+  // fridayTemplateOverrides[week]).
+  // newShift = ['HH:MM', 'HH:MM'] för att sätta tid, eller null för att
+  // markera personen som ledig den dagen.
+  const updateScheduleShift = (personId, dayKey, newShift, options = {}) => {
+    setStaff(prev => prev.map(p => {
+      if (p.id !== personId) return p;
+      const cleanShift = newShift ? normalizeShift(newShift) : null;
+      // Vardag: enklast – skriv eller ta bort sched[day]
+      if (dayKey !== 'fri') {
+        const sched = { ...(p.sched || {}) };
+        if (cleanShift) sched[dayKey] = cleanShift;
+        else delete sched[dayKey];
+        return { ...p, sched };
+      }
+      // Fredag: olika fält beroende på personens fredagsläge
+      if (p.fridayMode === 'passbank') {
+        const sched = { ...(p.sched || {}) };
+        if (cleanShift) sched.fri = cleanShift;
+        else delete sched.fri;
+        return { ...p, sched };
+      }
+      if (p.fridayMode === 'fixed') {
+        return { ...p, fridayShift: cleanShift };
+      }
+      if (p.fridayMode === 'rotation') {
+        const week = options.fridayWeek || 1;
+        if (p.fridayUseTemplate) {
+          // Central mall: skapa eller rensa en override för veckan.
+          // null betyder "explicit ledig denna vecka" (skiljs från undefined
+          // som betyder "följ mallen").
+          const overrides = { ...(p.fridayTemplateOverrides || {}) };
+          overrides[String(week)] = cleanShift;
+          return { ...p, fridayTemplateOverrides: overrides };
+        }
+        // Egen rull: uppdatera array-platsen för veckan
+        const rotation = (p.fridayRotation || []).slice();
+        while (rotation.length < fridayCycleWeeks) rotation.push(null);
+        rotation[week - 1] = cleanShift;
+        return { ...p, fridayRotation: rotation };
+      }
+      // fridayMode === null (ej valt): gör inget – be användaren välja läge först
+      return p;
+    }));
+  };
+
   const addStaff = () => {
     if (departments.length === 0) {
       alert('Lägg till minst en avdelning under "Inställningar" först.');
@@ -2719,6 +2803,8 @@ function FritidsSchemaApp() {
             departments={departments} passBank={passBank}
             fridayCycleWeeks={fridayCycleWeeks} currentFridayWeek={currentFridayWeek}
             setCurrentFridayWeek={setCurrentFridayWeek}
+            fridayTemplateRotation={fridayTemplateRotation}
+            onUpdateShift={updateScheduleShift}
             hasFridaySetup={staff.some(s =>
               (s.fridayMode === 'rotation' && Array.isArray(s.fridayRotation) && s.fridayRotation.some(x => x))
               || (s.fridayMode === 'rotation' && s.fridayUseTemplate)
@@ -3239,8 +3325,15 @@ function FeasibilityPanel({ issues, onGoToRules }) {
 }
 
 function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, onGoToStaff, onLoadExample, departments, passBank,
-                        fridayCycleWeeks, currentFridayWeek, setCurrentFridayWeek, hasFridaySetup }) {
+                        fridayCycleWeeks, currentFridayWeek, setCurrentFridayWeek, hasFridaySetup,
+                        fridayTemplateRotation = [], onUpdateShift }) {
   const [coverageFocus, setCoverageFocus] = useState(dayData.primaryCoverageKey || COVERAGE_SHARED);
+  // Inline-redigering: vilken person redigeras just nu (id eller null), och
+  // utkasts-värdena innan användaren sparar. null = ingen rad redigeras.
+  const [editingRowId, setEditingRowId] = useState(null);
+  const [editDraft, setEditDraft] = useState({ start: '', end: '' });
+  const [editError, setEditError] = useState('');
+
   const ticks = []; for (let m = 360; m <= TIMELINE_END; m += 60) ticks.push(m);
   const isFriday = activeDay === 'fri';
   const dayLabel = isFriday ? 'Fredag' : DAYS.find(d => d.key === activeDay).label;
@@ -3252,6 +3345,64 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
       setCoverageFocus(dayData.primaryCoverageKey || available[0] || COVERAGE_SHARED);
     }
   }, [coverageFocus, dayData.primaryCoverageKey, visibleCoverageViews]);
+
+  // Avbryt pågående redigering om man byter dag eller fredagsvecka mellan
+  // klicken — annars riskerar utkastet att hamna på fel rad.
+  useEffect(() => { cancelInlineEdit(); }, [activeDay, currentFridayWeek]);
+
+  // ESC stänger redigeringsläget, Enter sparar.
+  useEffect(() => {
+    if (editingRowId == null) return;
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); cancelInlineEdit(); }
+      else if (e.key === 'Enter') { e.preventDefault(); saveInlineEdit(); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+
+  // Hjälpfunktioner för inline-redigering. Definierade efter useEffects ovan
+  // pga JS-hoisting för `function`-deklarationer (de fungerar trots placeringen).
+  function startInlineEdit(person) {
+    const sh = isFriday ? person._friShift : person.sched?.[activeDay];
+    setEditingRowId(person.id);
+    setEditDraft({ start: sh?.[0] || '', end: sh?.[1] || '' });
+    setEditError('');
+  }
+  function cancelInlineEdit() {
+    setEditingRowId(null);
+    setEditDraft({ start: '', end: '' });
+    setEditError('');
+  }
+  function saveInlineEdit() {
+    if (editingRowId == null) return;
+    const { start, end } = editDraft;
+    if (!start || !end) {
+      setEditError('Fyll i både start- och sluttid');
+      return;
+    }
+    const startMin = timeToMin(start);
+    const endMin = timeToMin(end);
+    if (startMin == null || endMin == null) {
+      setEditError('Ogiltigt tidsformat');
+      return;
+    }
+    if (endMin <= startMin) {
+      setEditError('Sluttiden måste vara efter starttiden');
+      return;
+    }
+    if (endMin - startMin < 60) {
+      setEditError('Passet måste vara minst 60 min');
+      return;
+    }
+    onUpdateShift?.(editingRowId, activeDay, [start, end], { fridayWeek: currentFridayWeek });
+    cancelInlineEdit();
+  }
+  function setMarkedAsOff() {
+    if (editingRowId == null) return;
+    onUpdateShift?.(editingRowId, activeDay, null, { fridayWeek: currentFridayWeek });
+    cancelInlineEdit();
+  }
 
   const focusedCoverage = visibleCoverageViews.find(v => v.key === coverageFocus)
     || visibleCoverageViews[0]
@@ -3458,6 +3609,7 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
             const soft = softColor(dept.color);
             const currentShift = isFriday ? p._friShift : p.sched[activeDay];
             const shiftLabel = `${currentShift[0]}–${currentShift[1]}`;
+            const isEditing = editingRowId === p.id;
             // Hitta passnamnet om passet matchar passbanken
             const matchingPass = (typeof passBank !== 'undefined' && Array.isArray(passBank))
               ? normalizePassBank(passBank).find(pass =>
@@ -3468,6 +3620,25 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
             const tooltipText = passName
               ? `${p.name} – ${passName} (${shiftLabel})`
               : `${p.name} – ${shiftLabel}`;
+
+            // Veckotim-räkning för raden. När personen redigeras live visar vi
+            // en *preview* baserat på utkastet så användaren ser konsekvensen
+            // av sitt byte direkt utan att behöva spara.
+            const previewShift = isEditing && editDraft.start && editDraft.end
+              && timeToMin(editDraft.end) > timeToMin(editDraft.start)
+              ? normalizeShift([editDraft.start, editDraft.end])
+              : null;
+            const personForCalc = isEditing && previewShift
+              ? buildPreviewPerson(p, activeDay, previewShift, currentFridayWeek, fridayCycleWeeks)
+              : p;
+            const weekMin = weeklyMinutes(personForCalc, fridayCycleWeeks, fridayTemplateRotation);
+            const targetMin = getTargetMin(p);
+            const diffMin = weekMin - targetMin;
+            const onTarget = Math.abs(diffMin) <= 5;
+            const hoursColor = onTarget ? 'text-stone-500' : (diffMin > 0 ? 'text-amber-700' : 'text-orange-700');
+            const hoursLabel = `${minToHM(weekMin)} / ${minToHM(targetMin)}`;
+            const diffLabel = onTarget ? '' : (diffMin > 0 ? `+${minToHM(diffMin)}` : `−${minToHM(-diffMin)}`);
+
             return (
               <div key={p.id} className="flex items-center group">
                 <div className="w-32 pr-3 text-right">
@@ -3475,16 +3646,56 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
                     <Edit3 size={10} className="opacity-0 group-hover:opacity-50 transition" />{p.name}
                   </button>
                   {p.role && <p className="text-[10px] text-stone-500 truncate">{p.role}</p>}
+                  <p className={`text-[10px] truncate tabular-nums ${hoursColor}`} title={`Veckotimmar: ${minToHM(weekMin)} (mål ${minToHM(targetMin)})`}>
+                    {hoursLabel}{diffLabel && <span className="ml-1">({diffLabel})</span>}
+                  </p>
                 </div>
-                <div className="flex-1 relative h-7 bg-stone-50 rounded-md cursor-pointer" onClick={() => onEdit(p.id)} title={tooltipText}>
-                  <div className="absolute h-full rounded-md flex items-center px-2 transition-all hover:opacity-90"
-                    style={{ left: `${pctFromMin(p.startMin)}%`, width: `${pctFromMin(p.endMin) - pctFromMin(p.startMin)}%`,
-                      backgroundColor: soft, borderLeft: `3px solid ${dept.color}` }}>
-                    <span className="text-[11px] truncate text-stone-700" style={{ fontWeight: 500 }}>
-                      {passName ? `${shiftLabel} · ${passName}` : shiftLabel}
-                    </span>
+                {isEditing ? (
+                  /* Inline-redigering: två time-fält + spara/avbryt/markera ledig */
+                  <div className="flex-1 flex items-center gap-2 bg-amber-50 ring-1 ring-amber-200 rounded-md px-2 py-1">
+                    <input type="time" className="input w-28" autoFocus
+                      value={editDraft.start}
+                      onChange={e => { setEditDraft(d => ({ ...d, start: e.target.value })); setEditError(''); }} />
+                    <span className="text-stone-400 text-xs">–</span>
+                    <input type="time" className="input w-28"
+                      value={editDraft.end}
+                      onChange={e => { setEditDraft(d => ({ ...d, end: e.target.value })); setEditError(''); }} />
+                    {editDraft.start && editDraft.end && timeToMin(editDraft.end) > timeToMin(editDraft.start) && (
+                      <span className="text-[10px] text-stone-500 tabular-nums">
+                        {minToHM(timeToMin(editDraft.end) - timeToMin(editDraft.start))}
+                      </span>
+                    )}
+                    {editError && <span className="text-[10px] text-rose-700 ml-1">{editError}</span>}
+                    <div className="ml-auto flex items-center gap-1">
+                      <button type="button" onClick={saveInlineEdit}
+                        className="text-[11px] px-2 py-1 rounded bg-stone-800 text-white hover:bg-stone-900 transition">
+                        Spara
+                      </button>
+                      <button type="button" onClick={cancelInlineEdit}
+                        className="text-[11px] px-2 py-1 rounded bg-white text-stone-600 ring-1 ring-stone-200 hover:bg-stone-50 transition">
+                        Avbryt
+                      </button>
+                      <button type="button" onClick={setMarkedAsOff}
+                        className="text-[11px] px-2 py-1 rounded text-stone-500 hover:text-rose-700 transition"
+                        title="Markera personen som ledig denna dag">
+                        Ledig
+                      </button>
+                    </div>
                   </div>
-                </div>
+                ) : (
+                  /* Läsläge: stapel som öppnar inline-redigering vid klick */
+                  <div className="flex-1 relative h-7 bg-stone-50 rounded-md cursor-pointer"
+                    onClick={() => startInlineEdit(p)}
+                    title={`${tooltipText} · Klicka för att redigera tid`}>
+                    <div className="absolute h-full rounded-md flex items-center px-2 transition-all hover:opacity-90"
+                      style={{ left: `${pctFromMin(p.startMin)}%`, width: `${pctFromMin(p.endMin) - pctFromMin(p.startMin)}%`,
+                        backgroundColor: soft, borderLeft: `3px solid ${dept.color}` }}>
+                      <span className="text-[11px] truncate text-stone-700" style={{ fontWeight: 500 }}>
+                        {passName ? `${shiftLabel} · ${passName}` : shiftLabel}
+                      </span>
+                    </div>
+                  </div>
+                )}
               </div>
             );
           })}
