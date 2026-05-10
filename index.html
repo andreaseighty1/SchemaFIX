@@ -1909,17 +1909,18 @@ async function generateAlternativesAsync(initialStaff, coverageScopes, cycleWeek
       2500,
       {
         chunkSize: 50,
-        onProgress: (variantProgress) => {
-          if (!onProgress) return;
-          const overall = ((i + variantProgress) / variants.length) * 100;
-          // Min 1% (bara så bar:n syns alls) i stället för 3% – då börjar
-          // den röra sig direkt i stället för att stå still de första chunkarna
-          onProgress({
-            percent: Math.max(1, Math.min(100, overall)),
-            label: `${v.label} · ${Math.round(variantProgress * 100)} %`,
-            detail: `Tar fram alternativ ${i + 1} av ${variants.length}`,
-          });
-        },
+          onProgress: (variantProgress) => {
+            if (!onProgress) return;
+            const overall = ((i + variantProgress) / variants.length) * 100;
+            // Bar:ns procent (höger) och fyllningen är totalprogressen. Labeln
+            // visar bara variantens NAMN – variantens egna procent skulle bara
+            // förvirra eftersom de redan ser totalprocenten till höger.
+            onProgress({
+              percent: Math.max(1, Math.min(100, overall)),
+              label: v.label,
+              detail: `Tar fram alternativ ${i + 1} av ${variants.length}`,
+            });
+          },
       }
     );
     results.push({
@@ -2731,15 +2732,6 @@ function FritidsSchemaApp() {
           border-left: none;
           border-radius: 0 12px 12px 0;
         }
-        .coffee-fill {
-          position: absolute;
-          left: 7px;
-          right: 7px;
-          top: 8px;
-          height: 13px;
-          border-radius: 999px;
-          background: linear-gradient(180deg, #7c4a2c 0%, #5f381f 100%);
-        }
         .coffee-steam {
           position: absolute;
           bottom: 58px;
@@ -2918,32 +2910,7 @@ function FritidsSchemaApp() {
           onRemove={(id) => { removeStaff(id); setEditingId(null); }} />
       )}
 
-      {generating && (
-        <div className="fixed inset-0 z-40 flex items-center justify-center" style={{ backgroundColor: 'rgba(28, 25, 23, 0.4)' }}>
-          <div className="coffee-card rounded-[28px] p-8 shadow-2xl text-center max-w-sm ring-1 ring-stone-200/70">
-            <div className="coffee-wrap" aria-hidden="true">
-              <div className="coffee-steam s1" />
-              <div className="coffee-steam s2" />
-              <div className="coffee-steam s3" />
-              <div className="coffee-cup">
-                <div className="coffee-fill" />
-              </div>
-              <div className="coffee-plate" />
-            </div>
-            <div className="display-font text-2xl text-stone-800 mb-2">Jobbar med schemapusslet</div>
-            <p className="text-sm text-stone-600">{generationProgress.detail || 'Tar hänsyn till passbanken, bemanningen och allas villkor.'}</p>
-            <p className="text-xs text-stone-500 mt-2">Ta en kopp kaffe så länge.</p>
-            <div className="mt-5 h-2.5 bg-stone-200 rounded-full overflow-hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(generationProgress.percent)}>
-              <div className="h-full rounded-full bg-gradient-to-r from-stone-700 via-stone-800 to-amber-700 transition-all duration-150" style={{ width: `${generationProgress.percent}%` }} />
-            </div>
-            <div className="mt-3 flex items-center justify-between text-xs text-stone-500">
-              <span>{generationProgress.label || 'Räknar...'}</span>
-              <span>{Math.round(generationProgress.percent)}%</span>
-            </div>
-            <p className="text-[11px] text-stone-400 mt-2">Appen jobbar i små steg för att sidan ska fortsätta kännas levande.</p>
-          </div>
-        </div>
-      )}
+      {generating && <GenerationModal progress={generationProgress} />}
 
       {alternatives && (
         <AlternativesModal alternatives={alternatives} currentStaff={staff} coverageScopes={coverageScopes} fridayCycleWeeks={fridayCycleWeeks} fridayTemplateRotation={fridayTemplateRotation}
@@ -3058,6 +3025,78 @@ function PrintableSchedule({ staff, departments, passBank, fridayCycleWeeks, cur
           )}
         </div>
       ))}
+    </div>
+  );
+}
+
+// Humoristiska "what is the app doing"-meddelanden som roterar i generation-modalen.
+// Tonen: lätt självironisk, schemaläggar-vardag, mat och kaffe gärna omnämnt.
+// Lägg gärna till fler när nya situationer dyker upp.
+const GENERATION_QUIPS = [
+  'Kliar mig i håret...',
+  'Får ett grått hårstrå till...',
+  'Hämtar kaffe nr 23...',
+  'Räknar timmar på fingrarna...',
+  'Bråkar lite med fredagsrullen...',
+  'Försöker övertala måndagen att gå ihop...',
+  'Spelar Tetris med passen...',
+  'Letar efter en lucka för Karin...',
+  'Mumlar något om bemanningskrav...',
+  'Stoppar mer kaffe direkt i kretsarna...',
+  'Drar lite i en stapel hit och dit...',
+  'Talar med kalendern, lågmält...',
+  'Skriver osynliga post-it-lappar...',
+  'Hojtar "någon ledig klockan sex?"...',
+  'Pusslar med hjärnan på högvarv...',
+  'Vänder och vrider på onsdagen...',
+  'Lockar med fika till stängningen...',
+  'Räknar passen baklänges för säkerhets skull...',
+  'Funderar om jag ska börja om från ruta ett...',
+  'Övertygar mig själv att det går att lösa...',
+  'Tittar ut genom fönstret en stund...',
+  'Drömmer om att schemalägga sandlådor istället...',
+];
+
+// Modal som visas medan generatorn jobbar. Egen komponent för att kunna ha
+// sin egen useEffect-baserade rotation av humoristiska meddelanden.
+function GenerationModal({ progress }) {
+  const [quipIndex, setQuipIndex] = useState(() => Math.floor(Math.random() * GENERATION_QUIPS.length));
+  useEffect(() => {
+    // Byt meddelande varannan sekund. Undvik att slumpa fram samma två gånger
+    // i rad (irriterande om man bara stirrar).
+    const interval = setInterval(() => {
+      setQuipIndex(prev => {
+        if (GENERATION_QUIPS.length <= 1) return prev;
+        let next;
+        do { next = Math.floor(Math.random() * GENERATION_QUIPS.length); } while (next === prev);
+        return next;
+      });
+    }, 2000);
+    return () => clearInterval(interval);
+  }, []);
+  const quip = GENERATION_QUIPS[quipIndex] || '';
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center" style={{ backgroundColor: 'rgba(28, 25, 23, 0.4)' }}>
+      <div className="coffee-card rounded-[28px] p-8 shadow-2xl text-center max-w-sm ring-1 ring-stone-200/70">
+        <div className="coffee-wrap" aria-hidden="true">
+          <div className="coffee-steam s1" />
+          <div className="coffee-steam s2" />
+          <div className="coffee-steam s3" />
+          <div className="coffee-cup" />
+          <div className="coffee-plate" />
+        </div>
+        <div className="display-font text-2xl text-stone-800 mb-2">Jobbar med schemapusslet</div>
+        <p className="text-sm text-stone-600">{progress.detail || 'Tar hänsyn till passbanken, bemanningen och allas villkor.'}</p>
+        <p className="text-xs text-stone-500 mt-2">Ta en kopp kaffe så länge.</p>
+        <div className="mt-5 h-2.5 bg-stone-200 rounded-full overflow-hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(progress.percent)}>
+          <div className="h-full rounded-full bg-gradient-to-r from-stone-700 via-stone-800 to-amber-700 transition-all duration-150" style={{ width: `${progress.percent}%` }} />
+        </div>
+        <div className="mt-3 flex items-center justify-between text-xs text-stone-500">
+          <span>{progress.label || 'Räknar...'}</span>
+          <span>{Math.round(progress.percent)}%</span>
+        </div>
+        <p className="text-[11px] text-stone-400 mt-3 italic">{quip}</p>
+      </div>
     </div>
   );
 }
