@@ -210,7 +210,7 @@ const DEFAULTS = {
   // Fredagshantering: tre möjliga lägen.
   //  - 'passbank' = fredag genereras från passbanken precis som mån-tor
   //  - 'fixed'    = fast fredagstid (eller alltid ledig)
-  //  - 'rotation' = 8-veckors fredagsrull (egen eller central mall)
+  //  - 'rotation' = fredagsrull med konfigurerbar cykellängd (egen eller central mall)
   //  - null       = användaren har ännu inte valt (visar valdialog i edit-modalen)
   // hasFridayRotation behålls som spegel för bakåtkompatibilitet i kodvägar
   // som inte uppdaterats än, och avgör migration från legacy-data.
@@ -784,9 +784,12 @@ function normalizeConstraintSet(set) {
 }
 function normalizeDayOverrides(dayOverrides) {
   const next = {};
-  DAYS.forEach(d => {
-    const clean = normalizeConstraintSet(dayOverrides?.[d.key]);
-    if (Object.keys(clean).length > 0) next[d.key] = clean;
+  // Tillåter alla dagar inkl fredag. För passbank-läges-personer kan
+  // dagsspecifika regler för fredag vara värdefulla. Övriga lägen styr fredag
+  // via egna fält men en orphan-override här är ofarlig (frågas aldrig).
+  ALL_DAY_KEYS.forEach(key => {
+    const clean = normalizeConstraintSet(dayOverrides?.[key]);
+    if (Object.keys(clean).length > 0) next[key] = clean;
   });
   return next;
 }
@@ -939,14 +942,24 @@ function getAvailableEligiblePassesForDay(person, dayKey, staff, passBank = []) 
 }
 
 function getSuggestedDayMinutes(person, cycleWeeks, fridayTemplateRotation = []) {
-  const explicitDayMinutes = DAYS
-    .map(d => normalizeShift(person.sched?.[d.key]))
+  // För passbank-personer räknas fredag som en vanlig arbetsdag.
+  // För övriga lägen hanteras fredag separat via avgFridayMinutes och ingår
+  // inte i denna per-vardags-uppdelning.
+  const isPassbank = person.fridayMode === 'passbank';
+  const dayKeys = isPassbank ? [...WEEKDAY_KEYS, 'fri'] : WEEKDAY_KEYS;
+  const explicitDayMinutes = dayKeys
+    .map(key => normalizeShift(person.sched?.[key]))
     .filter(Boolean)
     .map(dayMinutes)
     .filter(Number.isFinite);
   if (explicitDayMinutes.length > 0) {
     const avg = explicitDayMinutes.reduce((sum, min) => sum + min, 0) / explicitDayMinutes.length;
     return clamp(roundToStep(avg), 60, 600);
+  }
+  // Cold-start: ingen tilldelning än. Räkna ut snittlängd från målet.
+  if (isPassbank) {
+    const workingDays = dayKeys.filter(key => !(person.daysOff || []).includes(key)).length || dayKeys.length;
+    return clamp(roundToStep(getTargetMin(person) / workingDays), 60, 600);
   }
   const workingDays = DAYS.filter(d => !(person.daysOff || []).includes(d.key)).length || DAYS.length;
   const fridayMinutes = avgFridayMinutes(person, cycleWeeks, fridayTemplateRotation);
@@ -1097,6 +1110,10 @@ function applyAnchorCoverageForDay(prepared, dayKey, coverageScopes, cycleWeeks,
 
       const candidates = prepared
         .filter(member => personMatchesCoverageScope(member, scope) && !(member.daysOff || []).includes(dayKey) && !member.fixedTimes)
+        // Generatorn får bara röra dagar den är ansvarig för. För 'fri'
+        // betyder det: bara passbank-läges-personer. Legacy-fredagspersoner
+        // har sin tid i andra fält och ska inte få sched.fri tilldelat.
+        .filter(member => isGeneratorManagedDay(member, dayKey))
         .map(member => {
           const current = normalizeShift(member.sched?.[dayKey]);
           const currentCovers = current && timeToMin(current[0]) <= anchor.start && timeToMin(current[1]) > anchor.start;
@@ -1136,15 +1153,18 @@ function applyAnchorCoverageForDay(prepared, dayKey, coverageScopes, cycleWeeks,
 function preparePersonForUse(person, cycleWeeks = 8, fridayTemplateRotation = [], passBank = []) {
   const normalized = normalizePerson(person, cycleWeeks);
   const sched = { ...normalized.sched };
-  DAYS.forEach(d => {
-    if ((normalized.daysOff || []).includes(d.key)) return;
-    const eligiblePasses = getEligiblePassesForDay(normalized, d.key, passBank);
-    const currentShift = normalizeShift(sched[d.key]);
+  // Iterera över de dagar generatorn ansvarar för per person — inkl fredag för
+  // passbank-läge. Andra fredagslägen rörs inte här (deras fredag ligger i
+  // fridayShift/fridayRotation).
+  generatorDaysForPerson(normalized).forEach(dayKey => {
+    if ((normalized.daysOff || []).includes(dayKey)) return;
+    const eligiblePasses = getEligiblePassesForDay(normalized, dayKey, passBank);
+    const currentShift = normalizeShift(sched[dayKey]);
     const isValidCurrentPass = currentShift && eligiblePasses.some(pass => shiftMatchesPass(currentShift, pass));
     if (!isValidCurrentPass) {
-      const autoShift = buildSuggestedShift(normalized, d.key, cycleWeeks, fridayTemplateRotation, passBank);
-      if (autoShift) sched[d.key] = autoShift;
-      else delete sched[d.key];
+      const autoShift = buildSuggestedShift(normalized, dayKey, cycleWeeks, fridayTemplateRotation, passBank);
+      if (autoShift) sched[dayKey] = autoShift;
+      else delete sched[dayKey];
     }
   });
   return { ...normalized, sched };
@@ -1152,14 +1172,20 @@ function preparePersonForUse(person, cycleWeeks = 8, fridayTemplateRotation = []
 function prepareStaffForUse(staff, cycleWeeks = 8, fridayTemplateRotation = [], passBank = [], coverageScopes = []) {
   const prepared = normalizeStaffList(staff, cycleWeeks).map(person => ({ ...person, sched: { ...person.sched } }));
 
-  DAYS.forEach(day => {
-    applyAnchorCoverageForDay(prepared, day.key, coverageScopes, cycleWeeks, fridayTemplateRotation, passBank);
+  // Iterera mån-tor + fre. För 'fri' filtreras kandidater till bara passbank-läges-personer
+  // i applyAnchorCoverageForDay och i candidate-loopen nedan, så legacy-personers
+  // fredag (som styrs av fridayShift/fridayRotation) lämnas orörd.
+  const generatorDays = [...WEEKDAY_KEYS, 'fri'];
+  generatorDays.forEach(dayKey => {
+    applyAnchorCoverageForDay(prepared, dayKey, coverageScopes, cycleWeeks, fridayTemplateRotation, passBank);
     const candidates = prepared
-      .filter(person => !(person.daysOff || []).includes(day.key))
+      .filter(person => !(person.daysOff || []).includes(dayKey))
+      // Bara personer som generatorn får skriva schema för på denna dag
+      .filter(person => isGeneratorManagedDay(person, dayKey))
       .map(person => {
         // Använd available-varianten så vi inte tilldelar fullbokade pass
-        const eligiblePasses = getAvailableEligiblePassesForDay(person, day.key, prepared, passBank);
-        const currentShift = normalizeShift(person.sched?.[day.key]);
+        const eligiblePasses = getAvailableEligiblePassesForDay(person, dayKey, prepared, passBank);
+        const currentShift = normalizeShift(person.sched?.[dayKey]);
         const isValidCurrentPass = currentShift && eligiblePasses.some(pass => shiftMatchesPass(currentShift, pass));
         return { person, eligiblePasses, isValidCurrentPass };
       })
@@ -1167,23 +1193,23 @@ function prepareStaffForUse(staff, cycleWeeks = 8, fridayTemplateRotation = [], 
         if (a.isValidCurrentPass !== b.isValidCurrentPass) return a.isValidCurrentPass ? 1 : -1;
         if (a.person.fixedTimes !== b.person.fixedTimes) return a.person.fixedTimes ? 1 : -1;
         if (a.eligiblePasses.length !== b.eligiblePasses.length) return a.eligiblePasses.length - b.eligiblePasses.length;
-        const aLatest = getStrictConstraints(a.person, day.key).latestStart;
-        const bLatest = getStrictConstraints(b.person, day.key).latestStart;
+        const aLatest = getStrictConstraints(a.person, dayKey).latestStart;
+        const bLatest = getStrictConstraints(b.person, dayKey).latestStart;
         return (aLatest ?? Infinity) - (bLatest ?? Infinity);
       });
 
     candidates.forEach(({ person, eligiblePasses, isValidCurrentPass }) => {
       if (isValidCurrentPass || eligiblePasses.length === 0) return;
       // Skicka in prepared så build-funktionerna ser uppdaterad usage
-      const autoShift = buildCoverageAwareShift(person, day.key, prepared, coverageScopes, cycleWeeks, fridayTemplateRotation, passBank)
-        || buildSuggestedShift(person, day.key, cycleWeeks, fridayTemplateRotation, passBank, prepared);
+      const autoShift = buildCoverageAwareShift(person, dayKey, prepared, coverageScopes, cycleWeeks, fridayTemplateRotation, passBank)
+        || buildSuggestedShift(person, dayKey, cycleWeeks, fridayTemplateRotation, passBank, prepared);
       const idx = prepared.findIndex(member => member.id === person.id);
       if (idx === -1) return;
       if (autoShift) {
-        prepared[idx] = { ...prepared[idx], sched: { ...prepared[idx].sched, [day.key]: autoShift } };
+        prepared[idx] = { ...prepared[idx], sched: { ...prepared[idx].sched, [dayKey]: autoShift } };
       } else {
         const nextSched = { ...prepared[idx].sched };
-        delete nextSched[day.key];
+        delete nextSched[dayKey];
         prepared[idx] = { ...prepared[idx], sched: nextSched };
       }
     });
@@ -1216,6 +1242,21 @@ function hasWeekdaySchedule(person) {
 
 function personMatchesCoverageScope(person, scope) {
   return scope.scopeType !== COVERAGE_DEPARTMENT || person.deptId === scope.deptId;
+}
+
+// True om generatorn får skriva i person.sched[dayKey] för denna person.
+// För mån-tor: alltid sant. För 'fri': bara om personen är i passbank-läge.
+// Övriga fredagslägen (rotation/fixed/null) styrs av andra fält och får
+// inte mutateras genom sched.fri.
+function isGeneratorManagedDay(person, dayKey) {
+  if (dayKey === 'fri') return person.fridayMode === 'passbank';
+  return WEEKDAY_KEYS.includes(dayKey);
+}
+
+// Lista över dagar generatorn ansvarar för, för en specifik person.
+// Passbank-läge → mån-tor + fre. Annars → mån-tor.
+function generatorDaysForPerson(person) {
+  return person.fridayMode === 'passbank' ? [...WEEKDAY_KEYS, 'fri'] : WEEKDAY_KEYS.slice();
 }
 
 function getShiftForDay(person, dayKey, options = {}) {
@@ -1521,24 +1562,27 @@ function attemptShiftMutation(staff, passBank = [], cycleWeeks = 8, fridayTempla
   const mutables = staff.filter(p => !p.fixedTimes);
   if (mutables.length === 0) return null;
   const p = mutables[Math.floor(Math.random() * mutables.length)];
-  const validDays = DAYS.filter(d => !(p.daysOff || []).includes(d.key));
+  // Tillåt fredag som mutationsdag bara om personen är i passbank-läge.
+  // Övriga lägen styrs av andra fält som generatorn inte rör.
+  const eligibleDayKeys = generatorDaysForPerson(p);
+  const validDays = eligibleDayKeys.filter(key => !(p.daysOff || []).includes(key));
   if (validDays.length === 0) return null;
-  const d = validDays[Math.floor(Math.random() * validDays.length)];
+  const dayKey = validDays[Math.floor(Math.random() * validDays.length)];
   // Respektera instances: bara pass som inte är fullbokade får väljas.
   // Personens nuvarande pass räknas som tillgängligt.
-  const eligiblePasses = getAvailableEligiblePassesForDay(p, d.key, staff, passBank);
+  const eligiblePasses = getAvailableEligiblePassesForDay(p, dayKey, staff, passBank);
   if (eligiblePasses.length === 0) return null;
-  const current = normalizeShift(p.sched?.[d.key]);
+  const current = normalizeShift(p.sched?.[dayKey]);
   const possibleShifts = eligiblePasses
     .map(passToShift)
     .filter(shift => !current || shift[0] !== current[0] || shift[1] !== current[1]);
   if (possibleShifts.length === 0) return null;
-  const preferred = buildSuggestedShift(p, d.key, cycleWeeks, fridayTemplateRotation, passBank, staff);
-  const currentAnchorHealth = coverageScopes.length > 0 ? summarizeAnchorCoverageHealth(staff, d.key, coverageScopes, p) : null;
-  const currentDayHealth = coverageScopes.length > 0 ? summarizeDayCoverageHealth(staff, d.key, coverageScopes) : null;
+  const preferred = buildSuggestedShift(p, dayKey, cycleWeeks, fridayTemplateRotation, passBank, staff);
+  const currentAnchorHealth = coverageScopes.length > 0 ? summarizeAnchorCoverageHealth(staff, dayKey, coverageScopes, p) : null;
+  const currentDayHealth = coverageScopes.length > 0 ? summarizeDayCoverageHealth(staff, dayKey, coverageScopes) : null;
   const variants = possibleShifts.map(shift => {
     const candidate = staff.map(person => person.id === p.id
-      ? { ...person, sched: { ...person.sched, [d.key]: shift } }
+      ? { ...person, sched: { ...person.sched, [dayKey]: shift } }
       : person
     );
     const preferenceScore = preferred
@@ -1548,8 +1592,8 @@ function attemptShiftMutation(staff, passBank = [], cycleWeeks = 8, fridayTempla
       shift,
       candidate,
       preferenceScore,
-      anchorHealth: coverageScopes.length > 0 ? summarizeAnchorCoverageHealth(candidate, d.key, coverageScopes, p) : null,
-      dayHealth: coverageScopes.length > 0 ? summarizeDayCoverageHealth(candidate, d.key, coverageScopes) : null,
+      anchorHealth: coverageScopes.length > 0 ? summarizeAnchorCoverageHealth(candidate, dayKey, coverageScopes, p) : null,
+      dayHealth: coverageScopes.length > 0 ? summarizeDayCoverageHealth(candidate, dayKey, coverageScopes) : null,
     };
   });
   variants.sort((a, b) => {
@@ -1586,12 +1630,17 @@ function attemptShiftMutation(staff, passBank = [], cycleWeeks = 8, fridayTempla
 function attemptSwapMutation(staff, passBank = [], cycleWeeks = 8, fridayTemplateRotation = [], coverageScopes = []) {
   const mutables = staff.filter(p => !p.fixedTimes);
   if (mutables.length < 2) return null;
-  // Välj slumpmässig dag
-  const allDays = DAYS.slice();
-  const d = allDays[Math.floor(Math.random() * allDays.length)];
-  // Hitta personer som jobbar denna dag (har ett pass och inte är ledig)
+  // Välj slumpmässig dag — inkl fredag, men byten på fredag tillåts bara
+  // mellan två passbank-personer (filtreras nedan i workingToday).
+  const allDays = [...WEEKDAY_KEYS, 'fri'];
+  const dayKey = allDays[Math.floor(Math.random() * allDays.length)];
+  // Hitta personer som jobbar denna dag (har ett pass och inte är ledig).
+  // För fredag: bara passbank-läges-personer kvalificerar (legacy-personer
+  // kan inte byta sin fredag genom sched-mutationer).
   const workingToday = mutables.filter(p =>
-    !(p.daysOff || []).includes(d.key) && p.sched?.[d.key]
+    !(p.daysOff || []).includes(dayKey)
+    && p.sched?.[dayKey]
+    && isGeneratorManagedDay(p, dayKey)
   );
   if (workingToday.length < 2) return null;
   // Välj två slumpmässiga personer
@@ -1600,17 +1649,17 @@ function attemptSwapMutation(staff, passBank = [], cycleWeeks = 8, fridayTemplat
   if (idxB >= idxA) idxB++;
   const personA = workingToday[idxA];
   const personB = workingToday[idxB];
-  const shiftA = normalizeShift(personA.sched?.[d.key]);
-  const shiftB = normalizeShift(personB.sched?.[d.key]);
+  const shiftA = normalizeShift(personA.sched?.[dayKey]);
+  const shiftB = normalizeShift(personB.sched?.[dayKey]);
   if (!shiftA || !shiftB) return null;
   // Identiska pass – inget att byta
   if (shiftA[0] === shiftB[0] && shiftA[1] === shiftB[1]) return null;
   // Kontrollera att båda personerna kan ta varandras pass
-  if (!isShiftLegal(personA, d.key, shiftB)) return null;
-  if (!isShiftLegal(personB, d.key, shiftA)) return null;
+  if (!isShiftLegal(personA, dayKey, shiftB)) return null;
+  if (!isShiftLegal(personB, dayKey, shiftA)) return null;
   // Och att passen finns i deras respektive eligible-lista (passBank-regler)
-  const eligibleA = getEligiblePassesForDay(personA, d.key, passBank);
-  const eligibleB = getEligiblePassesForDay(personB, d.key, passBank);
+  const eligibleA = getEligiblePassesForDay(personA, dayKey, passBank);
+  const eligibleB = getEligiblePassesForDay(personB, dayKey, passBank);
   const aCanTakeB = eligibleA.some(pass => {
     const s = passToShift(pass);
     return s[0] === shiftB[0] && s[1] === shiftB[1];
@@ -1622,14 +1671,14 @@ function attemptSwapMutation(staff, passBank = [], cycleWeeks = 8, fridayTemplat
   if (!aCanTakeB || !bCanTakeA) return null;
   // Bygg kandidat med bytet
   const candidate = staff.map(person => {
-    if (person.id === personA.id) return { ...person, sched: { ...person.sched, [d.key]: shiftB } };
-    if (person.id === personB.id) return { ...person, sched: { ...person.sched, [d.key]: shiftA } };
+    if (person.id === personA.id) return { ...person, sched: { ...person.sched, [dayKey]: shiftB } };
+    if (person.id === personB.id) return { ...person, sched: { ...person.sched, [dayKey]: shiftA } };
     return person;
   });
   // Ankarsäkerhet: byte får inte öka underbemanning av öppning/stängning
   if (coverageScopes.length > 0) {
-    const currentAnchor = summarizeAnchorCoverageHealth(staff, d.key, coverageScopes);
-    const candAnchor = summarizeAnchorCoverageHealth(candidate, d.key, coverageScopes);
+    const currentAnchor = summarizeAnchorCoverageHealth(staff, dayKey, coverageScopes);
+    const candAnchor = summarizeAnchorCoverageHealth(candidate, dayKey, coverageScopes);
     if (compareAnchorDeficit(candAnchor, currentAnchor) > 0) return null;
   }
   return candidate;
@@ -1985,15 +2034,28 @@ function analyzeCoverageBlockStatus(block, staff, passBank, cycleWeeks = 8) {
   const times = [];
   for (let time = getCoverageBlockActiveStart(block); time < block.end; time += SLOT_STEP_MINUTES) times.push(time);
 
-  const dayChecks = DAYS.map(day => {
+  // Vilka dagar ska analyseras? Mån-tor alltid. Fredag bara om någon i scopet
+  // är i passbank-läge – fast/rull-personer styr fredag via egna fält och är
+  // inte relevanta för pass-feasibilitet på fredag.
+  const passbankInScope = normalizedStaff.some(person =>
+    person.fridayMode === 'passbank' && personMatchesCoverageScope(person, scope)
+  );
+  const daysToCheck = passbankInScope
+    ? [...DAYS, { key: 'fri', label: 'Fredag', short: 'fre' }]
+    : DAYS;
+
+  const dayChecks = daysToCheck.map(day => {
     let worstAvailable = Infinity;
     let worstTime = block.start;
     times.forEach(time => {
-      const available = normalizedStaff.filter(person =>
-        !(person.daysOff || []).includes(day.key)
-        && personMatchesCoverageScope(person, scope)
-        && personCanCoverTime(person, day.key, time, passBank)
-      ).length;
+      const available = normalizedStaff.filter(person => {
+        if ((person.daysOff || []).includes(day.key)) return false;
+        if (!personMatchesCoverageScope(person, scope)) return false;
+        // På fredag räknas bara passbank-personer – övriga sköts av legacy-fält
+        // som denna analys inte täcker.
+        if (day.key === 'fri' && person.fridayMode !== 'passbank') return false;
+        return personCanCoverTime(person, day.key, time, passBank);
+      }).length;
       if (available < worstAvailable) {
         worstAvailable = available;
         worstTime = time;
@@ -4114,7 +4176,7 @@ function SettingsView({ departments, setDepartments, staff, setStaff, coverageBl
             <p><strong>Antal:</strong> max antal personer som kan tilldelas passet per dag. 1 betyder att passet är unikt – t.ex. bara en person stänger. Sätt högre om flera kan ha samma passtider, eller lämna tomt för obegränsat.</p>
             <p>Bemanningsblocken avgör när de här passen faktiskt behövs, så passbank och bemanning måste fungera tillsammans.</p>
             <p>Pass kan göras avdelningsspecifika eller gälla alla avdelningar.</p>
-            <p>Fredag styrs fortfarande separat av fast fredag eller fredagsrull längre ner i personalens formulär.</p>
+            <p>Aktivera <strong>fre</strong> på ett pass om det ska gå att tilldela personal som har valt <strong>Passbank</strong> som fredagshantering. Personer med fast fredag eller fredagsrull styrs fortfarande av sina egna fredagsfält längre ner.</p>
           </div>
         </div>
       </div>
@@ -4169,13 +4231,13 @@ function SettingsView({ departments, setDepartments, staff, setStaff, coverageBl
             })}
           </div>
           <p className="text-[10px] text-stone-400 mt-2">
-            Mallen används av personal som väljer "Central mall" i sin fredagsrull. De kan sedan ange startvecka och göra egna undantag.
+            Mallen används av personer som har valt <strong>Rull</strong> + <strong>Central mall</strong> som fredagshantering. De kan ange startvecka och göra egna undantag per vecka.
           </p>
         </div>
 
         {rotators.length === 0 ? (
           <div className="bg-stone-50 rounded-lg p-6 text-center text-sm text-stone-500">
-            Ingen i personalen är markerad som "ingår i fredagsrullen" än. Klicka på en person i Personal-fliken och bocka i det.
+            Ingen i personalen använder fredagsrullen än. Öppna en person under <strong>Personal</strong> och välj <strong>Rull</strong> som fredagshantering. (De andra lägena – Passbank och Fast tid – styrs på personnivå och påverkas inte av den här mallen.)
           </div>
         ) : (
           <div>
@@ -5107,7 +5169,11 @@ function Toggle({ checked, onChange, label, hint, tip }) {
 function DayOverridesEditor({ form, setForm }) {
   const overrides = form.dayOverrides || {};
   const overrideKeys = Object.keys(overrides).filter(k => overrides[k]);
-  const availableDays = DAYS.filter(d => !overrideKeys.includes(d.key));
+  // Tillåter fredag som dagsundantag bara när personen är i passbank-läge.
+  // Övriga lägen har inte fredag i sched och skulle ändå inte använda en
+  // dagsregel där (deras fredag styrs av andra fält).
+  const candidateDays = form.fridayMode === 'passbank' ? DAY_META : DAYS;
+  const availableDays = candidateDays.filter(d => !overrideKeys.includes(d.key));
 
   const FIELDS = [
     { key: 'earliestStart', label: 'Tidigast börja' },
@@ -5144,7 +5210,7 @@ function DayOverridesEditor({ form, setForm }) {
         <p className="text-xs text-stone-400 italic">Inga dagsundantag än.</p>
       )}
       {overrideKeys.map(dayKey => {
-        const dayLabel = DAYS.find(d => d.key === dayKey)?.label;
+        const dayLabel = getDayMeta(dayKey).label;
         const ov = overrides[dayKey] || {};
         const general = {
           earliestStart: form.earliestStart, latestStart: form.latestStart,
@@ -5533,10 +5599,13 @@ function PreviewSchedule({ staff, originalStaff, coverageScopes, departments }) 
   return (
     <div className="space-y-4">
       <p className="text-xs uppercase tracking-wider text-stone-500">Förhandsgranskning · ändringar markerade i färg</p>
-      {DAYS.map(d => {
+      {DAY_META.map(d => {
         const present = staff.filter(s => s.sched[d.key] && !(s.daysOff || []).includes(d.key))
           .map(s => ({ ...s, startMin: timeToMin(s.sched[d.key][0]), endMin: timeToMin(s.sched[d.key][1]) }))
           .sort((a, b) => a.startMin - b.startMin);
+        // Hoppa över fredag om ingen i passbank-läge har en fredagstid satt –
+        // då finns inget vettigt att visa här (legacy-fredag visas inte i denna preview).
+        if (d.key === 'fri' && present.length === 0) return null;
         const gaps = coverageScopes.reduce((sum, scope) => {
           const slots = computeSlots(staff, d.key, scope.slots, scope);
           return sum + slots.filter(s => s.count < s.min).length;
