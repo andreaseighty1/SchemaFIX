@@ -2786,7 +2786,7 @@ function FritidsSchemaApp() {
               <p className="text-xs uppercase tracking-widest text-stone-500 mb-1">Fritidshem · schemaverktyg</p>
               <h1 className="display-font text-4xl text-stone-800" style={{ letterSpacing: '-0.02em' }}>SchemaFIX</h1>
               <div className="flex items-center gap-2 mt-1 flex-wrap">
-                <p className="text-stone-600 text-sm">v1.0 (beta) · direktredigering och PDF-export</p>
+                <p className="text-stone-600 text-sm">v1.1 (beta) · direktredigering och PDF-export</p>
                 {dirty && (
                   <span className="inline-flex items-center gap-1 text-xs text-amber-700 bg-amber-50 ring-1 ring-amber-200 rounded-full px-2 py-0.5">
                     <Circle size={6} fill="currentColor" />
@@ -3296,6 +3296,30 @@ function buildCoverageBlocksFromWizard(state, departments, existingBlocks = []) 
   return normalizeCoverageBlocks(nextBlocks, departments);
 }
 
+// Två-fältsrad för "antal personer (min/max)" i bemanningsguiden. Bryts ut
+// för konsekvens — alla blocktyper får samma layout med tydliga MIN/MAX-labels
+// över inputs i stället för en liten not under.
+function MinMaxInputs({ min, max, onChange }) {
+  const parseMin = (v) => Math.max(0, parseInt(v, 10) || 0);
+  const parseMax = (v) => Math.max(min, parseInt(v, 10) || min);
+  return (
+    <div className="grid grid-cols-2 gap-2">
+      <div>
+        <p className="text-[10px] uppercase tracking-wider text-stone-500 mb-1">Min</p>
+        <input type="number" min="0" className="input w-full"
+          value={min}
+          onChange={e => { const m = parseMin(e.target.value); onChange(m, Math.max(m, max)); }} />
+      </div>
+      <div>
+        <p className="text-[10px] uppercase tracking-wider text-stone-500 mb-1">Max</p>
+        <input type="number" min={min} className="input w-full"
+          value={max}
+          onChange={e => onChange(min, parseMax(e.target.value))} />
+      </div>
+    </div>
+  );
+}
+
 function CoverageWizardModal({ departments, staff, blocks, onClose, onApply }) {
   const [form, setForm] = useState(() => buildCoverageWizardState(departments, blocks, staff));
   const totalStaff = staff.length;
@@ -3334,37 +3358,38 @@ function CoverageWizardModal({ departments, staff, blocks, onClose, onApply }) {
                 label="Gemensam öppning och morgonfritids" hint="Alla avdelningar räknas tillsammans på morgonen" />
               {form.sharedOpening ? (
                 <div className="grid md:grid-cols-2 gap-4">
-                  <Field label="Öppning: från och till">
+                  <Field label="Öppningstid">
                     <div className="flex items-center gap-2">
                       <TimeTextInput className="input flex-1" valueMinutes={form.openingStart} onCommit={minutes => updateForm({ openingStart: minutes })} />
                       <span className="text-stone-400">–</span>
                       <TimeTextInput className="input flex-1" valueMinutes={form.openingSplit} onCommit={minutes => updateForm({ openingSplit: minutes })} />
                     </div>
+                    <p className="text-[10px] text-stone-400 mt-1">
+                      {form.morningEnabled
+                        ? 'Den senare tiden är när öppningen övergår till morgonfritids.'
+                        : 'Den senare tiden är då öppningsblocket slutar.'}
+                    </p>
                   </Field>
-                  <Field label="Hur många behövs först?">
-                    <div className="grid grid-cols-2 gap-2">
-                      <input type="number" min="0" className="input" value={form.openingMin} onChange={e => updateForm({ openingMin: Math.max(0, parseInt(e.target.value, 10) || 0), openingMax: Math.max(Math.max(0, parseInt(e.target.value, 10) || 0), form.openingMax) })} />
-                      <input type="number" min={form.openingMin} className="input" value={form.openingMax} onChange={e => updateForm({ openingMax: Math.max(form.openingMin, parseInt(e.target.value, 10) || form.openingMin) })} />
-                    </div>
-                    <p className="text-[10px] text-stone-400 mt-1">vänster = min, höger = max</p>
+                  <Field label="Antal personer">
+                    <MinMaxInputs min={form.openingMin} max={form.openingMax}
+                      onChange={(min, max) => updateForm({ openingMin: min, openingMax: max })} />
                   </Field>
                   <div className="md:col-span-2 rounded-lg bg-white ring-1 ring-stone-200 p-3">
                     <Toggle checked={form.morningEnabled} onChange={value => updateForm({ morningEnabled: value })}
-                      label="Lägg även ett andra morgonblock" hint="Bra när fler ska vara på plats en stund senare" />
+                      label="Lägg till ett senare morgonblock" hint="Använd när bemanningen ökar efter öppningen — t.ex. när morgonfritids drar igång" />
                     {form.morningEnabled && (
                       <div className="grid md:grid-cols-2 gap-4 mt-3">
-                        <Field label="Morgonfritids: till">
+                        <Field label="Morgonfritids slutar">
                           <div className="flex items-center gap-2">
                             <div className="input bg-stone-50 text-stone-500 flex-1">{minToTime(form.openingSplit)}</div>
                             <span className="text-stone-400">–</span>
                             <TimeTextInput className="input flex-1" valueMinutes={form.morningEnd} onCommit={minutes => updateForm({ morningEnd: minutes })} />
                           </div>
+                          <p className="text-[10px] text-stone-400 mt-1">Startas automatiskt där öppningen slutar.</p>
                         </Field>
-                        <Field label="Hur många ska vara där då?">
-                          <div className="grid grid-cols-2 gap-2">
-                            <input type="number" min="0" className="input" value={form.morningMin} onChange={e => updateForm({ morningMin: Math.max(0, parseInt(e.target.value, 10) || 0), morningMax: Math.max(Math.max(0, parseInt(e.target.value, 10) || 0), form.morningMax) })} />
-                            <input type="number" min={form.morningMin} className="input" value={form.morningMax} onChange={e => updateForm({ morningMax: Math.max(form.morningMin, parseInt(e.target.value, 10) || form.morningMin) })} />
-                          </div>
+                        <Field label="Antal personer">
+                          <MinMaxInputs min={form.morningMin} max={form.morningMax}
+                            onChange={(min, max) => updateForm({ morningMin: min, morningMax: max })} />
                         </Field>
                       </div>
                     )}
@@ -3391,11 +3416,9 @@ function CoverageWizardModal({ departments, staff, blocks, onClose, onApply }) {
                               <TimeTextInput className="input flex-1" valueMinutes={card.openingEnd} onCommit={minutes => updateDeptCard(card.deptId, { openingEnd: minutes })} />
                             </div>
                           </Field>
-                          <Field label="Min / max">
-                            <div className="grid grid-cols-2 gap-2">
-                              <input type="number" min="0" className="input" value={card.openingMin} onChange={e => updateDeptCard(card.deptId, { openingMin: Math.max(0, parseInt(e.target.value, 10) || 0), openingMax: Math.max(Math.max(0, parseInt(e.target.value, 10) || 0), card.openingMax) })} />
-                              <input type="number" min={card.openingMin} className="input" value={card.openingMax} onChange={e => updateDeptCard(card.deptId, { openingMax: Math.max(card.openingMin, parseInt(e.target.value, 10) || card.openingMin) })} />
-                            </div>
+                          <Field label="Antal personer">
+                            <MinMaxInputs min={card.openingMin} max={card.openingMax}
+                              onChange={(min, max) => updateDeptCard(card.deptId, { openingMin: min, openingMax: max })} />
                           </Field>
                         </div>
                       )}
@@ -3418,11 +3441,9 @@ function CoverageWizardModal({ departments, staff, blocks, onClose, onApply }) {
                     <TimeTextInput className="input flex-1" valueMinutes={form.schoolEnd} onCommit={minutes => updateForm({ schoolEnd: minutes })} />
                   </div>
                 </Field>
-                <Field label="Hur många behövs?">
-                  <div className="grid grid-cols-2 gap-2">
-                    <input type="number" min="0" className="input" value={form.schoolMin} onChange={e => updateForm({ schoolMin: Math.max(0, parseInt(e.target.value, 10) || 0), schoolMax: Math.max(Math.max(0, parseInt(e.target.value, 10) || 0), form.schoolMax) })} />
-                    <input type="number" min={form.schoolMin} className="input" value={form.schoolMax} onChange={e => updateForm({ schoolMax: Math.max(form.schoolMin, parseInt(e.target.value, 10) || form.schoolMin) })} />
-                  </div>
+                <Field label="Antal personer">
+                  <MinMaxInputs min={form.schoolMin} max={form.schoolMax}
+                    onChange={(min, max) => updateForm({ schoolMin: min, schoolMax: max })} />
                 </Field>
               </div>
             )}
@@ -3450,11 +3471,9 @@ function CoverageWizardModal({ departments, staff, blocks, onClose, onApply }) {
                           <TimeTextInput className="input flex-1" valueMinutes={card.afternoonEnd} onCommit={minutes => updateDeptCard(card.deptId, { afternoonEnd: minutes })} />
                         </div>
                       </Field>
-                      <Field label="Min / max">
-                        <div className="grid grid-cols-2 gap-2">
-                          <input type="number" min="0" className="input" value={card.afternoonMin} onChange={e => updateDeptCard(card.deptId, { afternoonMin: Math.max(0, parseInt(e.target.value, 10) || 0), afternoonMax: Math.max(Math.max(0, parseInt(e.target.value, 10) || 0), card.afternoonMax) })} />
-                          <input type="number" min={card.afternoonMin} className="input" value={card.afternoonMax} onChange={e => updateDeptCard(card.deptId, { afternoonMax: Math.max(card.afternoonMin, parseInt(e.target.value, 10) || card.afternoonMin) })} />
-                        </div>
+                      <Field label="Antal personer">
+                        <MinMaxInputs min={card.afternoonMin} max={card.afternoonMax}
+                          onChange={(min, max) => updateDeptCard(card.deptId, { afternoonMin: min, afternoonMax: max })} />
                       </Field>
                     </div>
                   )}
@@ -3475,11 +3494,9 @@ function CoverageWizardModal({ departments, staff, blocks, onClose, onApply }) {
                     <TimeTextInput className="input flex-1" valueMinutes={form.closingEnd} onCommit={minutes => updateForm({ closingEnd: minutes })} />
                   </div>
                 </Field>
-                <Field label="Hur många stänger?">
-                  <div className="grid grid-cols-2 gap-2">
-                    <input type="number" min="0" className="input" value={form.closingMin} onChange={e => updateForm({ closingMin: Math.max(0, parseInt(e.target.value, 10) || 0), closingMax: Math.max(Math.max(0, parseInt(e.target.value, 10) || 0), form.closingMax) })} />
-                    <input type="number" min={form.closingMin} className="input" value={form.closingMax} onChange={e => updateForm({ closingMax: Math.max(form.closingMin, parseInt(e.target.value, 10) || form.closingMin) })} />
-                  </div>
+                <Field label="Antal personer">
+                  <MinMaxInputs min={form.closingMin} max={form.closingMax}
+                    onChange={(min, max) => updateForm({ closingMin: min, closingMax: max })} />
                 </Field>
               </div>
             ) : (
@@ -3500,11 +3517,9 @@ function CoverageWizardModal({ departments, staff, blocks, onClose, onApply }) {
                             <TimeTextInput className="input flex-1" valueMinutes={card.closingEnd} onCommit={minutes => updateDeptCard(card.deptId, { closingEnd: minutes })} />
                           </div>
                         </Field>
-                        <Field label="Min / max">
-                          <div className="grid grid-cols-2 gap-2">
-                            <input type="number" min="0" className="input" value={card.closingMin} onChange={e => updateDeptCard(card.deptId, { closingMin: Math.max(0, parseInt(e.target.value, 10) || 0), closingMax: Math.max(Math.max(0, parseInt(e.target.value, 10) || 0), card.closingMax) })} />
-                            <input type="number" min={card.closingMin} className="input" value={card.closingMax} onChange={e => updateDeptCard(card.deptId, { closingMax: Math.max(card.closingMin, parseInt(e.target.value, 10) || card.closingMin) })} />
-                          </div>
+                        <Field label="Antal personer">
+                          <MinMaxInputs min={card.closingMin} max={card.closingMax}
+                            onChange={(min, max) => updateDeptCard(card.deptId, { closingMin: min, closingMax: max })} />
                         </Field>
                       </div>
                     )}
@@ -3770,7 +3785,7 @@ function ScheduleView({ dayData, activeDay, setActiveDay, onEdit, staffCount, on
   return (
     <div className="space-y-4">
       <TabIntro>
-        Här ser du schemat per dag och hur bemanningen ser ut över tiden. Generatorn försöker matcha passbanken, bemanningsblocken och personalens regler. Växla mellan gemensam bemanning och avdelningar för att se om varje del av fritids har rätt täckning. Om något inte går ihop visas tydliga brist- och övermaxlistor här.
+        Här ser du schemat per dag och hur bemanningen ser ut över tiden. Generatorn försöker matcha passbanken, bemanningsblocken och personalens regler. <strong>Klicka på en stapel för att justera tider direkt</strong> — veckotimmarna räknas om medan du skriver, och dina manuella ändringar markeras så du kan ångra dem. Växla mellan gemensam bemanning och avdelningar för att se varje del av fritids. Om något inte går ihop visas brist- och övermaxlistor här. Knappen uppe till höger skriver ut hela veckan som PDF.
       </TabIntro>
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="flex gap-2 flex-wrap">
@@ -4125,7 +4140,7 @@ function StaffView({ staff, fridayCycleWeeks, fridayTemplateRotation, violations
   return (
     <div className="space-y-4">
       <TabIntro>
-        Lägg till och redigera personalen. Börja med reglerna och passurvalet, och använd manuell veckoredigering först när du vill finjustera enskilda dagar. Listan visar varje persons mål jämfört med faktisk arbetstid.
+        Lägg till och redigera personalen. Börja med reglerna och passurvalet — de styr hur generatorn pusslar. Manuell veckoredigering här är för specialfall; vanligtvis finjusterar man enklast direkt i veckovyn efteråt. Listan visar varje persons mål jämfört med faktisk arbetstid.
       </TabIntro>
       <div className="bg-white rounded-2xl ring-1 ring-stone-200 overflow-hidden">
         <table className="w-full text-sm">
@@ -5983,7 +5998,7 @@ function WelcomeModal({ onClose, onStartTour }) {
     { num: '1', title: 'Lägg till avdelningar', desc: 'Vad heter era avdelningar? Färgkoda dem så ni ser dem tydligt.' },
     { num: '2', title: 'Lägg till pass och personal', desc: 'Börja gärna med passbanken. Fyll sedan i avdelning, tjänstgöring, tillåtna pass, fredagsrutin och villkor för varje person.' },
     { num: '3', title: 'Justera bemanningskrav', desc: 'Lägg gemensamma block och avdelningsblock så appen vet hur bemanningen ska se ut över dagen. Använd min/max om du vill styra t.ex. exakt en öppnare.' },
-    { num: '4', title: 'Generera schemaförslag', desc: 'Tryck på knappen — appen pusslar fram tre olika alternativ baserat på passbanken, bemanningskrav, fredagsupplägg och allas villkor. Vecka-vyn visar sedan var något saknas eller blir för mycket.' },
+    { num: '4', title: 'Generera, finjustera, dela', desc: 'Appen pusslar fram tre alternativ. Välj det som känns bäst — klicka sedan på en stapel i veckovyn för att justera tider direkt (timmarna räknas om medan du skriver). Skriv ut som PDF när du är nöjd.' },
   ];
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: 'rgba(28, 25, 23, 0.5)' }}>
@@ -6029,7 +6044,7 @@ function TourBubble({ step, onNext, onClose }) {
     },
     {
       title: 'Steg 2 av 4 · Personal',
-      desc: 'Lägg först in passbanken under Inställningar, och lägg sedan till en kollega i taget. Börja med avdelning, tjänstgöring, tillåtna pass och villkor som "måste börja senast 08:40 för lektion". Manuell veckoredigering används mest för finjustering efteråt.',
+      desc: 'Lägg först in passbanken under Inställningar, och lägg sedan till en kollega i taget. Börja med avdelning, tjänstgöring, tillåtna pass och villkor som "måste börja senast 08:40 för lektion". Manuell veckoredigering här är för specialfall — vanligtvis finjusterar man enklast direkt i veckovyn efteråt.',
     },
     {
       title: 'Steg 3 av 4 · Bemanningskrav',
@@ -6037,7 +6052,7 @@ function TourBubble({ step, onNext, onClose }) {
     },
     {
       title: 'Steg 4 av 4 · Vecka & Generera',
-      desc: 'Här ser du schemat per dag och täckning över tiden. Tryck på "Generera schemaförslag" högst upp för att låta appen pussla fram tre alternativ baserat på passbanken, avdelningsbemanning, fredagar och allas villkor. Om något inte går ihop visas både bristlistor och perioder över max direkt här.',
+      desc: 'Här ser du schemat per dag och täckning över tiden. Tryck på "Generera schemaförslag" för att låta appen pussla fram tre alternativ. Klicka på en stapel för att justera tider direkt — veckotimmarna räknas om medan du skriver. Manuella ändringar markeras med en stjärna så du kan ångra dem individuellt. Skriv ut som PDF när du är nöjd.',
     },
   ];
   const cur = STEPS[step];
